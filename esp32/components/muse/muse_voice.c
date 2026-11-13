@@ -1391,6 +1391,17 @@ static void voice_task(void *arg)
             s_press_mark = ev.mark;
             s_press_us = ev.at_us;
             wake = ev.wake;
+            if (muse_settings_gadget_mode() == MUSE_GADGET_MODE_MEETING) {
+                /* Meeting mode is a placeholder in this build: never record,
+                 * just say so on the face. A waking press only wakes. */
+                muse_input_clear_call_pending(ev.mark);
+                if (!ev.wake) {
+                    muse_state_set_mode(MUSE_MODE_IDLE);
+                    muse_state_set_caption("MEETING MODE - COMING SOON");
+                }
+                pre_reset();
+                continue;
+            }
         }
         bool ptt = muse_voice_ptt_enabled();
         if (wake && ptt && !ptt_held_on_waking()) {
@@ -1452,8 +1463,11 @@ static void voice_task(void *arg)
             muse_state_set_level(0);
             if (atomic_load(&s_shutdown) || muse_state_mode(NULL) == MUSE_MODE_OFF) continue;
 #if CONFIG_MUSE_REALTIME_VOICE && !CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
-            /* Other boards retain tap-to-call beside holding for a note. */
-            if (result == NOTE_TAP && s_press_input_epoch == muse_input_call_epoch()
+            /* Other boards retain tap-to-call beside holding for a note.
+             * In text mode a tap must not start a call: it falls through to
+             * too_short(), which tells the user to hold to talk. */
+            if (result == NOTE_TAP && muse_settings_gadget_mode() == MUSE_GADGET_MODE_CALL
+                && s_press_input_epoch == muse_input_call_epoch()
                 && muse_voice_call_ready()) {
                 run_call(false, 0);
                 pre_reset();

@@ -141,6 +141,7 @@ void muse_state_wait_awake(uint32_t ms) { vTaskDelay(ms); }
 bool muse_settings_voice_notes(void) { return notes_mode; }
 int muse_settings_volume(void) { return 20; }
 int muse_settings_mic_gain(void) { return 30; }
+int muse_settings_gadget_mode(void) { return MUSE_GADGET_MODE_CALL; }
 bool muse_wifi_connected(void) { return ready; }
 void muse_wifi_apply(void) {}
 void muse_wifi_power(muse_wifi_power_t p) { (void)p; }

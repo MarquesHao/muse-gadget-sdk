@@ -1,0 +1,9 @@
+# Project V1 overlay for the Waveshare ESP32-S3-Touch-AMOLED-1.75C build.
+# Load last, after sdkconfig.defaults, devices/sdkconfig.muse and
+# devices/sdkconfig.muse-waveshare-s3-175c.
+#
+# Live voice calls: a tap on the talk button starts/ends a call with Muse,
+# holding it still sends a voice note. The project's three-mode switch
+# (components/muse, muse_settings_gadget_mode) gates this at run time:
+# Text mode never starts a call and never plays a reply aloud.
+CONFIG_MUSE_REALTIME_VOICE=y

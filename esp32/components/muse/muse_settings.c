@@ -42,6 +42,7 @@ static struct {
     uint8_t text_size;
     bool wifi_on;
     bool ble_on;
+    uint8_t gadget_mode;
     char ssid[MUSE_SSID_MAX + 1];
     char pass[MUSE_PASS_MAX + 1];
     char host[MUSE_HOST_MAX + 1];
@@ -139,6 +140,7 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "ble_on", &b) == ESP_OK) {
         s.ble_on = b;
     }
+    load_u8("gmode", &s.gadget_mode);
     load_str("ssid", s.ssid, sizeof(s.ssid));
     load_str("pass", s.pass, sizeof(s.pass));
     load_str("host", s.host, sizeof(s.host));
@@ -146,6 +148,7 @@ esp_err_t muse_settings_init(void)
     load_str("token", s.token, sizeof(s.token));
 
     s.volume = clampi(s.volume, 0, 100);
+    s.gadget_mode = clampi(s.gadget_mode, 0, MUSE_GADGET_MODE_COUNT - 1);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
     s.text_size = clampi(s.text_size, MUSE_TEXT_SMALL, MUSE_TEXT_LARGE);
@@ -169,6 +172,14 @@ int muse_settings_text_size(void) { return s.text_size; }
 bool muse_settings_wifi_on(void) { return s.wifi_on; }
 bool muse_settings_ble_on(void) { return s.ble_on; }
 bool muse_settings_voice_notes(void) { return atomic_load(&s_voice_notes); }
+int muse_settings_gadget_mode(void) { return s.gadget_mode; }
+
+void muse_settings_set_gadget_mode(int mode)
+{
+    s.gadget_mode = clampi(mode, 0, MUSE_GADGET_MODE_COUNT - 1);
+    save_u8("gmode", s.gadget_mode);
+    notify(MUSE_SETTING_GADGET_MODE);
+}
 
 void muse_settings_set_voice_notes(bool on)
 {

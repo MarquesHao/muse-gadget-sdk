@@ -426,8 +426,9 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
         return ESP_OK;
     }
     /* Speaker off still plays silence at the same pace, so captions timed to
-     * the audio scroll as if it were heard. */
-    bool mute = !muse_settings_speaker_on();
+     * the audio scroll as if it were heard. Text mode is silent the same way:
+     * replies are shown, never played. */
+    bool mute = !muse_settings_speaker_on() || muse_settings_gadget_mode() == MUSE_GADGET_MODE_TEXT;
     while (frames) {
         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
         for (size_t i = 0; i < n; i++) {

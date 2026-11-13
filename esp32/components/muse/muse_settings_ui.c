@@ -122,6 +122,9 @@ static lv_obj_t *s_ble_sw, *s_ble_status;
 static lv_obj_t *s_notes_sw;
 #endif
 static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val;
+static const char *const GADGET_MODE_NAMES[] = { "Voice call", "Text replies", "Meeting (soon)" };
+#define GADGET_MODE_COUNT (int)(sizeof(GADGET_MODE_NAMES) / sizeof(GADGET_MODE_NAMES[0]))
+static lv_obj_t *s_mode_checks[GADGET_MODE_COUNT], *s_mode_rows[GADGET_MODE_COUNT];
 
 /* Sleep page. */
 static const int SLEEP_CHOICES[] = { 0, 30, 60, 120, 300, 600 };
@@ -1247,6 +1250,11 @@ static void on_speaker_sw(lv_event_t *e)
     muse_settings_set_speaker_on(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
+static void on_mode_choice(lv_event_t *e)
+{
+    muse_settings_set_gadget_mode((int)(intptr_t)lv_event_get_user_data(e));
+}
+
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
 static void on_notes_sw(lv_event_t *e)
 {
@@ -1299,6 +1307,14 @@ static void build_sound_page(lv_obj_t *tile)
         return;
     }
     s_sound = page(tile, "SOUND", true, &list);
+    note(list, "Mode:");
+    for (int i = 0; i < GADGET_MODE_COUNT; i++) {
+        s_mode_rows[i] = row(list, NULL, GADGET_MODE_NAMES[i], &s_mode_checks[i], on_mode_choice,
+                             (void *)(intptr_t)i);
+        lv_obj_set_style_text_color(s_mode_checks[i], lv_color_hex(COLOR_ACCENT), 0);
+    }
+    note(list, "Voice call: tap the top button to talk live, or hold it to send a voice note. "
+               "Text replies: hold to talk; replies are shown, not spoken. Meeting: coming soon.");
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
     s_notes_sw = switch_row(list, "Voice notes", muse_settings_voice_notes(), on_notes_sw);
     note(list, "Off: hold yellow to talk live, release to listen; blue ends the call. "
@@ -1350,6 +1366,10 @@ static void tick_sound(void)
     bool on = muse_settings_speaker_on();   /* also toggled from the face */
     if (s_spk_sw && on != lv_obj_has_state(s_spk_sw, LV_STATE_CHECKED)) {
         lv_obj_set_state(s_spk_sw, LV_STATE_CHECKED, on);
+    }
+    int gm = muse_settings_gadget_mode();
+    for (int i = 0; i < GADGET_MODE_COUNT; i++) {
+        if (s_mode_checks[i]) set_text(s_mode_checks[i], i == gm ? LV_SYMBOL_OK : "");
     }
     if (muse_board->epaper) return;
     float db = muse_voice_monitor_db();
