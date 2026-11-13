@@ -40,6 +40,11 @@ typedef struct {
     float happy;     /* 0..1 pet reaction */
     float working;   /* 0 or 1 in THINKING: a call's Muse is busy on work it was asked
                       * for, nothing playing. A renderer that ignores it shows THINKING. */
+    float rest;      /* 0..1: lying-down quiet pose (a meeting recording is running):
+                      * body flattened, eyes shut, slow breathing, Z's and a red
+                      * recording dot. A renderer that ignores it shows the mode. */
+    float idle;      /* seconds the face has been left alone (awake, untouched):
+                      * drives yawns and heavy lids in IDLE. Ignorable. */
 } muse_pose_t;
 
 /* Accent colour of a mode (for the surrounding UI), as 0xRRGGBB. */

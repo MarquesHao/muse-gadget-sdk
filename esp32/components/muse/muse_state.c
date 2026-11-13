@@ -304,3 +304,15 @@ float muse_state_happiness(void)
     /* Ease out over the last 0.4 s. */
     return left > 0.4f ? 1.0f : left / 0.4f;
 }
+
+static volatile bool s_recording;
+
+void muse_state_set_recording(bool on)
+{
+    s_recording = on;
+}
+
+bool muse_state_recording(void)
+{
+    return s_recording;
+}

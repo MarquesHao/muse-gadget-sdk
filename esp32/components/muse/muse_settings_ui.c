@@ -122,7 +122,38 @@ static lv_obj_t *s_ble_sw, *s_ble_status;
 static lv_obj_t *s_notes_sw;
 #endif
 static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val;
-static const char *const GADGET_MODE_NAMES[] = { "Voice call", "Text replies", "Meeting (soon)" };
+#if CONFIG_MUSE_CJK_FONT_NOTO
+LV_FONT_DECLARE(muse_font_cjk_noto_16)
+#define SETTINGS_CJK_FONT muse_font_cjk_noto_16
+#elif CONFIG_MUSE_CJK_FONT
+LV_FONT_DECLARE(muse_font_cjk_16)
+#define SETTINGS_CJK_FONT muse_font_cjk_16
+#endif
+#if CONFIG_MUSE_CJK_FONT
+/* Chinese pilot (project V1.1, P4): the Sound page in Chinese. */
+static const char *const GADGET_MODE_NAMES[] = { "语音通话", "文字回复", "会议录音" };
+static const char *const SOUND_TITLE = "声音";
+static const char *const SOUND_NAV = "声音";
+static const char *const SOUND_MODE_HINT = "模式：";
+static const char *const SOUND_MODE_DESC =
+    "语音通话：点顶部键实时通话，或按住发语音条。文字回复：按住说话，回复只显示文字、不出声。"
+    "会议录音：录音存到设备里，再按一次顶部键停止；文件只留在设备上。";
+static const char *const SOUND_SPEAKER = "扬声器";
+static const char *const SOUND_VOLUME = "音量";
+static const char *const SOUND_GAIN = "麦克风增益";
+#else
+static const char *const GADGET_MODE_NAMES[] = { "Voice call", "Text replies", "Meeting" };
+static const char *const SOUND_TITLE = "SOUND";
+static const char *const SOUND_NAV = "Sound";
+static const char *const SOUND_MODE_HINT = "Mode:";
+static const char *const SOUND_MODE_DESC =
+    "Voice call: tap the top button to talk live, or hold it to send a voice note. "
+    "Text replies: hold to talk; replies are shown, not spoken. Meeting: records to the "
+    "device until the top button is pressed again; files stay on the device.";
+static const char *const SOUND_SPEAKER = "Speaker";
+static const char *const SOUND_VOLUME = "Volume";
+static const char *const SOUND_GAIN = "Mic gain";
+#endif
 #define GADGET_MODE_COUNT (int)(sizeof(GADGET_MODE_NAMES) / sizeof(GADGET_MODE_NAMES[0]))
 static lv_obj_t *s_mode_checks[GADGET_MODE_COUNT], *s_mode_rows[GADGET_MODE_COUNT];
 
@@ -169,6 +200,44 @@ static const lv_font_t *settings_font(const lv_font_t *font)
     return font;
 }
 
+/* settings_font() plus the CJK fallback (project V1.1, P4), so labels
+ * whose text is Chinese in this build render their hanzi. The fallback
+ * only ever supplies glyphs the base font lacks, so Latin text is
+ * unchanged. Copies live in a small static table, like muse_ui.c's. */
+static const lv_font_t *settings_font_cjk(const lv_font_t *font)
+{
+#if CONFIG_MUSE_CJK_FONT
+    /* Distinct results of settings_font() across every settings page:
+     * unscii_16 and montserrat 14/16/20/28, fewer on wide layouts where
+     * the mapper merges sizes — eight slots cover them with room. */
+    static lv_font_t copies[8];
+    static lv_font_t chains[8];
+    static const lv_font_t *bases[8];
+    static int used;
+    for (int i = 0; i < used; i++) {
+        if (bases[i] == font) {
+            return &copies[i];
+        }
+    }
+    if (used >= 8) {
+        return font;
+    }
+    copies[used] = *font;
+    if (font->fallback) {
+        /* Chain, never replace an existing fallback. */
+        chains[used] = SETTINGS_CJK_FONT;
+        chains[used].fallback = font->fallback;
+        copies[used].fallback = &chains[used];
+    } else {
+        copies[used].fallback = &SETTINGS_CJK_FONT;
+    }
+    bases[used] = font;
+    return &copies[used++];
+#else
+    return font;
+#endif
+}
+
 /* A 172 px portrait panel cannot fit an icon, name and status side by side. */
 static bool narrow_panel(void)
 {
@@ -206,7 +275,7 @@ static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, uint32_t color, 
 {
     char shown[SHOWN_MAX];
     lv_obj_t *l = lv_label_create(parent);
-    lv_obj_set_style_text_font(l, settings_font(font), 0);
+    lv_obj_set_style_text_font(l, settings_font_cjk(settings_font(font)), 0);
     lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
     lv_label_set_text(l, muse_text_showable(text, shown, sizeof(shown)));
     return l;
@@ -1306,25 +1375,24 @@ static void build_sound_page(lv_obj_t *tile)
         set_val(s_bright_val, "%d%%", muse_settings_brightness());
         return;
     }
-    s_sound = page(tile, "SOUND", true, &list);
-    note(list, "Mode:");
+    s_sound = page(tile, SOUND_TITLE, true, &list);
+    note(list, SOUND_MODE_HINT);
     for (int i = 0; i < GADGET_MODE_COUNT; i++) {
         s_mode_rows[i] = row(list, NULL, GADGET_MODE_NAMES[i], &s_mode_checks[i], on_mode_choice,
                              (void *)(intptr_t)i);
         lv_obj_set_style_text_color(s_mode_checks[i], lv_color_hex(COLOR_ACCENT), 0);
     }
-    note(list, "Voice call: tap the top button to talk live, or hold it to send a voice note. "
-               "Text replies: hold to talk; replies are shown, not spoken. Meeting: coming soon.");
+    note(list, SOUND_MODE_DESC);
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
     s_notes_sw = switch_row(list, "Voice notes", muse_settings_voice_notes(), on_notes_sw);
     note(list, "Off: hold yellow to talk live, release to listen; blue ends the call. "
                "On: hold yellow to send a voice note. Applies to the next call.");
 #endif
     if (muse_board->audio_init) {
-        s_spk_sw = switch_row(list, "Speaker", muse_settings_speaker_on(), on_speaker_sw);
-        s_vol_sl = slider(list, "Volume", 0, 100, muse_settings_volume(), &s_vol_val, on_volume);
+        s_spk_sw = switch_row(list, SOUND_SPEAKER, muse_settings_speaker_on(), on_speaker_sw);
+        s_vol_sl = slider(list, SOUND_VOLUME, 0, 100, muse_settings_volume(), &s_vol_val, on_volume);
     }
-    s_gain_sl = slider(list, "Mic gain", 0, MUSE_MIC_GAIN_MAX / 3, muse_settings_mic_gain() / 3, &s_gain_val, on_gain);
+    s_gain_sl = slider(list, SOUND_GAIN, 0, MUSE_MIC_GAIN_MAX / 3, muse_settings_mic_gain() / 3, &s_gain_val, on_gain);
 
     lv_obj_t *meter = lv_obj_create(list);
     lv_obj_remove_style_all(meter);
@@ -1603,7 +1671,7 @@ static void build_home(lv_obj_t *tile)
     if (screen_only()) {
         row(list, LV_SYMBOL_IMAGE, "Screen", &s_home_sound, on_nav, (void *)&SOUND);
     } else {
-        row(list, LV_SYMBOL_VOLUME_MAX, "Sound", &s_home_sound, on_nav, (void *)&SOUND);
+        row(list, LV_SYMBOL_VOLUME_MAX, SOUND_NAV, &s_home_sound, on_nav, (void *)&SOUND);
     }
     row(list, LV_SYMBOL_EYE_CLOSE, "Sleep", &s_home_sleep, on_nav, (void *)&SLEEP);
     row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);

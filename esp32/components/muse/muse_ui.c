@@ -31,6 +31,7 @@
 #include "src/draw/lv_image_decoder_private.h"   /* custom decoder */
 #include "src/misc/lv_area_private.h"            /* lv_area_intersect, for the ring */
 
+#include "muse_audio.h"
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_input.h"
@@ -115,10 +116,30 @@ static bool s_note_listening;   /* a toggled note is recording: keep its face up
 static volatile bool s_face_active = true;
 static lv_obj_t *s_face;
 
+/* Quick panel (project V1.1, P1): tapping Muse while idle opens a small
+ * card on the top layer with the three-mode switch and the volume slider —
+ * the same controls as the Sound settings page, without swiping there.
+ * A tap anywhere outside the card closes it. */
+static lv_obj_t *s_quick, *s_quick_catch;
+static lv_obj_t *s_quick_checks[MUSE_GADGET_MODE_COUNT], *s_quick_vol_val, *s_quick_vol_sl;
+static bool s_quick_open;
+static bool s_quick_syncing;   /* quick_refresh is setting the slider itself */
+static int s_quick_shown_mode = -1, s_quick_shown_vol = -1;   /* what the card last painted */
+#if CONFIG_MUSE_CJK_FONT
+static const char *const QUICK_MODE_NAMES[MUSE_GADGET_MODE_COUNT] = {
+    "语音通话", "文字回复", "会议录音",
+};
+#else
+static const char *const QUICK_MODE_NAMES[MUSE_GADGET_MODE_COUNT] = {
+    "Voice call", "Text replies", "Meeting",
+};
+#endif
+_Static_assert(MUSE_GADGET_MODE_COUNT == 3, "QUICK_MODE_NAMES names every gadget mode");
+
 static void update_tileview_swipe(void)
 {
     if (!s_tv) return;
-    bool enabled = s_swipe_enabled && !s_touch_talk_down;
+    bool enabled = s_swipe_enabled && !s_touch_talk_down && !s_quick_open;
 #if CONFIG_MUSE_VOICE_NOTE_TOGGLE
     enabled = enabled && !s_note_listening;
 #endif
@@ -545,10 +566,116 @@ static void build_button_icons(lv_obj_t *face)
     lv_obj_align(s_aux_icon, a->align, a->x, a->y);
 }
 
+static void quick_refresh(void)
+{
+    if (!s_quick) return;
+    int gm = muse_settings_gadget_mode();
+    if (gm != s_quick_shown_mode) {
+        s_quick_shown_mode = gm;
+        for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
+            if (s_quick_checks[i]) {
+                lv_label_set_text(s_quick_checks[i], i == gm ? LV_SYMBOL_OK : "");
+            }
+        }
+    }
+    /* The slider follows the setting (it can change on the Sound page too),
+     * except while it is being dragged. */
+    if (s_quick_vol_sl && !lv_obj_has_state(s_quick_vol_sl, LV_STATE_PRESSED)) {
+        int v = muse_settings_volume();
+        if (v != s_quick_shown_vol) {
+            s_quick_shown_vol = v;
+            s_quick_syncing = true;   /* a programmatic set must not re-enter on_quick_volume */
+            lv_slider_set_value(s_quick_vol_sl, v, LV_ANIM_OFF);
+            s_quick_syncing = false;
+            if (s_quick_vol_val) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%d", v);
+                lv_label_set_text(s_quick_vol_val, buf);
+            }
+        }
+    }
+}
+
+static void quick_hide(void)
+{
+    if (!s_quick_open) return;
+    s_quick_open = false;
+    lv_obj_add_flag(s_quick_catch, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_quick, LV_OBJ_FLAG_HIDDEN);
+    update_tileview_swipe();
+}
+
+static void quick_show(void)
+{
+    if (!s_quick || s_quick_open) return;
+    s_quick_shown_mode = s_quick_shown_vol = -1;   /* repaint on open */
+    quick_refresh();
+    /* No move_foreground: build order on the top layer (pairing card, then
+     * catcher, then this card, then the sleep cover) already stacks them
+     * right, and the cover must stay above the card. */
+    lv_obj_remove_flag(s_quick_catch, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_quick, LV_OBJ_FLAG_HIDDEN);
+    s_quick_open = true;
+    update_tileview_swipe();
+}
+
+/* Per frame: the panel lives only while the face shows, idle. Anything
+ * else (a press starting a note, a call, sleep) takes it away. */
+static void quick_tick(void)
+{
+    if (!s_quick_open) return;
+    if (!s_face_active || muse_state_mode(NULL) != MUSE_MODE_IDLE || muse_state_recording()) {
+        quick_hide();
+        return;
+    }
+    quick_refresh();
+}
+
+static void on_quick_mode(lv_event_t *e)
+{
+    int mode = (int)(intptr_t)lv_event_get_user_data(e);
+    muse_settings_set_gadget_mode(mode);
+    quick_refresh();
+    if (mode == MUSE_GADGET_MODE_MEETING) {
+        quick_hide();   /* recording starts at once: show its face, not the card */
+    }
+}
+
+static void on_quick_volume(lv_event_t *e)
+{
+    if (s_quick_syncing) return;
+    /* Dragging fires this per pixel: apply the level now, but persist it
+     * once, on release (on_quick_volume_done) — muse_settings_set_volume
+     * writes NVS on every call. */
+    int v = lv_slider_get_value(lv_event_get_target(e));
+    muse_audio_set_volume(v);
+    if (s_quick_vol_val) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d", v);
+        lv_label_set_text(s_quick_vol_val, buf);
+    }
+}
+
+static void on_quick_volume_done(lv_event_t *e)
+{
+    int v = lv_slider_get_value(lv_event_get_target(e));
+    muse_settings_set_volume(v);
+    s_quick_shown_vol = v;
+}
+
+static void on_quick_catch(lv_event_t *e)
+{
+    (void)e;
+    quick_hide();
+}
+
 static void on_canvas_clicked(lv_event_t *e)
 {
     (void)e;
     muse_state_make_happy();
+    if (s_face_active && muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+        quick_show();
+    }
 }
 
 static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compact)
@@ -586,6 +713,47 @@ static const lv_font_t *caption_font(void)
     return &font;
 #else
     return &lv_font_unscii_16;
+#endif
+}
+
+/* A copy of a UI font whose fallback is the CJK font, so the labels this
+ * project shows in Chinese (gadget-mode names, the quick panel) render
+ * their hanzi instead of boxes. Same trick as caption_font(): LVGL's
+ * fonts are shared const objects, so the copies live in a small static
+ * table keyed by the base font. Without CONFIG_MUSE_CJK_FONT this is
+ * the base font itself. */
+static const lv_font_t *ui_font_cjk(const lv_font_t *base)
+{
+#if CONFIG_MUSE_CJK_FONT
+    /* Distinct bases in use: the quick panel's title/name font and its
+     * 14 px labels, after muse_lang_montserrat() — a handful at most. */
+    static lv_font_t copies[6];
+    static lv_font_t chains[6];
+    static const lv_font_t *bases[6];
+    static int used;
+    for (int i = 0; i < used; i++) {
+        if (bases[i] == base) {
+            return &copies[i];
+        }
+    }
+    if (used >= 6) {
+        ESP_LOGW(TAG, "ui_font_cjk: table full, %p keeps no CJK fallback", (const void *)base);
+        return base;
+    }
+    copies[used] = *base;
+    if (base->fallback) {
+        /* Chain, never replace: the base may already fall back somewhere
+         * (muse_lang_montserrat's accented-letters font, say). */
+        chains[used] = CJK_FONT;
+        chains[used].fallback = base->fallback;
+        copies[used].fallback = &chains[used];
+    } else {
+        copies[used].fallback = &CJK_FONT;
+    }
+    bases[used] = base;
+    return &copies[used++];
+#else
+    return base;
 #endif
 }
 
@@ -1617,6 +1785,81 @@ static void build_overlays(void)
     lv_obj_set_width(s_pair_hint, lv_pct(100));
     lv_label_set_long_mode(s_pair_hint, LV_LABEL_LONG_MODE_WRAP);
 
+    if (muse_board->touch) {
+        /* Quick panel: an invisible full-screen catcher under a small card,
+         * both on the top layer like the pairing card. The catcher takes
+         * every tap outside the card and closes it. */
+        s_quick_catch = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(s_quick_catch);
+        lv_obj_set_size(s_quick_catch, lv_pct(100), lv_pct(100));
+        lv_obj_add_flag(s_quick_catch, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_event_cb(s_quick_catch, on_quick_catch, LV_EVENT_CLICKED, NULL);
+
+        s_quick = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(s_quick);
+        lv_obj_set_size(s_quick, s_small ? s_w - 24 : 320, LV_SIZE_CONTENT);
+        lv_obj_center(s_quick);
+        lv_obj_set_flex_flow(s_quick, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(s_quick, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_ver(s_quick, s_small ? 10 : 16, 0);
+        lv_obj_set_style_pad_hor(s_quick, s_small ? 10 : 16, 0);
+        lv_obj_set_style_pad_row(s_quick, 8, 0);
+        lv_obj_set_style_radius(s_quick, s_small ? 10 : 24, 0);
+        lv_obj_set_style_bg_opa(s_quick, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(s_quick, lv_color_hex(0x1a1530), 0);
+        lv_obj_set_style_border_color(s_quick, lv_color_hex(COLOR_ACCENT), 0);
+        lv_obj_set_style_border_width(s_quick, 2, 0);
+        lv_obj_remove_flag(s_quick, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_quick, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t *q_title = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
+#if CONFIG_MUSE_CJK_FONT
+        lv_label_set_text(q_title, "模式");
+#else
+        lv_label_set_text(q_title, "Mode");
+#endif
+        for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
+            lv_obj_t *row = lv_obj_create(s_quick);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, lv_pct(100), 36);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(row, 10, 0);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, on_quick_mode, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            s_quick_checks[i] = make_label(row, &lv_font_montserrat_20, COLOR_ACCENT);
+            lv_obj_set_width(s_quick_checks[i], 26);
+            lv_obj_t *name = make_label(row, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
+            lv_label_set_text(name, QUICK_MODE_NAMES[i]);
+        }
+        lv_obj_t *vol_row = lv_obj_create(s_quick);
+        lv_obj_remove_style_all(vol_row);
+        lv_obj_set_size(vol_row, lv_pct(100), 36);
+        lv_obj_set_flex_flow(vol_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(vol_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(vol_row, 10, 0);
+        lv_obj_t *vol_name = make_label(vol_row, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
+#if CONFIG_MUSE_CJK_FONT
+        lv_label_set_text(vol_name, "音量");
+#else
+        lv_label_set_text(vol_name, "Volume");
+#endif
+        s_quick_vol_sl = lv_slider_create(vol_row);
+        lv_slider_set_range(s_quick_vol_sl, 0, 100);
+        lv_slider_set_value(s_quick_vol_sl, muse_settings_volume(), LV_ANIM_OFF);
+        lv_obj_set_flex_grow(s_quick_vol_sl, 1);
+        lv_obj_add_event_cb(s_quick_vol_sl, on_quick_volume, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(s_quick_vol_sl, on_quick_volume_done, LV_EVENT_RELEASED, NULL);
+        lv_obj_add_event_cb(s_quick_vol_sl, on_quick_volume_done, LV_EVENT_PRESS_LOST, NULL);
+        s_quick_vol_val = make_label(vol_row, muse_lang_montserrat(&lv_font_montserrat_14), COLOR_LIT);
+        lv_obj_set_width(s_quick_vol_val, 30);
+        lv_obj_t *q_hint = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
+#if CONFIG_MUSE_CJK_FONT
+        lv_label_set_text(q_hint, "点外面关闭");
+#else
+        lv_label_set_text(q_hint, "Tap outside to close");
+#endif
+    }
+
     /* Sleep cover: swallows the waking touch. */
     s_cover = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(s_cover);
@@ -2196,7 +2439,9 @@ static void frame_tick(lv_timer_t *timer)
     }
 #endif
     update_chrome(now);
+    quick_tick();
     if (muse_menu_tick(now)) {
+        quick_hide();
         image_hide_locked();
         return;   /* the menu covers the face */
     }
@@ -2216,6 +2461,14 @@ static void frame_tick(lv_timer_t *timer)
         ((mode == MUSE_MODE_LISTENING) != (muse_voice_call_view() == MUSE_VOICE_VIEW_LISTENING))) level = 0;
     s_level += (level - s_level) * (level > s_level ? 0.6f : 0.2f);
 
+    /* The rest pose (meeting recording) eases in and out like the level. */
+    static float s_rest_level;
+    float rest_target = muse_state_recording() ? 1.0f : 0.0f;
+    s_rest_level += (rest_target - s_rest_level) * 0.08f;
+    if (rest_target == 0.0f && s_rest_level < 0.01f) {
+        s_rest_level = 0.0f;
+    }
+
     muse_pose_t pose = {
         .mode = mode,
         .t = now,
@@ -2223,6 +2476,8 @@ static void frame_tick(lv_timer_t *timer)
         .level = s_level,
         .happy = muse_state_happiness(),
         .working = muse_voice_call_view() == MUSE_VOICE_VIEW_WORKING ? 1.0f : 0,
+        .rest = s_rest_level,
+        .idle = (float)muse_state_idle_secs(),
     };
     if (!muse_board->epaper || mode != s_last_epaper_pose) {
         muse_pixel_render(&pose);

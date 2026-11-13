@@ -16,6 +16,7 @@
 
 #include "muse_voice.h"
 
+#include <inttypes.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@
 #include "muse_board.h"
 #include "muse_chat.h"
 #include "muse_input.h"
+#include "muse_meeting.h"
 #include "muse_mem.h"
 #include "muse_settings.h"
 #include "muse_state.h"
@@ -1305,6 +1307,153 @@ static void note_toggled(bool on)
 #endif
 }
 
+/*
+ * Meeting mode (project V1.1, P2): while the gadget mode is MEETING the
+ * voice task records the room to a WAV file on the storage partition
+ * instead of idling. Entering the mode starts a recording; a talk press,
+ * leaving the mode or a full disk ends it, and the file is finalized
+ * before the caption says so. This task never writes flash itself (its
+ * stack is in PSRAM): encoded blocks go to muse_meeting's writer task.
+ * After a press stop the session stays disarmed until the next press, so
+ * the press is a plain record/stop toggle within the mode.
+ */
+static bool s_meet_armed = true;
+static bool s_meet_failed;
+
+/* One 512-byte WAV IMA block from 1017 samples: the first sample travels
+ * as the block preamble (predictor, index 0) and the encoder is seeded
+ * with it, so any standard IMA decoder can play the file. */
+static void meet_encode_block(const int16_t *pcm, uint8_t out[MUSE_MEETING_BLOCK_BYTES])
+{
+    out[0] = (uint8_t)(pcm[0] & 0xff);
+    out[1] = (uint8_t)((pcm[0] >> 8) & 0xff);
+    out[2] = 0;
+    out[3] = 0;
+    muse_adpcm_t enc = { .pred = pcm[0], .index = 0 };
+    muse_adpcm_encode_block(&enc, pcm + 1, MUSE_MEETING_BLOCK_SAMPLES - 1, out + 4);
+}
+
+static void meeting_session(void)
+{
+    char name[20];
+    uint32_t max_blocks = 0;
+    if (muse_meeting_begin(name, sizeof(name), &max_blocks) != ESP_OK) {
+        s_meet_failed = true;
+        muse_state_set_mode(MUSE_MODE_IDLE);
+        muse_state_set_caption("MEETING STORAGE UNAVAILABLE");
+        return;
+    }
+    int16_t *stage = heap_caps_malloc((MUSE_MEETING_BLOCK_SAMPLES + MUSE_AUDIO_CHUNK) * sizeof(int16_t),
+                                      MUSE_BIG_CAPS);
+    if (!stage) {
+        muse_meeting_end(0);
+        s_meet_failed = true;
+        muse_state_set_caption("MEETING OUT OF MEMORY");
+        return;
+    }
+    muse_state_set_mode(MUSE_MODE_IDLE);
+    muse_state_set_recording(true);
+    muse_state_set_caption("REC 00:00");
+    size_t staged = 0;
+    uint32_t total = 0, blocks = 0;
+    uint32_t enc_samples = 0;   /* samples actually handed to the writer: the WAV fact count */
+    bool stop_press = false, full = false, error = false;
+    int64_t start_us = esp_timer_get_time();
+    int last_sec = -1;
+    while (!full && !error) {
+        if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+            error = true;
+            break;
+        }
+        muse_state_set_level(muse_audio_level(s_chunk, MUSE_AUDIO_CHUNK));
+        memcpy(stage + staged, s_chunk, sizeof(s_chunk));
+        staged += MUSE_AUDIO_CHUNK;
+        total += MUSE_AUDIO_CHUNK;
+        while (staged >= MUSE_MEETING_BLOCK_SAMPLES) {
+            uint8_t block[MUSE_MEETING_BLOCK_BYTES];
+            meet_encode_block(stage, block);
+            memmove(stage, stage + MUSE_MEETING_BLOCK_SAMPLES,
+                    (staged - MUSE_MEETING_BLOCK_SAMPLES) * sizeof(int16_t));
+            staged -= MUSE_MEETING_BLOCK_SAMPLES;
+            if (!muse_meeting_write(block)) {
+                error = true;   /* writer fell behind or the disk filled */
+                break;
+            }
+            enc_samples += MUSE_MEETING_BLOCK_SAMPLES;
+            if (++blocks >= max_blocks) {
+                full = true;
+                break;
+            }
+        }
+        if (error || full) {
+            break;
+        }
+        muse_input_event_t ev;
+        while (xQueueReceive(s_queue, &ev, 0) == pdTRUE) {
+            muse_state_poke();
+            /* Any press stops a meeting recording. Unlike record() there
+             * is no epoch check: in this mode a press has no other meaning,
+             * and an epoch bumped by a full input queue must not leave a
+             * recording unstoppable. */
+            if (ev.type == MUSE_PTT_DOWN) {
+                stop_press = true;
+            }
+            muse_input_clear_call_pending(ev.mark);   /* presses end here, like record()'s */
+        }
+        if (stop_press || muse_settings_gadget_mode() != MUSE_GADGET_MODE_MEETING
+            || atomic_load(&s_shutdown)) {
+            break;
+        }
+        int sec = (int)((esp_timer_get_time() - start_us) / 1000000);
+        if (sec != last_sec) {
+            last_sec = sec;
+            muse_state_poke();   /* a recording keeps the screen (and its REC marker) up */
+            muse_state_set_caption("REC %02d:%02d", sec / 60, sec % 60);
+        }
+    }
+    if (!error && staged > 0) {
+        /* Pad the tail to a whole block with its last sample: no speech lost.
+         * The fact chunk counts only the real (pre-pad) samples. On the
+         * error path the staged remainder is dropped instead, so the header
+         * never claims samples the file does not contain. */
+        uint32_t tail_samples = (uint32_t)staged;
+        for (size_t i = staged; i < MUSE_MEETING_BLOCK_SAMPLES; i++) {
+            stage[i] = stage[staged - 1];
+        }
+        uint8_t block[MUSE_MEETING_BLOCK_BYTES];
+        meet_encode_block(stage, block);
+        if (muse_meeting_write(block)) {
+            blocks++;
+            enc_samples += tail_samples;
+        }
+    }
+    muse_state_set_level(0);
+    muse_state_set_recording(false);
+    esp_err_t end = muse_meeting_end(enc_samples);
+    free(stage);
+    s_meet_armed = false;
+    int secs = (int)(enc_samples / MUSE_AUDIO_RATE);
+    char msg[64];
+    if (end != ESP_OK) {
+        s_meet_failed = true;
+        /* A caption, not a hint: a failed save must not auto-expire
+         * (upstream's caption/hint split, tests/test_muse_caption_hint). */
+        muse_state_set_caption("MEETING SAVE FAILED");
+    } else if (full) {
+        snprintf(msg, sizeof(msg), "STORAGE FULL - SAVED %s", name);
+        muse_state_set_hint(msg);
+    } else if (error) {
+        snprintf(msg, sizeof(msg), "SAVED %s (STOPPED EARLY)", name);
+        muse_state_set_hint(msg);
+    } else {
+        snprintf(msg, sizeof(msg), "SAVED %s (%02d:%02d)", name, secs / 60, secs % 60);
+        muse_state_set_hint(msg);
+    }
+    ESP_LOGI(TAG, "meeting %s: %s, %" PRIu32 " captured, %" PRIu32 " written in %" PRIu32 " blocks",
+             name, full ? "storage full" : stop_press ? "press stop" : "mode change/shutdown",
+             total, enc_samples, blocks);
+}
+
 static void voice_task(void *arg)
 {
     bool pending_down = false;
@@ -1377,6 +1526,17 @@ static void voice_task(void *arg)
                 }
                 continue;
             }
+            /* Meeting mode records instead of idling (see meeting_session). */
+            if (muse_settings_gadget_mode() == MUSE_GADGET_MODE_MEETING) {
+                if (s_meet_armed && !s_meet_failed && !atomic_load(&s_shutdown)) {
+                    meeting_session();
+                    pre_reset();
+                    continue;
+                }
+            } else {
+                s_meet_armed = true;   /* re-arm for the next visit */
+                s_meet_failed = false;
+            }
             /* The 20 ms read paces this loop. */
             idle_capture();
             if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
@@ -1392,12 +1552,18 @@ static void voice_task(void *arg)
             s_press_us = ev.at_us;
             wake = ev.wake;
             if (muse_settings_gadget_mode() == MUSE_GADGET_MODE_MEETING) {
-                /* Meeting mode is a placeholder in this build: never record,
-                 * just say so on the face. A waking press only wakes. */
+                /* A press outside a running meeting session: re-arm (the
+                 * recording starts on the next loop pass), or repeat why
+                 * recording is unavailable. A waking press only wakes. */
                 muse_input_clear_call_pending(ev.mark);
                 if (!ev.wake) {
                     muse_state_set_mode(MUSE_MODE_IDLE);
-                    muse_state_set_caption("MEETING MODE - COMING SOON");
+                    if (s_meet_failed) {
+                        muse_state_set_caption("MEETING STORAGE UNAVAILABLE");
+                    } else {
+                        s_meet_armed = true;
+                        muse_state_set_caption("MEETING - STARTING");
+                    }
                 }
                 pre_reset();
                 continue;

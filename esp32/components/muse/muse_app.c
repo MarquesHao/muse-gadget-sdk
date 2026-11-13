@@ -26,6 +26,7 @@
 #include "muse_ble.h"
 #include "muse_chat.h"
 #include "muse_input.h"
+#include "muse_meeting.h"
 #include "muse_settings.h"
 #include "muse_state.h"
 #include "muse_text.h"
@@ -75,6 +76,11 @@ void muse_app_run(const muse_board_t *board)
     ESP_ERROR_CHECK(muse_settings_init());
     muse_settings_set_listener(on_setting);
     muse_state_init();
+    /* Meeting storage prewarm: the one place a first-boot format may
+     * happen (this task's stack is internal RAM; the voice task's is not).
+     * Failure is fine here — boards without a storage partition and a
+     * corrupt store just make meeting mode report unavailable. */
+    (void)muse_meeting_mount();
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
     ESP_ERROR_CHECK(muse_review_init());
 #endif

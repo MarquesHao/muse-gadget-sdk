@@ -106,3 +106,9 @@ void muse_state_nudge(void);
 /* Touch/pet reaction. */
 void muse_state_make_happy(void);
 float muse_state_happiness(void);
+
+/* Meeting mode is recording to local storage (project V1.1): the UI shows
+ * the resting pose with a recording marker while this is set. Written by
+ * the voice task, read by the UI. */
+void muse_state_set_recording(bool on);
+bool muse_state_recording(void);

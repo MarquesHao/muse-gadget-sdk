@@ -39,6 +39,8 @@ static void update_tileview_swipe(void) {}
 #endif
 static bool update_sleep(void) { return false; }
 static void update_chrome(float now) { (void)now; }
+static void quick_tick(void) {}
+static void quick_hide(void) {}
 static bool muse_menu_tick(float now) { (void)now; return false; }
 static int lv_obj_get_scroll_x(void *obj) { (void)obj; return 0; }
 static void invalidate_muse(void) {}
@@ -48,6 +50,8 @@ int64_t esp_timer_get_time(void) { return 1000000; }
 muse_mode_t muse_state_mode(float *t) { if (t) *t=0; return mode; }
 float muse_state_level(void) { return source_level; }
 float muse_state_happiness(void) { return 0; }
+bool muse_state_recording(void) { return false; }
+float muse_state_idle_secs(void) { return 0; }
 bool muse_voice_in_call(void) { return true; }
 muse_voice_view_t muse_voice_call_view(void) { return view; }
 void muse_pixel_render(const muse_pose_t *pose) { rendered=*pose; }

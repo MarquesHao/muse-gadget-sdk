@@ -950,6 +950,50 @@ void muse_pixel_render(const muse_pose_t *p)
     update_palette(working ? &WORKING_SCHEME : &SCHEMES[mode], dt);
     float blink = eyes_update(p, dt);
 
+    /* The rest pose belongs to the idle face: in any other mode the mode
+     * wins and rest is ignored (the recording itself keeps running). */
+    float rest = mode == MUSE_MODE_IDLE ? clampf(p->rest, 0, 1) : 0;
+
+    /* ---- idle drowsiness and the rest pose (project V1.1, P3) ----
+     * pose->idle counts seconds left alone in IDLE: past ~90 s a yawn
+     * wells up every ~40 s; past ~4 minutes the lids stay heavy.
+     * pose->rest (a meeting recording is running) closes the eyes and
+     * flattens the body below. Both are pure functions of the pose, so
+     * renderers that never fill the fields never see them. */
+    static float s_next_yawn = 90.0f;   /* in idle seconds */
+    static float s_yawn_at = -1.0f;     /* p->t when the live yawn began */
+    float yawn = 0;
+    if (rest < 0.5f && p->idle >= 90.0f) {
+        if (s_yawn_at < 0 && p->idle >= s_next_yawn) {
+            s_yawn_at = t;
+            s_next_yawn = p->idle + 35.0f + frand() * 15.0f;
+        }
+    } else {
+        s_yawn_at = -1;
+        if (p->idle < 90.0f) {
+            s_next_yawn = 90.0f;
+        }
+    }
+    if (s_yawn_at >= 0) {
+        float yt = (t - s_yawn_at) / 1.8f;
+        if (yt >= 1.0f) {
+            s_yawn_at = -1;
+        } else {
+            yawn = sinf(yt * 3.14159f);
+        }
+    }
+    float drowsy = (mode == MUSE_MODE_IDLE && rest < 0.5f)
+                 ? clampf((p->idle - 240.0f) / 60.0f, 0, 1) : 0;
+    if (yawn > 0) {
+        blink = fmaxf(blink, yawn * 0.9f);
+    }
+    if (drowsy > 0) {
+        blink = fmaxf(blink, drowsy * 0.5f);
+    }
+    if (rest > 0) {
+        blink = fmaxf(blink, rest * 0.94f);
+    }
+
     memset(s_fb, C_BG, sizeof(s_fb));
 
     /* ---- body motion ---- */
@@ -981,11 +1025,19 @@ void muse_pixel_render(const muse_pose_t *p)
     if (happy > 0) {
         hop = fabsf(sinf(t * 9.0f)) * 3.0f * happy;
     }
+    if (rest > 0) {
+        /* Lying down: stiller body, slower breath. */
+        bob *= 1.0f - rest * 0.7f;
+        breathe_rate = 2.0f - 1.1f * rest;
+    }
 
     /* Boot: the avatar pops up from a squash, then opens their eyes. */
     float boot = mode == MUSE_MODE_BOOT ? clampf(p->mode_t / 1.4f, 0, 1) : 1.0f;
     float pop = mode == MUSE_MODE_BOOT ? clampf(p->mode_t / 0.6f, 0, 1) : 1.0f;
     float squash = 1.0f - (1.0f - pop) * 0.35f + sinf(pop * 3.1416f) * 0.06f;
+    if (rest > 0) {
+        squash *= 1.0f - rest * 0.16f;   /* settled flat against the ground */
+    }
 
     float breathe = sinf(t * breathe_rate + 1.0f) * 0.03f;
     avatar_t j;
@@ -1013,6 +1065,9 @@ void muse_pixel_render(const muse_pose_t *p)
     float spk_speed = working ? 1.8f : mode == MUSE_MODE_THINKING ? 2.8f : mode == MUSE_MODE_LISTENING ? 1.2f
                     : mode == MUSE_MODE_SPEAKING ? 1.5f : 0.6f;
     int spk_count = mode == MUSE_MODE_BOOT ? (int)(boot * 6) : working ? 3 : (int)(6 * fade);
+    if (rest > 0) {
+        spk_count = (int)(spk_count * (1.0f - rest));   /* no sparkles while resting */
+    }
     draw_sparkles(p, j.cx, j.cy, false, spk_speed, spk_count);
 
     /* ---- limbs ---- */
@@ -1145,9 +1200,16 @@ void muse_pixel_render(const muse_pose_t *p)
     default:
         break;
     }
-    if (happy > 0.2f && mode != MUSE_MODE_ERROR) {
+    if (happy > 0.2f && mode != MUSE_MODE_ERROR && rest <= 0.5f) {
         style = EYES_HAPPY;
         mouth = MOUTH_GRIN;
+    }
+    if (rest > 0.5f) {
+        mouth = MOUTH_FLAT;   /* quiet while recording: rest beats happy */
+        mouth_open = 0;
+    } else if (yawn > 0.45f && mode == MUSE_MODE_IDLE) {
+        mouth = MOUTH_O;
+        mouth_open = yawn * 0.4f;
     }
 
     float gaze_x = s_eyes.gx;
@@ -1197,6 +1259,22 @@ void muse_pixel_render(const muse_pose_t *p)
     }
     if (mode == MUSE_MODE_ERROR) {
         draw_alert(iround(j.cx + 18), iround(top - 1));
+    }
+    if (rest > 0.5f) {
+        /* Recording: Z's drift up from the head, and a red dot blinks
+         * slowly in the corner — readable across the room. */
+        static const char *const ZEE[] = { "####", "...#", "..#.", ".#..", "####" };
+        for (int i = 0; i < 2; i++) {
+            float ph = fracf(t * 0.25f + i * 0.5f);
+            if (ph < 0.15f) {
+                continue;
+            }
+            stamp(ZEE, 5, iround(j.cx + 14 + ph * 5), iround(top + 4 - ph * 9), C_ACC, C_ACC);
+        }
+        if (fracf(t * 0.7f) < 0.62f) {
+            static const char *const DOT[] = { ".###.", "#####", "#####", "#####", ".###." };
+            stamp(DOT, 5, 55, 4, C_HEART, C_HEART);
+        }
     }
 
 }

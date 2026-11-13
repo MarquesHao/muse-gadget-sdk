@@ -40,6 +40,7 @@
 #include "muse_console.h"
 #include "muse_link.h"
 #include "muse_mem.h"
+#include "muse_meeting.h"
 #include "muse_menu.h"
 #include "muse_settings.h"
 #if !CONFIG_MUSE_UI_FREEINK
@@ -896,6 +897,17 @@ static bool console_command(char *line, bool whole)
         return true;
     }
 #endif
+    if (!strcmp(line, "meet.list")) {
+        muse_meeting_console_list();
+        return true;
+    }
+    if (!strncmp(line, "meet.dump=", 10)) {
+        if (!muse_meeting_console_dump(atoi(line + 10))) {
+            printf("@meet.error no such recording\n");
+            fflush(stdout);
+        }
+        return true;
+    }
     if (!strcmp(line, "status")) {
         size_t cap = 1024;   /* long SSID, host and VM names escaped: past 512 */
         char *json = heap_caps_malloc(cap, MUSE_BIG_CAPS);

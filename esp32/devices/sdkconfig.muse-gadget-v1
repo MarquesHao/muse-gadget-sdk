@@ -7,3 +7,15 @@
 # (components/muse, muse_settings_gadget_mode) gates this at run time:
 # Text mode never starts a call and never plays a reply aloud.
 CONFIG_MUSE_REALTIME_VOICE=y
+#
+# Meeting recordings (V1.1): the project partition table keeps every
+# upstream partition at its offset and adds a FAT "storage" partition in
+# the flash past the OTA slots (this board has 32 MB).
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_gadget.csv"
+#
+# Chinese UI pilot (V1.1 P4): Noto Sans SC 16 px as the caption/label CJK
+# fallback (~910 KB of flash per the Kconfig help). Captions with Chinese
+# (Muse's replies) render instead of boxes, and the gadget-mode names
+# plus the Sound page's main rows are shown in Chinese in this build.
+CONFIG_MUSE_CJK_FONT=y
+CONFIG_MUSE_CJK_FONT_NOTO=y
