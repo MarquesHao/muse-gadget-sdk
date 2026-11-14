@@ -963,7 +963,10 @@ void muse_pixel_render(const muse_pose_t *p)
     static float s_next_yawn = 90.0f;   /* in idle seconds */
     static float s_yawn_at = -1.0f;     /* p->t when the live yawn began */
     float yawn = 0;
-    if (rest < 0.5f && p->idle >= 90.0f) {
+    /* IDLE only, like the drowsy term below and the yawn mouth further
+     * down: without the mode gate, pose->idle keeps counting through a
+     * long call and the pet visibly squeezes its eyes shut mid-call. */
+    if (mode == MUSE_MODE_IDLE && rest < 0.5f && p->idle >= 90.0f) {
         if (s_yawn_at < 0 && p->idle >= s_next_yawn) {
             s_yawn_at = t;
             s_next_yawn = p->idle + 35.0f + frand() * 15.0f;

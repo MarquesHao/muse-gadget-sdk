@@ -19,3 +19,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_gadget.csv"
 # plus the Sound page's main rows are shown in Chinese in this build.
 CONFIG_MUSE_CJK_FONT=y
 CONFIG_MUSE_CJK_FONT_NOTO=y
+#
+# Custom device.guide for this build (protocols/DEVICE.md contract,
+# assembled into the firmware): tells the owner's Muse what this
+# gadget is the first time they meet — the three project modes above,
+# how meeting recording works (local WAV files only, nothing uploaded),
+# the tap-the-face quick panel and where the volume lives. Kept free of
+# anything personal; it is compiled into the firmware for anyone holding
+# the device to read.
+CONFIG_MUSE_DEVICE_GUIDE="devices/guides/muse-gadget-175c.md"

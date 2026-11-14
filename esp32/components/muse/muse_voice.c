@@ -1348,6 +1348,9 @@ static void meeting_session(void)
     if (!stage) {
         muse_meeting_end(0);
         s_meet_failed = true;
+        /* Set IDLE explicitly, like the begin() failure above: do not
+         * rely on the caller always entering here already in IDLE. */
+        muse_state_set_mode(MUSE_MODE_IDLE);
         muse_state_set_caption("MEETING OUT OF MEMORY");
         return;
     }

@@ -260,7 +260,18 @@ static void fmt_flag_set(void)
 static esp_err_t mount_or_format_once(void)
 {
     esp_err_t err = mount(false);
-    if (err == ESP_OK || fmt_flag_done()) {
+    if (err == ESP_OK) {
+        /* A partition that mounts is a formatted partition. If the flag
+         * is missing anyway — power died between the one-time format and
+         * its NVS commit — record the fact now: with the flag lost AND a
+         * later corruption, the branch below would mistake this for a
+         * fresh partition and reformat over every recording. */
+        if (!fmt_flag_done()) {
+            fmt_flag_set();
+        }
+        return ESP_OK;
+    }
+    if (fmt_flag_done()) {
         return err;
     }
     err = mount(true);
@@ -343,6 +354,16 @@ esp_err_t muse_meeting_begin(char *name_out, size_t name_cap, uint32_t *max_bloc
     }
     meet_msg_t m = { .kind = MSG_BEGIN };
     snprintf(m.name, sizeof(m.name), "MEET%04d.WAV", idx);
+    /* Arm the recording guard BEFORE the writer creates the file: the
+     * console dump refuses s_current while s_recording is set, and that
+     * refusal must already hold in the window between the writer opening
+     * the file and this call returning — otherwise a dump in that window
+     * exports the placeholder header as an empty WAV. Cleared again on
+     * the failure return below (the timeout path clears it in end()). */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    strlcpy(s_current, m.name, sizeof(s_current));
+    s_recording = true;
+    xSemaphoreGive(s_lock);
     /* Drain a token a timed-out earlier call may have left behind, or this
      * take could complete against the wrong operation. The writer resets
      * s_op_err when it processes BEGIN; nothing else may. */
@@ -354,12 +375,12 @@ esp_err_t muse_meeting_begin(char *name_out, size_t name_cap, uint32_t *max_bloc
         return ESP_ERR_TIMEOUT;
     }
     if (s_op_err != ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_recording = false;
+        s_current[0] = '\0';
+        xSemaphoreGive(s_lock);
         return s_op_err;
     }
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    strlcpy(s_current, m.name, sizeof(s_current));
-    s_recording = true;
-    xSemaphoreGive(s_lock);
     if (name_out) {
         strlcpy(name_out, m.name, name_cap);
     }
