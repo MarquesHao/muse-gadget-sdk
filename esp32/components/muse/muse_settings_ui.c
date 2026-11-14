@@ -122,6 +122,8 @@ static lv_obj_t *s_ble_sw, *s_ble_status;
 static lv_obj_t *s_notes_sw;
 #endif
 static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val;
+/* Keep this NOTO-first selection in sync with CJK_FONT in muse_ui.c:
+ * the two files each pick the CJK font this way. */
 #if CONFIG_MUSE_CJK_FONT_NOTO
 LV_FONT_DECLARE(muse_font_cjk_noto_16)
 #define SETTINGS_CJK_FONT muse_font_cjk_noto_16
@@ -155,6 +157,11 @@ static const char *const SOUND_VOLUME = "Volume";
 static const char *const SOUND_GAIN = "Mic gain";
 #endif
 #define GADGET_MODE_COUNT (int)(sizeof(GADGET_MODE_NAMES) / sizeof(GADGET_MODE_NAMES[0]))
+/* Direct guard, not just muse_ui.c's transitive one: if the name list
+ * and the settings enum drift apart, this file must fail to build too —
+ * its rows are indexed by mode and cast straight to muse_gadget_mode_t. */
+_Static_assert(GADGET_MODE_COUNT == MUSE_GADGET_MODE_COUNT,
+               "GADGET_MODE_NAMES names every gadget mode");
 static lv_obj_t *s_mode_checks[GADGET_MODE_COUNT], *s_mode_rows[GADGET_MODE_COUNT];
 
 /* Sleep page. */
@@ -209,7 +216,11 @@ static const lv_font_t *settings_font_cjk(const lv_font_t *font)
 #if CONFIG_MUSE_CJK_FONT
     /* Distinct results of settings_font() across every settings page:
      * unscii_16 and montserrat 14/16/20/28, fewer on wide layouts where
-     * the mapper merges sizes — eight slots cover them with room. */
+     * the mapper merges sizes — five at most, so the eight slots cannot
+     * fill and the "table full" return below is unreachable in practice;
+     * only a ninth distinct font — the first to find all eight slots
+     * taken — would keep no CJK fallback (Latin unaffected, hanzi would
+     * box) until a slot is added. */
     static lv_font_t copies[8];
     static lv_font_t chains[8];
     static const lv_font_t *bases[8];

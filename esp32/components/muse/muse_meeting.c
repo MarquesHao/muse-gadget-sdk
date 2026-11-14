@@ -124,6 +124,11 @@ static void writer_task(void *arg)
                 s_op_err = ESP_FAIL;
                 fclose(s_fp);
                 s_fp = NULL;
+                /* The file holds at most a partial header and no audio:
+                 * remove it, or it would squat on this MEETnnnn name
+                 * forever (next_index() only reuses gaps) and show up
+                 * in the list as a zero-second recording. */
+                remove(s_fp_path);
             }
             xSemaphoreGive(s_done);
         } else if (m.kind == MSG_DATA) {

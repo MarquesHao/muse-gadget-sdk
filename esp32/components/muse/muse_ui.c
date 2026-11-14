@@ -683,6 +683,8 @@ static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compac
     return s_small ? compact : full;
 }
 
+/* Keep this NOTO-first selection in sync with SETTINGS_CJK_FONT in
+ * muse_settings_ui.c: the two files each pick the CJK font this way. */
 #if CONFIG_MUSE_CJK_FONT_NOTO
 LV_FONT_DECLARE(muse_font_cjk_noto_16)
 #define CJK_FONT muse_font_cjk_noto_16
@@ -725,8 +727,12 @@ static const lv_font_t *caption_font(void)
 static const lv_font_t *ui_font_cjk(const lv_font_t *base)
 {
 #if CONFIG_MUSE_CJK_FONT
-    /* Distinct bases in use: the quick panel's title/name font and its
-     * 14 px labels, after muse_lang_montserrat() — a handful at most. */
+    /* Distinct bases in use: exactly two call patterns — the quick
+     * panel's title/name font and its 14 px labels, each passed through
+     * muse_lang_montserrat() — so at most two entries on any one board
+     * (font_pick's compact alternative is fixed per board). Six slots
+     * leave a wide margin, and a full table only loses the CJK fallback
+     * for that label, with the log below saying so. */
     static lv_font_t copies[6];
     static lv_font_t chains[6];
     static const lv_font_t *bases[6];
