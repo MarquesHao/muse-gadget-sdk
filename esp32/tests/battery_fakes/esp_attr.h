@@ -17,4 +17,5 @@
 #pragma once
 
 #define IRAM_ATTR
+#define EXT_RAM_BSS_ATTR   // host stub: section placement is a no-op here (muse_voice/muse_audio use it since the PSRAM move)
 #define RTC_NOINIT_ATTR   // the harness saves and loads it across its runs, as across a reset

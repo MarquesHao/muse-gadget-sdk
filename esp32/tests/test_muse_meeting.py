@@ -242,6 +242,35 @@ class WriterPathTest(unittest.TestCase):
         failed = begin.index("!= sizeof(WAV_HDR)")
         self.assertIn("remove(s_fp_path)", begin[failed:])
 
+    def test_topped_session_with_audio_is_salvaged_by_backfill(self):
+        begin = segment(WRITER, "m.kind == MSG_BEGIN", "} else if (m.kind == MSG_DATA)")
+        # The salvage patches the OLD file's header: it must run before
+        # the new file is opened and before the byte counter is reset
+        # for the new session.
+        salvage = begin.index("HDR_OFF_DATA_SIZE")
+        self.assertLess(salvage, begin.index('fopen(s_fp_path, "wb")'))
+        self.assertLess(salvage, begin.index("s_data_bytes = 0"))
+        for offset in ("HDR_OFF_RIFF_SIZE", "HDR_OFF_FACT_SAMPLES", "HDR_OFF_DATA_SIZE"):
+            self.assertIn(f"fseek(s_fp, {offset}, SEEK_SET)", begin)
+        # The fact count is derived from whole counted blocks, the same
+        # arithmetic MSG_END relies on: every MSG_DATA block is full.
+        self.assertIn("(s_data_bytes / MUSE_MEETING_BLOCK_BYTES)", begin)
+        self.assertIn("* MUSE_MEETING_BLOCK_SAMPLES", begin)
+        self.assertIn("MEET_HDR_BYTES - 8 + s_data_bytes", begin)
+
+    def test_topped_session_without_audio_is_removed(self):
+        begin = segment(WRITER, "m.kind == MSG_BEGIN", "} else if (m.kind == MSG_DATA)")
+        topped = begin.index("if (s_data_bytes == 0)")
+        self.assertIn("remove(s_fp_path)", begin[topped:])
+        # The removal still names the old file: it happens before
+        # s_fp_path is overwritten with the new session's name.
+        self.assertLess(topped, begin.index("snprintf(s_fp_path"))
+
+    def test_salvage_never_touches_the_new_sessions_error(self):
+        begin = segment(WRITER, "m.kind == MSG_BEGIN", "} else if (m.kind == MSG_DATA)")
+        topped = begin[:begin.index("snprintf(s_fp_path")]
+        self.assertNotIn("s_op_err =", topped)
+
     def test_op_err_is_reset_only_by_the_writer_at_begin(self):
         begin = segment(WRITER, "m.kind == MSG_BEGIN", "} else if (m.kind == MSG_DATA)")
         self.assertIn("s_op_err = ESP_OK", begin)

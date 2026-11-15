@@ -312,6 +312,7 @@ typedef void lv_obj_t;
 #define LV_SYMBOL_POWER "P"
 #define COLOR_DANGER 1
 #define COLOR_TEXT 2
+#define TR(en, zh) (en)   /* the settings pages' language macro, in its English form (the fix2 language pass put TR into build_power_page) */
 static lv_obj_t *s_power;
 static char shown[128];
 static struct { const char *power_button, *talk_button, *aux_button; } board = {"red bottom-left", "top-right", NULL}, *muse_board = &board;

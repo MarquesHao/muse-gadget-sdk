@@ -112,8 +112,54 @@ static void writer_task(void *arg)
         xQueueReceive(s_wq, &m, portMAX_DELAY);
         if (m.kind == MSG_BEGIN) {
             if (s_fp) {
-                fclose(s_fp);   /* a previous session never ended: abandon it, don't leak the handle */
+                /* A previous session never ended (its END never reached
+                 * the writer). Its file still wears the placeholder
+                 * header — every size field zero — but holds however many
+                 * whole blocks the writer counted into s_data_bytes, and
+                 * those blocks are real audio: every MSG_DATA block is a
+                 * full 1017-sample block. (The one padded tail block a
+                 * session can produce is written immediately before its
+                 * END, and an END queued ahead of this BEGIN would have
+                 * finalized the file instead of leaving it to be topped.)
+                 * Salvage it: patch the three header fields from the
+                 * counted bytes, exactly as MSG_END does, so the recording
+                 * stays listed with its real length and stays playable.
+                 * A topped file with no blocks holds no audio and is
+                 * removed, like the header-failure and zero-sample cases.
+                 * A salvage failure is logged only: it must not poison
+                 * s_op_err, which belongs to the session this BEGIN is
+                 * starting. */
+                bool salvaged = false;
+                if (s_data_bytes > 0) {
+                    uint8_t word[4];
+                    uint32_t samples = (s_data_bytes / MUSE_MEETING_BLOCK_BYTES)
+                                       * MUSE_MEETING_BLOCK_SAMPLES;
+                    put_u32(word, MEET_HDR_BYTES - 8 + s_data_bytes);
+                    salvaged = fseek(s_fp, HDR_OFF_RIFF_SIZE, SEEK_SET) == 0
+                               && fwrite(word, 1, 4, s_fp) == 4;
+                    put_u32(word, samples);
+                    salvaged = salvaged && fseek(s_fp, HDR_OFF_FACT_SAMPLES, SEEK_SET) == 0
+                               && fwrite(word, 1, 4, s_fp) == 4;
+                    put_u32(word, s_data_bytes);
+                    salvaged = salvaged && fseek(s_fp, HDR_OFF_DATA_SIZE, SEEK_SET) == 0
+                               && fwrite(word, 1, 4, s_fp) == 4;
+                    if (salvaged) {
+                        fflush(s_fp);
+                    }
+                }
+                fclose(s_fp);
                 s_fp = NULL;
+                if (s_data_bytes == 0) {
+                    remove(s_fp_path);   /* no audio in it: leave no stub behind */
+                } else if (salvaged) {
+                    ESP_LOGW(TAG, "previous session never ended: salvaged %s "
+                                  "(%" PRIu32 " bytes of audio)",
+                             s_fp_path, s_data_bytes);
+                } else {
+                    ESP_LOGW(TAG, "previous session never ended: %s header "
+                                  "salvage failed, sizes stay zero",
+                             s_fp_path);
+                }
             }
             snprintf(s_fp_path, sizeof(s_fp_path), MEET_BASE "/%s", m.name);
             s_data_bytes = 0;
@@ -353,6 +399,21 @@ esp_err_t muse_meeting_mount(void)
 bool muse_meeting_mounted(void)
 {
     return s_mounted;
+}
+
+/* Read-only mount for the frame player: same lock + mount discipline as
+ * the console paths, but without init_once() — browsing assets must not
+ * create the writer task and its queues. Never formats. */
+esp_err_t muse_meeting_storage_mount(void)
+{
+    esp_err_t err = lock_init_once();
+    if (err != ESP_OK) {
+        return err;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    err = mount(false);
+    xSemaphoreGive(s_lock);
+    return err;
 }
 
 /* The next free MEETnnnn.WAV name; recordings are only ever created in

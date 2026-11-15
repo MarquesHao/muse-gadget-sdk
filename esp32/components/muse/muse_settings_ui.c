@@ -65,9 +65,9 @@
 #define MAX_APS 12
 
 #define COLOR_TEXT 0xf2efff
-#define COLOR_DIM 0x8b84a8
-#define COLOR_CARD 0x1a1530
-#define COLOR_CARD_PRESSED 0x2e2552
+#define COLOR_DIM 0x8e8e93          /* iOS secondary-label grey (was a purple-grey) */
+#define COLOR_CARD 0x1c1c1e         /* iOS grouped-list surface (was dark purple) */
+#define COLOR_CARD_PRESSED 0x2c2c2e
 #define COLOR_ACCENT 0xa77dff
 #define COLOR_OK 0x6ff0bf
 #define COLOR_WARN 0xffb45c
@@ -81,6 +81,9 @@ static bool s_tiny;   /* round and under 300 px: see TINY_LIST_W */
 static lv_obj_t *s_tile;
 static lv_obj_t *s_current;
 static lv_obj_t *s_home, *s_wifi, *s_hatch, *s_ble, *s_sound, *s_sleep, *s_battery, *s_power, *s_text;
+#if CONFIG_MUSE_CJK_FONT
+static lv_obj_t *s_lang;   /* the language page (a build without the CJK font has nothing to switch) */
+#endif
 
 /*
  * Only home is kept. A sub-page is built when it opens and deleted on the way
@@ -94,6 +97,9 @@ typedef struct {
 
 /* Home values. */
 static lv_obj_t *s_home_wifi, *s_home_hatch, *s_home_ble, *s_home_sound, *s_home_sleep, *s_home_battery, *s_about;
+#if CONFIG_MUSE_CJK_FONT
+static lv_obj_t *s_home_lang;
+#endif
 #if CONFIG_MUSE_VIDEO
 static lv_obj_t *s_home_camera;
 #endif
@@ -263,6 +269,17 @@ static const lv_font_t *settings_font_cjk(const lv_font_t *font)
         return font;
     }
     copies[used] = *font;
+    /* Same clipping fix as muse_ui.c's ui_font_cjk: the CJK fallback's
+     * glyphs are laid out on its own metrics (a 31 px line for the 16 px
+     * face), so in a shorter base line box — an unscii title, a 16 px
+     * note — hanzi lose their tops and bottoms. The chain takes the
+     * taller metrics; labels size and wrap by them. */
+    if (SETTINGS_CJK_FONT.line_height > copies[used].line_height) {
+        copies[used].line_height = SETTINGS_CJK_FONT.line_height;
+    }
+    if (SETTINGS_CJK_FONT.base_line > copies[used].base_line) {
+        copies[used].base_line = SETTINGS_CJK_FONT.base_line;
+    }
     if (font->fallback) {
         /* Chain, never replace an existing fallback. */
         chains[used] = SETTINGS_CJK_FONT;
@@ -340,6 +357,18 @@ static lv_obj_t *note(lv_obj_t *list, const char *text)
 }
 
 static void go_back(void);
+static void on_nav(lv_event_t *e);
+
+/* An iOS-style group header: small, grey, left-aligned, with air above
+ * it. Explanatory paragraphs keep using note(). */
+static lv_obj_t *section(lv_obj_t *list, const char *text)
+{
+    lv_obj_t *l = label(list, &lv_font_montserrat_14, COLOR_DIM, text);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_obj_set_style_pad_top(l, 10, 0);
+    lv_obj_set_style_pad_left(l, 16, 0);
+    return l;
+}
 
 static void on_gesture(lv_event_t *e)
 {
@@ -434,7 +463,10 @@ static lv_obj_t *page(lv_obj_t *tile, const char *title, bool back, lv_obj_t **l
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, list_top);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(list, wide ? 16 : narrow_panel() || s_tiny ? 6 : 10, 0);
+    /* Standard layout: rows sit 2 px apart on the black page, so a run of
+     * cards reads as one iOS-style grouped list with hairline separations
+     * instead of a stack of floating pills. */
+    lv_obj_set_style_pad_row(list, wide ? 16 : narrow_panel() || s_tiny ? 6 : 2, 0);
     /* Clear the page dots on flat panels, or the bottom curve on round ones. */
     lv_obj_set_style_pad_bottom(list, wide ? 16 : narrow_panel() ? 12 : (compact ? 32 : s_tiny ? 64 : 110), 0);
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
@@ -448,7 +480,7 @@ static lv_obj_t *card(lv_obj_t *list, bool clickable)
     lv_obj_t *c = clickable ? lv_button_create(list) : lv_obj_create(list);
     lv_obj_remove_style_all(c);
     lv_obj_set_size(c, lv_pct(100), wide_layout() ? 84 : s_tiny ? TINY_ROW_H : ROW_H);
-    lv_obj_set_style_radius(c, s_tiny ? 12 : 18, 0);
+    lv_obj_set_style_radius(c, 12, 0);   /* iOS grouped-list corner radius */
     lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_CARD), 0);
     lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_CARD_PRESSED), LV_STATE_PRESSED);
@@ -499,6 +531,11 @@ static lv_obj_t *row(lv_obj_t *list, const char *icon, const char *text, lv_obj_
         lv_obj_set_style_max_width(v, 130, 0);
         lv_label_set_long_mode(v, LV_LABEL_LONG_MODE_DOTS);
         *value_out = v;
+    }
+    if (cb == on_nav) {
+        /* Navigation rows end in a chevron, iOS-style; choice rows keep
+         * their checkmark as the value instead. */
+        label(c, &lv_font_montserrat_16, COLOR_DIM, LV_SYMBOL_RIGHT);
     }
     if (cb) {
         lv_obj_add_event_cb(c, cb, LV_EVENT_CLICKED, user);
@@ -1453,21 +1490,15 @@ static void build_sound_page(lv_obj_t *tile)
         return;
     }
     s_sound = page(tile, SOUND_TITLE, true, &list);
-    note(list, SOUND_MODE_HINT);
+    section(list, SOUND_MODE_HINT);
     for (int i = 0; i < GADGET_MODE_COUNT; i++) {
         row(list, NULL, gadget_mode_name(i), &s_mode_checks[i], on_mode_choice,
             (void *)(intptr_t)i);
         lv_obj_set_style_text_color(s_mode_checks[i], lv_color_hex(COLOR_ACCENT), 0);
     }
     note(list, SOUND_MODE_DESC);
-#if CONFIG_MUSE_CJK_FONT
-    note(list, TR("Language:", "语言："));
-    for (int i = 0; i < MUSE_LANG_COUNT; i++) {
-        row(list, NULL, i == MUSE_LANG_ZH ? "中文" : "English", &s_lang_checks[i], on_lang_choice,
-            (void *)(intptr_t)i);
-        lv_obj_set_style_text_color(s_lang_checks[i], lv_color_hex(COLOR_ACCENT), 0);
-    }
-#endif
+    /* The language rows moved to their own page off the home list
+     * (build_language_page); the Sound page keeps sound only. */
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
     s_notes_sw = switch_row(list, "Voice notes", muse_settings_voice_notes(), on_notes_sw);
     note(list, "Off: hold yellow to talk live, release to listen; blue ends the call. "
@@ -1525,12 +1556,6 @@ static void tick_sound(void)
     for (int i = 0; i < GADGET_MODE_COUNT; i++) {
         if (s_mode_checks[i]) set_text(s_mode_checks[i], i == gm ? LV_SYMBOL_OK : "");
     }
-#if CONFIG_MUSE_CJK_FONT
-    int lg = muse_settings_lang();
-    for (int i = 0; i < MUSE_LANG_COUNT; i++) {
-        if (s_lang_checks[i]) set_text(s_lang_checks[i], i == lg ? LV_SYMBOL_OK : "");
-    }
-#endif
     if (muse_board->epaper) return;
     float db = muse_voice_monitor_db();
     int v = (int)(db + 70.0f);
@@ -1540,6 +1565,34 @@ static void tick_sound(void)
     lv_obj_set_style_bg_color(s_mic_bar, lv_color_hex(color), LV_PART_INDICATOR);
     set_val(s_mic_val, "%d dBFS", (int)db);
 }
+
+/* ---------- Language ---------- */
+
+#if CONFIG_MUSE_CJK_FONT
+/* Its own page off the home list (it lived on the Sound page until the
+ * P8 UI pass). The behaviour is unchanged: on_lang_choice stores the
+ * pick and restarts into it. */
+static void build_language_page(lv_obj_t *tile)
+{
+    lv_obj_t *list;
+    s_lang = page(tile, TR("LANGUAGE", "语言"), true, &list);
+    for (int i = 0; i < MUSE_LANG_COUNT; i++) {
+        row(list, NULL, i == MUSE_LANG_ZH ? "中文" : "English", &s_lang_checks[i], on_lang_choice,
+            (void *)(intptr_t)i);
+        lv_obj_set_style_text_color(s_lang_checks[i], lv_color_hex(COLOR_ACCENT), 0);
+    }
+    note(list, TR("Takes effect after a restart, which happens on its own.",
+                  "点选后设备会自动重启并生效。"));
+}
+
+static void tick_language(void)
+{
+    int lg = muse_settings_lang();
+    for (int i = 0; i < MUSE_LANG_COUNT; i++) {
+        if (s_lang_checks[i]) set_text(s_lang_checks[i], i == lg ? LV_SYMBOL_OK : "");
+    }
+}
+#endif
 
 /* ---------- Sleep ---------- */
 
@@ -1743,6 +1796,9 @@ static const page_t WIFI = { &s_wifi, build_wifi_page };
 static const page_t HATCH = { &s_hatch, build_hatch_page };
 static const page_t BLE = { &s_ble, build_ble_page };
 static const page_t SOUND = { &s_sound, build_sound_page };
+#if CONFIG_MUSE_CJK_FONT
+static const page_t LANGUAGE = { &s_lang, build_language_page };
+#endif
 static const page_t SLEEP = { &s_sleep, build_sleep_page };
 static const page_t BATTERY = { &s_battery, build_battery_page };
 static const page_t POWER = { &s_power, build_power_page };
@@ -1768,6 +1824,9 @@ static void build_home(lv_obj_t *tile)
     } else {
         row(list, LV_SYMBOL_VOLUME_MAX, SOUND_NAV, &s_home_sound, on_nav, (void *)&SOUND);
     }
+#if CONFIG_MUSE_CJK_FONT
+    row(list, NULL, TR("Language", "语言"), &s_home_lang, on_nav, (void *)&LANGUAGE);
+#endif
     row(list, LV_SYMBOL_EYE_CLOSE, TR("Sleep", "休眠"), &s_home_sleep, on_nav, (void *)&SLEEP);
     row(list, LV_SYMBOL_BATTERY_FULL, TR("Battery", "电池"), &s_home_battery, on_nav, (void *)&BATTERY);
 #if CONFIG_MUSE_VIDEO
@@ -1808,6 +1867,9 @@ static void tick_home(void)
         set_text(s_home_sound, TR("Muted", "已静音"));
     }
     set_text(s_home_sleep, sleep_name(muse_settings_sleep_s()));
+#if CONFIG_MUSE_CJK_FONT
+    set_text(s_home_lang, muse_settings_lang() == MUSE_LANG_ZH ? "中文" : "English");
+#endif
 
     muse_power_t p = muse_state_power();
     char buf[96];
@@ -1846,7 +1908,11 @@ static volatile int s_bench_open = -1;   /* applied in the LVGL task, by the nex
 
 bool muse_settings_ui_bench_open(const char *name)
 {
-    static const char *const NAMES[] = { "home", "wifi", "muse", "ble", "sound", "sleep", "battery", "power" };
+    static const char *const NAMES[] = { "home", "wifi", "muse", "ble", "sound", "sleep", "battery", "power"
+#if CONFIG_MUSE_CJK_FONT
+        , "language"
+#endif
+    };
     for (int i = 0; i < (int)(sizeof(NAMES) / sizeof(NAMES[0])); i++) {
         if (!strcmp(name, NAMES[i])) {
             s_bench_open = i;
@@ -1858,7 +1924,11 @@ bool muse_settings_ui_bench_open(const char *name)
 
 static void bench_open_pending(void)
 {
-    static const page_t *const PAGES[] = { NULL, &WIFI, &HATCH, &BLE, &SOUND, &SLEEP, &BATTERY, &POWER };
+    static const page_t *const PAGES[] = { NULL, &WIFI, &HATCH, &BLE, &SOUND, &SLEEP, &BATTERY, &POWER
+#if CONFIG_MUSE_CJK_FONT
+        , &LANGUAGE
+#endif
+    };
     int i = s_bench_open;
     if (i < 0) {
         return;
@@ -1903,6 +1973,10 @@ void muse_settings_ui_tick(bool visible)
         tick_ble();
     } else if (s_current == s_sound) {
         tick_sound();
+#if CONFIG_MUSE_CJK_FONT
+    } else if (s_current == s_lang) {
+        tick_language();
+#endif
     } else if (s_current == s_sleep) {
         tick_sleep();
     } else if (s_current == s_battery) {

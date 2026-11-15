@@ -34,6 +34,7 @@ typedef int esp_err_t;
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
 #define IRAM_ATTR
+#define EXT_RAM_BSS_ATTR   /* host stub: section placement is a no-op here (muse_voice/muse_audio use it since the PSRAM move) */
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
 #define MALLOC_CAP_INTERNAL 4

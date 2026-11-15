@@ -279,6 +279,9 @@ static const muse_board_t s_board = {
     /* Side buttons: PWR (talk) above BOOT (sleep/off), on the right. */
     .talk_hint = { LV_ALIGN_CENTER, 153, -129 },    /* 40 degrees above/below 3 o'clock */
     .aux_hint = { LV_ALIGN_CENTER, 153, 129 },
+    /* Only the 1.75C (the owner's board) takes the minimal face; the
+     * plain 1.75 sharing this file keeps the full chrome. */
+    .minimal_face = true,
 #endif
     .frame_ms = 40,
     .init = init,

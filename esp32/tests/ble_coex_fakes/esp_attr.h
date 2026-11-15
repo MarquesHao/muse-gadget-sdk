@@ -17,3 +17,4 @@
 #pragma once
 #define IRAM_ATTR
 #define DRAM_ATTR
+#define EXT_RAM_BSS_ATTR   // host stub: section placement is a no-op here (muse_voice/muse_audio use it since the PSRAM move)

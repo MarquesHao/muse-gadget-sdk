@@ -37,6 +37,7 @@
 #include "muse_input.h"
 #include "muse_chat.h"
 #include "muse_console.h"
+#include "muse_frames.h"
 #include "muse_lang.h"
 #include "muse_link.h"
 #include "muse_mem.h"
@@ -213,6 +214,13 @@ static bool s_caption_shown;
 static lv_obj_t *s_state_lbl;
 static lv_obj_t *s_name_lbl;    /* this gadget's own name, to tell it from the next one */
 static lv_obj_t *s_power_lbl;
+/* Minimal-face chrome (board minimal_face): the battery arc along the top
+ * edge and the status dot that replaces the state text. */
+static lv_obj_t *s_batt_arc;
+static lv_obj_t *s_state_dot;
+static int s_shown_batt = -2;          /* -2: nothing painted yet */
+static uint32_t s_shown_dot = 0x000000;
+static bool s_dot_shown = true;
 static lv_obj_t *s_caption_lbl;
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
@@ -564,6 +572,7 @@ static void on_touch_mic(lv_event_t *e)
 /* Icons beside the physical buttons, in place of an instruction caption. */
 static void build_button_icons(lv_obj_t *face)
 {
+    if (muse_board->minimal_face) return;   /* no corner icons: the quick panel is the way in */
     if (muse_board->rim_controls) return;   /* dedicated rim hints below */
     const muse_button_hint_t *t = &muse_board->talk_hint, *a = &muse_board->aux_hint;
     s_mic_icon = make_mic(face, s_tall ? 24 : s_small ? 12 : 26);
@@ -730,6 +739,17 @@ static const lv_font_t *caption_font(void)
     if (!font.get_glyph_dsc) {
         font = lv_font_unscii_16;
         font.fallback = &CJK_FONT;
+        /* The copy needs the fallback's line metrics, not unscii's:
+         * hanzi are laid out on the CJK face's 31 px line, and in a
+         * 16 px line box they clip — captions size, wrap and page by
+         * this font, so this is the caption half of the clipping fix
+         * (the ui_font_cjk chains cover the labels). */
+        if (CJK_FONT.line_height > font.line_height) {
+            font.line_height = CJK_FONT.line_height;
+        }
+        if (CJK_FONT.base_line > font.base_line) {
+            font.base_line = CJK_FONT.base_line;
+        }
 #if CONFIG_MUSE_LATIN_FONT
         static lv_font_t cjk;   /* and a copy of that for accented letters among CJK */
         cjk = CJK_FONT;
@@ -772,6 +792,17 @@ static const lv_font_t *ui_font_cjk(const lv_font_t *base)
         return base;
     }
     copies[used] = *base;
+    /* The fallback's glyphs are laid out on the fallback's own metrics —
+     * the 16 px CJK face wants a 31 px line — so in the base font's
+     * shorter line box their tops and bottoms clip (the "Chinese text
+     * looks cut off" bug). Give the chain the taller metrics: labels
+     * size, wrap and baseline by them, and hanzi stop losing strokes. */
+    if (CJK_FONT.line_height > copies[used].line_height) {
+        copies[used].line_height = CJK_FONT.line_height;
+    }
+    if (CJK_FONT.base_line > copies[used].base_line) {
+        copies[used].base_line = CJK_FONT.base_line;
+    }
     if (base->fallback) {
         /* Chain, never replace: the base may already fall back somewhere
          * (muse_lang_montserrat's accented-letters font, say). */
@@ -1190,13 +1221,16 @@ static void build_answer(lv_obj_t *face, int ring_in)
     lv_obj_add_flag(s_review_position, LV_OBJ_FLAG_HIDDEN);
 #endif
 
-    if (muse_board->touch && !muse_board->rim_controls) {
+    if (muse_board->touch && !muse_board->rim_controls && !muse_board->minimal_face) {
         build_speaker(face, spk_x, spk_y);
     }
 
     /* Out of the way while a page is up: the mode name, where Muse was. */
     lv_obj_update_layout(face);
-    s_answers[ANSWER_READ].hides[0] = s_state_lbl;
+    /* Minimal-face boards keep the state label hidden for good (the status
+     * dot replaces it), so it stays out of the hides: leaving this layout
+     * unhides everything listed here. */
+    s_answers[ANSWER_READ].hides[0] = muse_board->minimal_face ? NULL : s_state_lbl;
     s_answers[ANSWER_READ].hides[1] = s_name_lbl;   /* the reply takes the top too */
     add_hides(&s_answers[ANSWER_READ], 2);
     add_hides(&s_answers[ANSWER_HEARD], 0);
@@ -1431,7 +1465,16 @@ static void build_screen(void)
      * whose blank bottom rows can tuck in behind the meter.
      */
     int ring_in = (s_w < s_h ? s_w : s_h) / 2 - 10;   /* the ring's inner edge */
-    int cap_h = 2 * lv_font_get_line_height(&lv_font_unscii_16) + CAPTION_LINE_SPACE;
+    int cap_line = lv_font_get_line_height(&lv_font_unscii_16);
+#if CONFIG_MUSE_CJK_FONT
+    /* A Chinese caption draws in the CJK face, whose line is far taller
+     * than unscii's; the band must fit two of those lines or the caption
+     * clips to one. */
+    if (lv_font_get_line_height(caption_font()) > cap_line) {
+        cap_line = lv_font_get_line_height(caption_font());
+    }
+#endif
+    int cap_h = 2 * cap_line + CAPTION_LINE_SPACE;
     int cap_bottom = 179;                              /* a 466 px circle's; fine for rectangles */
     if (muse_board->round) {
         cap_bottom = (int)sqrtf((float)(ring_in * ring_in - CAPTION_W * CAPTION_W / 4)) - 3;
@@ -1453,6 +1496,11 @@ static void build_screen(void)
     s_muse_y = s_big_y;
     lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_canvas, on_canvas_clicked, LV_EVENT_CLICKED, NULL);
+    /* The frame-library face (P8) layers over the canvas; the ring,
+     * icons and labels are created after this, so they stay on top. It
+     * shows nothing until its player has frames, and the pixel face
+     * remains the fallback everywhere the library is unavailable. */
+    muse_frames_attach(face);
     if (s_ring) {
         /* The canvas's black corners reach the bezel; keep the ring on top. */
         lv_obj_move_foreground(s_ring);
@@ -1471,6 +1519,35 @@ static void build_screen(void)
     s_wifi_icon = make_label(status, &lv_font_montserrat_14, COLOR_DIM);
     s_ble_icon = make_label(status, &lv_font_montserrat_14, COLOR_DIM);
     s_power_lbl = make_label(status, &lv_font_unscii_8, COLOR_DIM);
+    if (muse_board->minimal_face) {
+        /* Minimal chrome: the BLE glyph and the battery percentage text go
+         * away (their update paths keep writing to the hidden labels,
+         * harmlessly). The battery becomes an arc along the top edge —
+         * inside the mode ring's band — and a dot beside the Wi-Fi icon
+         * carries the state, coloured by update_status(). */
+        lv_obj_add_flag(s_ble_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_power_lbl, LV_OBJ_FLAG_HIDDEN);
+        s_state_dot = lv_obj_create(status);
+        lv_obj_remove_style_all(s_state_dot);
+        lv_obj_set_size(s_state_dot, 10, 10);
+        lv_obj_set_style_radius(s_state_dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(s_state_dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(s_state_dot, lv_color_hex(0x30d158), 0);
+        lv_obj_remove_flag(s_state_dot, LV_OBJ_FLAG_SCROLLABLE);
+
+        s_batt_arc = lv_arc_create(face);
+        lv_obj_set_size(s_batt_arc, 424, 424);
+        lv_obj_center(s_batt_arc);
+        lv_arc_set_bg_angles(s_batt_arc, 225, 315);   /* the span over the top */
+        lv_arc_set_range(s_batt_arc, 0, 100);
+        lv_obj_remove_style(s_batt_arc, NULL, LV_PART_KNOB);
+        lv_obj_remove_flag(s_batt_arc, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_arc_width(s_batt_arc, 5, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(s_batt_arc, 5, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(s_batt_arc, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+        lv_obj_set_style_arc_color(s_batt_arc, lv_color_hex(0xf2f2f7), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_rounded(s_batt_arc, true, LV_PART_INDICATOR);
+    }
 
     /* The compact layout leaves the state to the avatar and the caption,
      * unless the screen is tall enough to fit it in small type above Muse. */
@@ -1478,6 +1555,11 @@ static void build_screen(void)
     lv_obj_set_style_text_letter_space(s_state_lbl, s_small ? 1 : 2, 0);
     lv_obj_align(s_state_lbl, LV_ALIGN_TOP_MID, 0, muse_board->rim_controls ? 64 : s_small ? 22 : 40 + s_dy);
     lv_obj_set_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN, s_small && !s_tall && s_h < 200);
+    if (muse_board->minimal_face) {
+        /* The status dot speaks for the state text. Kept out of the read
+         * layout's hides (build_answer), whose restore would unhide it. */
+        lv_obj_add_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
 
     /* This gadget's own name, dim under the state while it's unpaired: with
      * more than one on the bench, the screen says which one to pick in the
@@ -2124,6 +2206,27 @@ static void update_power(float now)
         lv_obj_set_style_text_font(s_power_lbl, ui_font_cjk(muse_lang_label_font(buf, &lv_font_unscii_8)), 0);
         lv_label_set_text(s_power_lbl, buf);
     }
+
+    if (s_batt_arc) {
+        /* The arc is the battery readout: length follows the level, green
+         * while charging, red when low, near-white otherwise. On USB power
+         * (no battery reading) it hides rather than inventing a level. */
+        if (p.battery_pct < 0) {
+            if (s_shown_batt != -1) {
+                s_shown_batt = -1;
+                lv_obj_add_flag(s_batt_arc, LV_OBJ_FLAG_HIDDEN);
+            }
+        } else {
+            lv_obj_remove_flag(s_batt_arc, LV_OBJ_FLAG_HIDDEN);
+            int key = p.battery_pct * 2 + (p.charging ? 1 : 0);
+            if (key != s_shown_batt) {
+                s_shown_batt = key;
+                lv_arc_set_value(s_batt_arc, p.battery_pct);
+                uint32_t color = p.charging ? 0x30d158 : (p.battery_pct <= 20 ? 0xff453a : 0xf2f2f7);
+                lv_obj_set_style_arc_color(s_batt_arc, lv_color_hex(color), LV_PART_INDICATOR);
+            }
+        }
+    }
 }
 
 /* An avatar without a working pose keeps THINKING's accent. */
@@ -2207,6 +2310,22 @@ static void update_status(muse_mode_t mode, float now)
         s_shown_state = (int)mode;
         s_shown_status_accent = accent;
         s_shown_lit = -1;
+    }
+
+    if (s_state_dot) {
+        /* The dot replaces the state text on minimal-face boards: green
+         * when idle on a joined network (s_idle_name is READY only then),
+         * the mode's own accent colour otherwise; hidden while off. */
+        uint32_t dot = (mode == MUSE_MODE_IDLE && strcmp(s_idle_name, "READY") == 0) ? 0x30d158 : accent;
+        bool show = mode != MUSE_MODE_OFF;
+        if (dot != s_shown_dot) {
+            s_shown_dot = dot;
+            lv_obj_set_style_bg_color(s_state_dot, lv_color_hex(dot), 0);
+        }
+        if (show != s_dot_shown) {
+            s_dot_shown = show;
+            lv_obj_set_flag(s_state_dot, LV_OBJ_FLAG_HIDDEN, !show);
+        }
     }
 
     /* Ring: phase progress while listening/speaking, a spinner while thinking. */

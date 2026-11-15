@@ -53,6 +53,14 @@ extern "C" {
 esp_err_t muse_meeting_mount(void);
 bool muse_meeting_mounted(void);
 
+/* Mount for read-only browsing (the frame player, muse_frames.c): the
+ * mount lock and mount(false) only — no writer setup, and never a
+ * format (the boot-time muse_meeting_mount() owns the one-time format;
+ * if it has not run or the store is corrupt this simply fails). The
+ * partition then stays mounted, exactly as after a begin/list/dump.
+ * ESP_ERR_NOT_FOUND on boards without a storage partition. */
+esp_err_t muse_meeting_storage_mount(void);
+
 /* Starts a recording: picks the next MEETnnnn.WAV name (into name_out) and
  * reports how many blocks fit in the free space (max_blocks). The file is
  * open on the writer task once this returns ESP_OK. */

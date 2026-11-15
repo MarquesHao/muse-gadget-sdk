@@ -99,6 +99,12 @@ typedef struct {
     /* 466 px round-panel layout: dedicated 26-36 px rim icons, safe header chord
      * and central read-reply column. Requires all three hint positions/names. */
     bool rim_controls;
+    /* Minimal face chrome (project P8 follow-up, the owner's 1.75C): no
+     * corner button icons (speaker circle, mic and power hints) — modes are
+     * switched from the tap-face quick panel; the battery percentage text
+     * becomes an arc along the top edge, and the state text becomes a small
+     * status dot beside the Wi-Fi icon. Other boards keep the full chrome. */
+    bool minimal_face;
     /* The menu turns a right-edge aux button's hint on end, which LVGL draws
      * through a ~14 KB layer; set this where that's too much RAM (the C3) and
      * the hint lies flat on the menu's bar, left of the talk button's. */
