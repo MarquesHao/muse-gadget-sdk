@@ -788,7 +788,15 @@ static const lv_font_t *ui_font_cjk(const lv_font_t *base)
         }
     }
     if (used >= 6) {
-        ESP_LOGW(TAG, "ui_font_cjk: table full, %p keeps no CJK fallback", (const void *)base);
+        /* Once only: label paths reach here per label once the table
+         * is full, and a warning per call would flood the log for a
+         * state that cannot change at runtime. Same once-only rule as
+         * the settings side's drafted log (round-2 draft B1). */
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            ESP_LOGW(TAG, "ui_font_cjk: table full, %p keeps no CJK fallback", (const void *)base);
+        }
         return base;
     }
     copies[used] = *base;
