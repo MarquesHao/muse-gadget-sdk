@@ -72,7 +72,8 @@ void muse_settings_set_voice_notes(bool on);
  * restarts: CALL = tap for a live voice call, hold for a voice note, replies
  * spoken; TEXT = voice notes only, replies shown and never played; MEETING =
  * records room audio to on-device WAV files until the talk button is pressed
- * again (V1.1 P2, muse_meeting.c). */
+ * again, the mode is left, the storage fills up, or a recording error stops
+ * it (V1.1 P2, muse_meeting.c). */
 enum { MUSE_GADGET_MODE_CALL, MUSE_GADGET_MODE_TEXT, MUSE_GADGET_MODE_MEETING, MUSE_GADGET_MODE_COUNT };
 int muse_settings_gadget_mode(void);
 void muse_settings_set_gadget_mode(int mode);

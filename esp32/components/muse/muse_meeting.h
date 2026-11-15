@@ -68,7 +68,9 @@ esp_err_t muse_meeting_end(uint32_t total_samples);
 
 /* Serial console helpers (muse_input.c): list the recordings, and dump
  * one of them (1-based index over the MEETnnnn sequence) as base64 lines
- * on stdout. Dump returns false when there is no such file. */
+ * on stdout. Dump returns false when there is no such file, when the
+ * index is outside 1..9999, when the file is the one being recorded, or
+ * when the storage partition is not available. */
 void muse_meeting_console_list(void);
 bool muse_meeting_console_dump(int index);
 

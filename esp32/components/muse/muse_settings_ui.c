@@ -131,6 +131,9 @@ LV_FONT_DECLARE(muse_font_cjk_noto_16)
 LV_FONT_DECLARE(muse_font_cjk_16)
 #define SETTINGS_CJK_FONT muse_font_cjk_16
 #endif
+/* The mode names below are the Sound page's copy of the quick panel's
+ * QUICK_MODE_NAMES in muse_ui.c: keep the two lists in sync, in enum
+ * order, in both languages. */
 #if CONFIG_MUSE_CJK_FONT
 /* Chinese pilot (project V1.1, P4): the Sound page in Chinese. */
 static const char *const GADGET_MODE_NAMES[] = { "语音通话", "文字回复", "会议录音" };
@@ -162,7 +165,7 @@ static const char *const SOUND_GAIN = "Mic gain";
  * its rows are indexed by mode and cast straight to muse_gadget_mode_t. */
 _Static_assert(GADGET_MODE_COUNT == MUSE_GADGET_MODE_COUNT,
                "GADGET_MODE_NAMES names every gadget mode");
-static lv_obj_t *s_mode_checks[GADGET_MODE_COUNT], *s_mode_rows[GADGET_MODE_COUNT];
+static lv_obj_t *s_mode_checks[GADGET_MODE_COUNT];
 
 /* Sleep page. */
 static const int SLEEP_CHOICES[] = { 0, 30, 60, 120, 300, 600 };
@@ -1389,8 +1392,8 @@ static void build_sound_page(lv_obj_t *tile)
     s_sound = page(tile, SOUND_TITLE, true, &list);
     note(list, SOUND_MODE_HINT);
     for (int i = 0; i < GADGET_MODE_COUNT; i++) {
-        s_mode_rows[i] = row(list, NULL, GADGET_MODE_NAMES[i], &s_mode_checks[i], on_mode_choice,
-                             (void *)(intptr_t)i);
+        row(list, NULL, GADGET_MODE_NAMES[i], &s_mode_checks[i], on_mode_choice,
+            (void *)(intptr_t)i);
         lv_obj_set_style_text_color(s_mode_checks[i], lv_color_hex(COLOR_ACCENT), 0);
     }
     note(list, SOUND_MODE_DESC);

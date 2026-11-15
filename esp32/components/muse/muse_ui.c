@@ -116,15 +116,18 @@ static bool s_note_listening;   /* a toggled note is recording: keep its face up
 static volatile bool s_face_active = true;
 static lv_obj_t *s_face;
 
-/* Quick panel (project V1.1, P1): tapping Muse while idle opens a small
- * card on the top layer with the three-mode switch and the volume slider —
- * the same controls as the Sound settings page, without swiping there.
+/* Quick panel (project V1.1, P1): tapping Muse while idle (and not
+ * recording a meeting) opens a small card on the top layer with the
+ * three-mode switch and the volume slider — the same controls as the
+ * Sound settings page, without swiping there.
  * A tap anywhere outside the card closes it. */
 static lv_obj_t *s_quick, *s_quick_catch;
 static lv_obj_t *s_quick_checks[MUSE_GADGET_MODE_COUNT], *s_quick_vol_val, *s_quick_vol_sl;
 static bool s_quick_open;
 static bool s_quick_syncing;   /* quick_refresh is setting the slider itself */
 static int s_quick_shown_mode = -1, s_quick_shown_vol = -1;   /* what the card last painted */
+/* Keep these names in sync with GADGET_MODE_NAMES in muse_settings_ui.c:
+ * the quick panel and the Sound page each carry a copy, in enum order. */
 #if CONFIG_MUSE_CJK_FONT
 static const char *const QUICK_MODE_NAMES[MUSE_GADGET_MODE_COUNT] = {
     "语音通话", "文字回复", "会议录音",
@@ -673,7 +676,10 @@ static void on_canvas_clicked(lv_event_t *e)
 {
     (void)e;
     muse_state_make_happy();
-    if (s_face_active && muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+    /* Same gate quick_tick() enforces every frame: without the recording
+     * check the card would open over a meeting recording and be hidden
+     * again on the next frame. */
+    if (s_face_active && muse_state_mode(NULL) == MUSE_MODE_IDLE && !muse_state_recording()) {
         quick_show();
     }
 }

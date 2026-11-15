@@ -1453,7 +1453,7 @@ static void meeting_session(void)
         muse_state_set_hint(msg);
     }
     ESP_LOGI(TAG, "meeting %s: %s, %" PRIu32 " captured, %" PRIu32 " written in %" PRIu32 " blocks",
-             name, full ? "storage full" : stop_press ? "press stop" : "mode change/shutdown",
+             name, full ? "storage full" : error ? "error" : stop_press ? "press stop" : "mode change/shutdown",
              total, enc_samples, blocks);
 }
 
