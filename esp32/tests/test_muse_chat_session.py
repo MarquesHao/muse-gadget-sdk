@@ -100,6 +100,12 @@ bool muse_hatch_configured() { return true; }
 static void resampler_init(resampler_t *, int, int) {}
 static void on_dictation_end(bool) {}
 static void log_marks() {}
+/* The cases here are the speaker-off ones: replies are shown, not fetched. */
+bool muse_settings_speaker_on(void) { return false; }
+int muse_settings_gadget_mode(void) { return 0; }
+#define MUSE_GADGET_MODE_TEXT 1
+/* start_tts readies the decoder for a fetch the speaker-off cases never make. */
+void mp3dec_init(mp3dec_t *) {}
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
 /* The real review store, read back whole: one page holds all of it here. */
 int muse_chat_caption_page(const char *text, int, char *out, size_t cap) {

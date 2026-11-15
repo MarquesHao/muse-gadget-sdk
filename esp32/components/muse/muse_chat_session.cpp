@@ -128,6 +128,8 @@ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP
 #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
 #define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
 #define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
+#define TTS_FIRST_BYTE_US (3 * 1000000LL)  /* a speech fetch with nothing in 3 s is given up on */
+#define TTS_STALL_US (5 * 1000000LL)       /* one gone quiet mid-stream for 5 s is given up on */
 
 #define PING_US (20 * 1000000LL)
 #define DEAD_US (60 * 1000000LL)           /* nothing from the server, pongs included */
@@ -201,7 +203,7 @@ static int64_t s_auto_backoff_us = AUTO_RETRY_MIN_US;
 
 /* ---- Streams on the connection ---- */
 
-enum kind_t : uint8_t { K_NONE, K_SUB, K_DICT, K_CHAT, K_TTS, K_CALL, K_END_CALL };
+enum kind_t : uint8_t { K_NONE, K_SUB, K_DICT, K_CHAT, K_TTS, K_CALL, K_END_CALL, K_PROBE };
 
 struct stream_t {
     int64_t id;
@@ -277,6 +279,14 @@ struct turn_t {
     resampler_t down;
     int kbps;
     int down_rate;
+    int64_t tts_id;          /* the speech fetch stream's id, 0 when none is open */
+    int64_t tts_open_us;     /* when the current fetch opened */
+    int64_t tts_first_us;    /* when its first byte arrived, 0 until then */
+    int64_t tts_last_us;     /* when its latest byte arrived (the stall watch) */
+    size_t tts_bytes;        /* bytes the current fetch has brought */
+    int tts_frames;          /* MP3 frames decoded for the message being fetched */
+    int tts_try;             /* 0: the /api/voice path, 1: the older /voice path */
+    int tts_status;          /* HTTP status of the current fetch, 0 until known */
     bool detached;           /* the reply is slow: a notice is said, the turn ends, the reply starts another */
     bool incoming;           /* plays a reply to a request that outlived its turn */
 };
@@ -1739,6 +1749,110 @@ static void incoming_play(uint32_t gen)
     }
 }
 
+/* ---- Speech fetch: a reply's voice, from the VM's own TTS stream ---- */
+
+/* Gives up on the speech fetch for the message being shown: its text is
+ * paced with silence instead, as before, and the turn ends as usual. */
+static void tts_fallback(const char *why)
+{
+    (void)why;   /* the reason only reaches the log, which a build may stub out */
+    int i = s_turn.tts_msg;
+    if (i < 0) {
+        return;
+    }
+    msg_t &m = s_turn.msgs[i];
+    ESP_LOGW(TAG, "tts: message %s: no speech (%s); showing it at reading pace", m.id, why);
+    size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + i * TEXT_MAX) : m.len;
+    m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
+    s_turn.silent = true;
+}
+
+/* Percent-encodes a message id for a fetch path: letters, digits and
+ * -_.!~*'() stay as they are, the rest becomes %XX (the VM's own client
+ * encodes the same way). */
+static void tts_encode_id(const char *id, char *out, size_t cap)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t n = 0;
+    for (const uint8_t *p = (const uint8_t *)id; *p && n + 4 < cap; p++) {
+        uint8_t c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '!' || c == '~' || c == '*' || c == '\'' || c == '(' || c == ')') {
+            out[n++] = (char)c;
+        } else {
+            out[n++] = '%';
+            out[n++] = hex[c >> 4];
+            out[n++] = hex[c & 15];
+        }
+    }
+    out[n] = '\0';
+}
+
+/* Opens the speech fetch for message i, on the path for the current try. */
+static bool tts_open(int i)
+{
+    char enc[240];
+    tts_encode_id(s_turn.msgs[i].id, enc, sizeof(enc));
+    char path[288];
+    snprintf(path, sizeof(path), "%s?message_id=%s", s_turn.tts_try ? "/voice/tts-stream" : "/api/voice/tts-stream",
+             enc);
+    s_turn.tts_open_us = now_us();
+    s_turn.tts_first_us = 0;
+    s_turn.tts_last_us = s_turn.tts_open_us;
+    s_turn.tts_bytes = 0;
+    s_turn.tts_status = 0;
+    int64_t id = open_stream(K_TTS, "GET", path, nullptr, "audio/mpeg", nullptr, true);
+    if (!id) {
+        return false;
+    }
+    s_turn.tts_id = id;
+    ESP_LOGI(TAG, "tts: message %s: fetching its speech (%s path)", s_turn.msgs[i].id,
+             s_turn.tts_try ? "older" : "api");
+    return true;
+}
+
+/* ---- Boot probe: does the VM's TTS stream answer at all? ----
+ * Once per boot, the first finished assistant row the subscription brings
+ * while no turn is running (so never one of this device's own turns) lends
+ * its id for a single fetch whose audio is counted and dropped, never
+ * played. It only logs: the status, the byte count, the first byte's wait. */
+enum probe_t : uint8_t { PROBE_IDLE, PROBE_FLYING, PROBE_DONE };
+static probe_t s_probe_stage;
+static bool s_probe_armed;   /* set once the session is up (hatch_task) */
+static int s_probe_prefix;   /* 0: the /api path, 1: the older /voice path */
+static char s_probe_id[80];
+static int64_t s_probe_open_us, s_probe_first_us;
+static size_t s_probe_bytes;
+
+static bool probe_open(int prefix)
+{
+    char enc[240];
+    tts_encode_id(s_probe_id, enc, sizeof(enc));
+    char path[288];
+    snprintf(path, sizeof(path), "%s?message_id=%s", prefix ? "/voice/tts-stream" : "/api/voice/tts-stream", enc);
+    s_probe_open_us = now_us();
+    s_probe_first_us = 0;
+    s_probe_bytes = 0;
+    s_probe_prefix = prefix;
+    if (!open_stream(K_PROBE, "GET", path, nullptr, "audio/mpeg", nullptr, true)) {
+        s_probe_stage = PROBE_DONE;
+        ESP_LOGW(TAG, "tts probe: the fetch stream would not open");
+        return false;
+    }
+    s_probe_stage = PROBE_FLYING;
+    ESP_LOGI(TAG, "tts probe: asking for message %s (%s path)", s_probe_id, prefix ? "older" : "api");
+    return true;
+}
+
+static void probe_note_id(const char *id)
+{
+    if (!s_probe_armed || s_probe_stage != PROBE_IDLE || s_turn.phase != P_IDLE || !id || !id[0]) {
+        return;
+    }
+    strlcpy(s_probe_id, id, sizeof(s_probe_id));
+    probe_open(0);
+}
+
 static void on_event(cJSON *line)
 {
     if (strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(line, "type")) ?: "", "event") != 0) {
@@ -1755,6 +1869,12 @@ static void on_event(cJSON *line)
         last = v > last ? v : last;
     }
     cJSON *payload = cJSON_GetObjectItem(line, "payload");
+    if (!strcmp(event, "message.assistant")) {
+        const char *pid = msg_id(payload, line);
+        if (pid) {
+            probe_note_id(pid);   /* the boot TTS probe; inert once it has run */
+        }
+    }
     if (s_turn.phase == P_IDLE) {
         pending_event(event, payload, line);
         return;
@@ -1850,31 +1970,40 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
-        /*
-         * Replies are text, shown at reading pace: silence in place of speech
-         * paces the captions and ends the turn. To speak them instead, send
-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
-         * play the MP3 it returns. In place of the silence below: keep
-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
-         * end. decode() plays it at the speaker's volume, captions following,
-         * and finishes the message once it's drained.
-         */
         m.pcm_start = s_turn.pcm_out;
-        /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
-         * was kept at reading pace, not stretched over the whole reply's time
-         * (the Watcher keeps the rest for review). */
-        size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + i * TEXT_MAX) : m.len;
-        m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
         m.tts = TTS_ACTIVE;
         s_turn.tts_msg = i;
-        s_turn.silent = true;
-        ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+        if (!muse_settings_speaker_on() || muse_settings_gadget_mode() == MUSE_GADGET_MODE_TEXT) {
+            /* Speaker off, or text mode: the reply is shown at reading pace,
+             * silence in place of speech pacing the captions, and no fetch
+             * is made. Paced to the text kept: a reply longer than
+             * CAPTION_TEXT shows what was kept at reading pace, not stretched
+             * over the whole reply's time (the Watcher keeps the rest for
+             * review). */
+            size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + i * TEXT_MAX) : m.len;
+            m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
+            s_turn.silent = true;
+            ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+        } else {
+            /* The VM speaks its own replies: fetch this message's MP3 from
+             * its TTS stream (tts_open) and let tts_data()/decode() play it,
+             * captions following. Anything that goes wrong on the way falls
+             * back to the silent pacing above (tts_fallback), so a reply is
+             * never held up by its voice. */
+            m.pcm_frames = 0;
+            s_turn.silent = false;
+            s_turn.mp3_len = 0;
+            s_turn.mp3_ended = false;
+            s_turn.kbps = 0;
+            s_turn.down_rate = 0;
+            s_turn.tts_try = 0;
+            s_turn.tts_frames = 0;
+            mp3dec_init(&s_turn.dec);
+            ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
+            if (!tts_open(i)) {
+                tts_fallback("the fetch stream would not open");
+            }
+        }
         show_reply_start(m);
         return;
     }
@@ -1882,6 +2011,16 @@ static void start_tts(void)
 
 static void tts_data(const uint8_t *data, size_t len)
 {
+    if (s_turn.tts_msg >= 0) {
+        int64_t now = now_us();
+        if (!s_turn.tts_first_us) {
+            s_turn.tts_first_us = now;
+            mark(M_TTS);
+            ESP_LOGI(TAG, "tts: message %s: first byte +%d ms", s_turn.msgs[s_turn.tts_msg].id,
+                     (int)((now - s_turn.tts_open_us) / 1000));
+        }
+        s_turn.tts_last_us = now;
+    }
     if (s_turn.mp3_len + len > MP3_BUF) {
         ESP_LOGW(TAG, "MP3 buffer full, dropping %u bytes", (unsigned)len);
         len = MP3_BUF - s_turn.mp3_len;
@@ -1889,21 +2028,50 @@ static void tts_data(const uint8_t *data, size_t len)
     mark(M_MP3);
     memcpy(s_turn.mp3 + s_turn.mp3_len, data, len);
     s_turn.mp3_len += len;
+    s_turn.tts_bytes += len;   /* what was kept; the log's byte counts stay honest */
 }
 
 static void tts_end(stream_t *s, bool ok)
 {
-    int i = s->msg;
+    int status = s->status;
     close_stream(s);
-    if (i < 0 || i != s_turn.tts_msg) {
+    if (s_turn.tts_msg < 0 || s->id != s_turn.tts_id) {
         return;
     }
+    s_turn.tts_id = 0;
+    s_turn.tts_status = status;
+    int i = s_turn.tts_msg;
+    msg_t &m = s_turn.msgs[i];
     if (ok) {
         s_turn.mp3_ended = true;   /* decode() drains the rest, then finishes */
-    } else {
-        s_turn.msgs[i].tts = TTS_FINISHED;
-        s_turn.tts_msg = -1;
+        ESP_LOGI(TAG, "tts: message %s: stream ended, %u bytes", m.id, (unsigned)s_turn.tts_bytes);
+        return;
     }
+    if (!s_turn.tts_bytes && s_turn.pcm_out == m.pcm_start) {
+        /* Nothing arrived at all. A 404 on the /api path earns the older
+         * /voice path one try (the VM's own client does the same); anything
+         * else, or a second failure, gives up on speech for this message. */
+        if (status == 404 && !s_turn.tts_try) {
+            s_turn.tts_try = 1;
+            if (tts_open(i)) {
+                return;
+            }
+        }
+        if (status == 404) {
+            tts_fallback("HTTP 404 on both paths");
+        } else if (status > 0) {
+            char why[32];
+            snprintf(why, sizeof(why), "HTTP %d", status);
+            tts_fallback(why);
+        } else {
+            tts_fallback("the stream was reset");
+        }
+        return;
+    }
+    /* Part of it arrived: play what there is rather than nothing. */
+    ESP_LOGW(TAG, "tts: message %s: stream failed after %u bytes; playing what arrived", m.id,
+             (unsigned)s_turn.tts_bytes);
+    s_turn.mp3_ended = true;
 }
 
 /* Speaker off: queues the shown message's silence while the reply buffer has room. */
@@ -1931,6 +2099,34 @@ static void decode(void)
     if (s_turn.tts_msg < 0) {
         return;
     }
+    if (!s_turn.silent && !s_turn.mp3_ended && !s_turn.tts_first_us && s_turn.tts_open_us &&
+        now_us() - s_turn.tts_open_us > TTS_FIRST_BYTE_US) {
+        /* The fetch is open but nothing has come: stop waiting on it. */
+        ESP_LOGW(TAG, "tts: message %s: no first byte in 3 s", s_turn.msgs[s_turn.tts_msg].id);
+        if (s_turn.tts_id) {
+            send_reset(s_turn.tts_id);
+            s_turn.tts_id = 0;
+        }
+        tts_fallback("no first byte in 3 s");
+        return;
+    }
+    if (!s_turn.mp3_ended && s_turn.tts_first_us && s_turn.tts_id &&
+        MP3_BUF - s_turn.mp3_len >= MP3_POLL_ROOM && now_us() - s_turn.tts_last_us > TTS_STALL_US) {
+        /* The fetch went quiet mid-stream while its socket is being read
+         * (the poll-room test mirrors the reader's own hold-off, so a full
+         * buffer draining at playing pace never trips this): it is not
+         * coming back. Keep whatever already decoded. */
+        msg_t &sm = s_turn.msgs[s_turn.tts_msg];
+        ESP_LOGW(TAG, "tts: message %s: the stream stalled (%u bytes in)", sm.id, (unsigned)s_turn.tts_bytes);
+        send_reset(s_turn.tts_id);
+        s_turn.tts_id = 0;
+        if (s_turn.pcm_out == sm.pcm_start) {
+            tts_fallback("the stream stalled");
+        } else {
+            s_turn.mp3_ended = true;   /* drain and play what arrived */
+        }
+        return;
+    }
     if (s_turn.silent) {
         pace_silently();
         return;
@@ -1956,6 +2152,7 @@ static void decode(void)
         if (!samples) {
             continue;
         }
+        s_turn.tts_frames++;
         if (info.channels == 2) {
             for (int k = 0; k < samples; k++) {
                 s_pcm[k] = (s_pcm[2 * k] + s_pcm[2 * k + 1]) / 2;
@@ -1985,6 +2182,13 @@ static void decode(void)
         m.pcm_frames = s_turn.pcm_out - m.pcm_start + rest;
     }
     if (s_turn.mp3_ended && !s_turn.mp3_len) {
+        if (s_turn.pcm_out == m.pcm_start) {
+            /* The stream brought nothing that decodes: show it instead. */
+            tts_fallback("nothing decodable arrived");
+            return;
+        }
+        ESP_LOGI(TAG, "tts: message %s: spoken: %u bytes, %d frames, HTTP %d", m.id, (unsigned)s_turn.tts_bytes,
+                 s_turn.tts_frames, s_turn.tts_status);
         m.pcm_end = s_turn.pcm_out;
         m.pcm_frames = s_turn.pcm_out - m.pcm_start;
         m.tts = TTS_FINISHED;
@@ -2113,9 +2317,15 @@ static void stream_data(stream_t *s, ConstByteSpan data)
         break;
     }
     case K_TTS:
-        if (s->msg == s_turn.tts_msg) {
+        if (s->id == s_turn.tts_id) {
             tts_data(data.data(), data.size());
         }
+        break;
+    case K_PROBE:
+        if (!s_probe_first_us) {
+            s_probe_first_us = now_us();
+        }
+        s_probe_bytes += data.size();
         break;
 #if CONFIG_MUSE_REALTIME_VOICE
     case K_CALL:
@@ -2152,6 +2362,21 @@ static bool stream_end(stream_t *s, bool ok)
     case K_TTS:
         tts_end(s, ok);
         break;
+    case K_PROBE: {
+        int status = s->status;
+        int prefix = s_probe_prefix;
+        close_stream(s);
+        ESP_LOGI(TAG, "tts probe: %s path: HTTP %d, %u bytes, first byte +%d ms, ended %s",
+                 prefix ? "older" : "api", status, (unsigned)s_probe_bytes,
+                 s_probe_first_us ? (int)((s_probe_first_us - s_probe_open_us) / 1000) : -1,
+                 ok ? "cleanly" : "early");
+        if (!ok && status == 404 && !prefix) {
+            probe_open(1);   /* the older path gets its try, as with a real fetch */
+        } else {
+            s_probe_stage = PROBE_DONE;
+        }
+        break;
+    }
 #if CONFIG_MUSE_REALTIME_VOICE
     case K_CALL:
     case K_END_CALL: {
@@ -2386,6 +2611,9 @@ static void hatch_task(void *arg)
         }
 #endif
         pending_expire(now_us());   /* connected or not */
+        if (s_connected) {
+            s_probe_armed = true;   /* the boot TTS probe may borrow a row's id once the session is up */
+        }
         if (!s_connected) {
             if (!muse_wifi_connected()) {
                 s_auto_next_us = 0;
