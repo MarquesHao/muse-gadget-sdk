@@ -87,6 +87,7 @@ static QueueHandle_t s_wq, s_freeq;
 static SemaphoreHandle_t s_done;
 static SemaphoreHandle_t s_lock;   /* serializes mount + state snapshots across caller tasks */
 static atomic_int s_init_state;    /* 0 new, 1 initializing, 2 done */
+static atomic_int s_lock_state;    /* same protocol, for s_lock alone */
 static esp_err_t s_init_err = ESP_OK;
 static volatile esp_err_t s_op_err = ESP_OK;
 static FILE *s_fp;                 /* writer task only */
@@ -172,17 +173,40 @@ static void writer_task(void *arg)
     }
 }
 
+/* The mount lock on its own, creatable without setup(): the boot-time
+ * prewarm mount takes s_lock but must not drag in setup() — the writer
+ * task's internal-RAM stack and the queues are memory the audio pipeline
+ * needs first at boot (a starved I2S DMA allocation crashed voice init
+ * on the 1.75C). First real use (begin/list/dump) runs full setup(). */
+static esp_err_t lock_init_once(void)
+{
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&s_lock_state, &expected, 1)) {
+        if (!s_lock) {
+            s_lock = xSemaphoreCreateMutex();
+        }
+        atomic_store(&s_lock_state, 2);
+        return s_lock ? ESP_OK : ESP_ERR_NO_MEM;
+    }
+    while (atomic_load(&s_lock_state) != 2) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return s_lock ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
 static esp_err_t setup(void)
 {
     if (s_setup) {
         return ESP_OK;
     }
+    if (lock_init_once() != ESP_OK) {
+        return ESP_ERR_NO_MEM;
+    }
     meet_blk_t *pool = heap_caps_malloc(MEET_POOL_BLOCKS * sizeof(meet_blk_t), MALLOC_CAP_SPIRAM);
     s_wq = xQueueCreate(MEET_POOL_BLOCKS + 4, sizeof(meet_msg_t));
     s_freeq = xQueueCreate(MEET_POOL_BLOCKS, sizeof(meet_blk_t *));
     s_done = xSemaphoreCreateBinary();
-    s_lock = xSemaphoreCreateMutex();
-    if (!pool || !s_wq || !s_freeq || !s_done || !s_lock) {
+    if (!pool || !s_wq || !s_freeq || !s_done) {
         return ESP_ERR_NO_MEM;
     }
     for (int i = 0; i < MEET_POOL_BLOCKS; i++) {
@@ -294,12 +318,31 @@ static esp_err_t mount_or_format_once(void)
  */
 esp_err_t muse_meeting_mount(void)
 {
-    esp_err_t err = init_once();
+    /* Lock only, NOT init_once(): the prewarm must not create the writer
+     * task or the queues — see lock_init_once. */
+    esp_err_t err = lock_init_once();
     if (err != ESP_OK) {
         return err;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     err = mount_or_format_once();
+    if (err == ESP_OK) {
+        /* The prewarm's jobs were the one-time format and proving the
+         * store works; nothing needs it mounted afterwards, and every
+         * real use (begin/list/dump) mounts on demand. Unmount again
+         * right away: a mounted wear-levelling layer holds several KB
+         * of internal RAM for the device's whole life, and on the 1.75C
+         * that leaves the largest free block too small for the chat
+         * session's VM-lookup task — voice then fails with CAN'T REACH
+         * MUSE while Link is up (measured on hardware, 2026-11-15). */
+        esp_err_t uerr = esp_vfs_fat_spiflash_unmount_rw_wl(MEET_BASE, s_wl);
+        if (uerr == ESP_OK) {
+            s_wl = WL_INVALID_HANDLE;
+            s_mounted = false;
+        } else {
+            ESP_LOGW(TAG, "prewarm unmount: %s", esp_err_to_name(uerr));
+        }
+    }
     xSemaphoreGive(s_lock);
     if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
         ESP_LOGW(TAG, "prewarm mount: %s", esp_err_to_name(err));

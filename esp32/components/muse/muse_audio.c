@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_codec_dev.h"
 #include "esp_heap_caps.h"
@@ -44,9 +45,17 @@ static bool s_open;
 /* Opening, closing and the volume and gain setters, which other tasks call:
  * with a board-switched codec supply, none may reach a codec mid-switch. */
 static SemaphoreHandle_t s_lock;
-static int16_t s_in_stereo[MUSE_AUDIO_CHUNK * CHANNELS];
-static int16_t s_in_mono[MUSE_AUDIO_CHUNK];
-static int16_t s_out_stereo[MUSE_AUDIO_CHUNK * CHANNELS];
+/* The chunk staging lives in PSRAM, not internal RAM: the chat
+ * session spawns an 8 KB-stack task to look the VM up, and with
+ * every staging buffer internal the largest free heap block at
+ * that moment lands within a few hundred bytes of the task's
+ * stack — on the 1.75C it fell short and voice could not connect
+ * (measured 2026-11-15; see muse_voice_call.cpp). These buffers
+ * are filled and emptied by the CPU around codec reads/writes,
+ * never DMA targets. */
+EXT_RAM_BSS_ATTR static int16_t s_in_stereo[MUSE_AUDIO_CHUNK * CHANNELS];
+EXT_RAM_BSS_ATTR static int16_t s_in_mono[MUSE_AUDIO_CHUNK];
+EXT_RAM_BSS_ATTR static int16_t s_out_stereo[MUSE_AUDIO_CHUNK * CHANNELS];
 
 /* One-pole high-pass on the mixed mic signal. */
 static float s_hpf_a;
@@ -467,7 +476,7 @@ float muse_audio_level(const int16_t *mono, size_t frames)
 void muse_audio_chirp(int rising)
 {
     enum { MS = 90, N = MUSE_AUDIO_RATE * MS / 1000 };
-    static int16_t buf[N];
+    EXT_RAM_BSS_ATTR static int16_t buf[N];   /* PSRAM: see s_in_stereo above */
     float f0 = rising ? 620.0f : 980.0f;
     float f1 = rising ? 1180.0f : 560.0f;
     float phase = 0;

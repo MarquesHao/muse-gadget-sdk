@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -169,7 +170,10 @@ static size_t s_pre_next, s_pre_fill;
 #if MUSE_LOW_MEM
 static muse_adpcm_t s_pre_enc;
 #endif
-static int16_t s_chunk[MUSE_AUDIO_CHUNK];
+/* PSRAM, not internal RAM: chunk staging the CPU fills and drains;
+ * internal headroom is what the chat session's VM-lookup task is
+ * created from (see muse_voice_call.cpp, measured 2026-11-15). */
+EXT_RAM_BSS_ATTR static int16_t s_chunk[MUSE_AUDIO_CHUNK];
 static int s_settle;
 
 /*
@@ -459,7 +463,7 @@ static bool hatch_reply(bool *delivered, bool incoming)
     muse_state_set_mode(MUSE_MODE_THINKING);
     /* Until there's a transcript or reply; a late reply has no note to send. */
     muse_state_set_caption(incoming ? "MUSE HAS AN ANSWER" : "SENDING VOICE NOTE");
-    static int16_t buf[MUSE_AUDIO_CHUNK];
+    EXT_RAM_BSS_ATTR static int16_t buf[MUSE_AUDIO_CHUNK];   /* PSRAM: see s_chunk */
     static const int16_t silence[MUSE_AUDIO_CHUNK];
     char text[96];
     static char page[MUSE_CAPTION_MAX];
@@ -1144,7 +1148,7 @@ static void call_view(muse_voice_view_t view)
  * crossing into a different press. */
 static void run_call(bool ptt, size_t waking_chunks)
 {
-    static int16_t out[MUSE_AUDIO_CHUNK];
+    EXT_RAM_BSS_ATTR static int16_t out[MUSE_AUDIO_CHUNK];   /* PSRAM: see s_chunk */
     static const int16_t silence[MUSE_AUDIO_CHUNK];
     char text[96] = "";
     call_ui_t c = { .ptt = ptt, .held = ptt, .input_epoch = s_press_input_epoch };

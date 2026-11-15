@@ -22,6 +22,7 @@
 
 #include "esp_app_desc.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
 #if CONFIG_ESP_HOSTED_ENABLED
@@ -131,45 +132,70 @@ LV_FONT_DECLARE(muse_font_cjk_noto_16)
 LV_FONT_DECLARE(muse_font_cjk_16)
 #define SETTINGS_CJK_FONT muse_font_cjk_16
 #endif
+/* The screen's language (project V1.1 fix2): these pages are written in
+ * English and translated where they are built — a page is built when
+ * first opened, in the then-current language, and changing the language
+ * restarts the device so every page rebuilds. TR() picks the text; a
+ * build without a CJK font has nothing to draw Chinese with, so it
+ * always picks English. The P4 pilot's compile-time Chinese became this
+ * run-time choice. */
+#if CONFIG_MUSE_CJK_FONT
+#define TR(en, zh) (muse_settings_lang() == MUSE_LANG_ZH ? (zh) : (en))
+#else
+#define TR(en, zh) (en)
+#endif
 /* The mode names below are the Sound page's copy of the quick panel's
  * QUICK_MODE_NAMES in muse_ui.c: keep the two lists in sync, in enum
  * order, in both languages. */
+static const char *const GADGET_MODE_NAMES_EN[] = { "Voice call", "Text replies", "Meeting" };
 #if CONFIG_MUSE_CJK_FONT
-/* Chinese pilot (project V1.1, P4): the Sound page in Chinese. */
-static const char *const GADGET_MODE_NAMES[] = { "语音通话", "文字回复", "会议录音" };
-static const char *const SOUND_TITLE = "声音";
-static const char *const SOUND_NAV = "声音";
-static const char *const SOUND_MODE_HINT = "模式：";
-static const char *const SOUND_MODE_DESC =
-    "语音通话：点顶部键实时通话，或按住发语音条。文字回复：按住说话，回复只显示文字、不出声。"
-    "会议录音：录音存到设备里，再按一次顶部键停止；文件只留在设备上。";
-static const char *const SOUND_SPEAKER = "扬声器";
-static const char *const SOUND_VOLUME = "音量";
-static const char *const SOUND_GAIN = "麦克风增益";
-#else
-static const char *const GADGET_MODE_NAMES[] = { "Voice call", "Text replies", "Meeting" };
-static const char *const SOUND_TITLE = "SOUND";
-static const char *const SOUND_NAV = "Sound";
-static const char *const SOUND_MODE_HINT = "Mode:";
-static const char *const SOUND_MODE_DESC =
-    "Voice call: tap the top button to talk live, or hold it to send a voice note. "
-    "Text replies: hold to talk; replies are shown, not spoken. Meeting: records to the "
-    "device until the top button is pressed again; files stay on the device.";
-static const char *const SOUND_SPEAKER = "Speaker";
-static const char *const SOUND_VOLUME = "Volume";
-static const char *const SOUND_GAIN = "Mic gain";
+static const char *const GADGET_MODE_NAMES_ZH[] = { "语音通话", "文字回复", "会议录音" };
 #endif
-#define GADGET_MODE_COUNT (int)(sizeof(GADGET_MODE_NAMES) / sizeof(GADGET_MODE_NAMES[0]))
+static const char *gadget_mode_name(int i)
+{
+#if CONFIG_MUSE_CJK_FONT
+    if (muse_settings_lang() == MUSE_LANG_ZH) {
+        return GADGET_MODE_NAMES_ZH[i];
+    }
+#endif
+    return GADGET_MODE_NAMES_EN[i];
+}
+#define SOUND_TITLE TR("SOUND", "声音")
+#define SOUND_NAV TR("Sound", "声音")
+#define SOUND_MODE_HINT TR("Mode:", "模式：")
+#define SOUND_MODE_DESC                                                                                                \
+    TR("Voice call: tap the top button to talk live, or hold it to send a voice note. "                                 \
+       "Text replies: hold to talk; replies are shown, not spoken. Meeting: records to the "                           \
+       "device until the top button is pressed again; files stay on the device.",                                      \
+       "语音通话：点顶部键实时通话，或按住发语音条。文字回复：按住说话，回复只显示文字、不出声。"                       \
+       "会议录音：录音存到设备里，再按一次顶部键停止；文件只留在设备上。")
+#define SOUND_SPEAKER TR("Speaker", "扬声器")
+#define SOUND_VOLUME TR("Volume", "音量")
+#define SOUND_GAIN TR("Mic gain", "麦克风增益")
+#define GADGET_MODE_COUNT (int)(sizeof(GADGET_MODE_NAMES_EN) / sizeof(GADGET_MODE_NAMES_EN[0]))
 /* Direct guard, not just muse_ui.c's transitive one: if the name list
  * and the settings enum drift apart, this file must fail to build too —
  * its rows are indexed by mode and cast straight to muse_gadget_mode_t. */
 _Static_assert(GADGET_MODE_COUNT == MUSE_GADGET_MODE_COUNT,
                "GADGET_MODE_NAMES names every gadget mode");
 static lv_obj_t *s_mode_checks[GADGET_MODE_COUNT];
+static lv_obj_t *s_lang_checks[MUSE_LANG_COUNT];
 
 /* Sleep page. */
 static const int SLEEP_CHOICES[] = { 0, 30, 60, 120, 300, 600 };
-static const char *const SLEEP_NAMES[] = { "Never", "30 seconds", "1 minute", "2 minutes", "5 minutes", "10 minutes" };
+static const char *const SLEEP_NAMES_EN[] = { "Never", "30 seconds", "1 minute", "2 minutes", "5 minutes", "10 minutes" };
+#if CONFIG_MUSE_CJK_FONT
+static const char *const SLEEP_NAMES_ZH[] = { "从不", "30 秒", "1 分钟", "2 分钟", "5 分钟", "10 分钟" };
+#endif
+static const char *sleep_display_name(int i)
+{
+#if CONFIG_MUSE_CJK_FONT
+    if (muse_settings_lang() == MUSE_LANG_ZH) {
+        return SLEEP_NAMES_ZH[i];
+    }
+#endif
+    return SLEEP_NAMES_EN[i];
+}
 #define SLEEP_COUNT (int)(sizeof(SLEEP_CHOICES) / sizeof(SLEEP_CHOICES[0]))
 static lv_obj_t *s_sleep_checks[SLEEP_COUNT], *s_sleep_rows[SLEEP_COUNT];
 static int s_sleep_shown = -1;
@@ -1070,19 +1096,21 @@ static void build_wifi_page(lv_obj_t *tile)
     s_wifi_status = note(list, "");
 
     s_wifi_saved = column(list);
-    s_wifi_scan_btn = button(list, LV_SYMBOL_REFRESH "  Scan for networks", COLOR_ACCENT, on_wifi_scan, &s_wifi_scan_lbl);
+    s_wifi_scan_btn = button(list, TR(LV_SYMBOL_REFRESH "  Scan for networks", LV_SYMBOL_REFRESH "  扫描网络"),
+                             COLOR_ACCENT, on_wifi_scan, &s_wifi_scan_lbl);
     s_wifi_list = column(list);
 
-    row(list, LV_SYMBOL_EDIT, "Other network...", NULL, on_wifi_other, NULL);
-    lv_obj_t *mac = info_row(list, "MAC address");
+    row(list, LV_SYMBOL_EDIT, TR("Other network...", "其他网络..."), NULL, on_wifi_other, NULL);
+    lv_obj_t *mac = info_row(list, TR("MAC address", "MAC 地址"));
     uint8_t m[6];
     if (sta_mac(m)) {
         char buf[18];
         snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
         lv_label_set_text(mac, buf);
     }
-    note(list, "Muse remembers up to 8 networks and joins the strongest one in range. Tap a saved one twice to "
-               "forget it.");
+    note(list, TR("Muse remembers up to 8 networks and joins the strongest one in range. Tap a saved one twice to "
+                  "forget it.",
+                  "Muse 最多记住 8 个网络，自动连范围内信号最强的。连点两下已存的网络可以忘记它。"));
 }
 
 static void tick_wifi(void)
@@ -1092,27 +1120,27 @@ static void tick_wifi(void)
     char buf[128];
     switch (w.state) {
     case MUSE_WIFI_OFF:
-        strlcpy(buf, "Wi-Fi is off", sizeof(buf));
+        strlcpy(buf, TR("Wi-Fi is off", "无线网已关闭"), sizeof(buf));
         break;
     case MUSE_WIFI_NO_NETWORK:
-        strlcpy(buf, "No saved networks. Scan and pick one.", sizeof(buf));
+        strlcpy(buf, TR("No saved networks. Scan and pick one.", "没有已存网络，扫描选一个。"), sizeof(buf));
         break;
     case MUSE_WIFI_CONNECTING:
-        snprintf(buf, sizeof(buf), "Joining %s\n%s", w.ssid, w.detail);
+        snprintf(buf, sizeof(buf), TR("Joining %s\n%s", "正在加入 %s\n%s"), w.ssid, w.detail);
         break;
     case MUSE_WIFI_CONNECTED:
         if (muse_board->epaper) {
-            snprintf(buf, sizeof(buf), "Connected to %s\n%s", w.ssid, w.ip);
+            snprintf(buf, sizeof(buf), TR("Connected to %s\n%s", "已连接到 %s\n%s"), w.ssid, w.ip);
         } else {
-            snprintf(buf, sizeof(buf), "Connected to %s\n%s  -  %d dBm", w.ssid, w.ip, w.rssi);
+            snprintf(buf, sizeof(buf), TR("Connected to %s\n%s  -  %d dBm", "已连接到 %s\n%s  -  %d dBm"), w.ssid, w.ip, w.rssi);
         }
         break;
     case MUSE_WIFI_NOT_NEARBY:
-        strlcpy(buf, "No saved network nearby\nLooking again within a minute", sizeof(buf));
+        strlcpy(buf, TR("No saved network nearby\nLooking again within a minute", "附近没有已存网络\n一分钟内再找"), sizeof(buf));
         break;
     case MUSE_WIFI_FAILED:
     default:
-        snprintf(buf, sizeof(buf), "Couldn't join %s\n%s", w.ssid, w.detail);
+        snprintf(buf, sizeof(buf), TR("Couldn't join %s\n%s", "加入不了 %s\n%s"), w.ssid, w.detail);
         break;
     }
     set_text(s_wifi_status, buf);
@@ -1125,7 +1153,8 @@ static void tick_wifi(void)
     }
     lv_obj_set_flag(s_wifi_scan_btn, LV_OBJ_FLAG_HIDDEN, !on);
     lv_obj_set_flag(s_wifi_list, LV_OBJ_FLAG_HIDDEN, !on);
-    set_text(s_wifi_scan_lbl, muse_wifi_scanning() ? "Scanning..." : LV_SYMBOL_REFRESH "  Scan for networks");
+    set_text(s_wifi_scan_lbl, muse_wifi_scanning() ? TR("Scanning...", "扫描中...")
+                                                   : TR(LV_SYMBOL_REFRESH "  Scan for networks", LV_SYMBOL_REFRESH "  扫描网络"));
     rebuild_saved_list();
     tick_saved_list(&w);
     /* The scan found one: join it now rather than at the next look. */
@@ -1157,7 +1186,7 @@ static void on_hatch_sdk_token_done(const char *text)
 static void on_hatch_sdk_token(lv_event_t *e)
 {
     (void)e;
-    open_text("SDK token", "", true, 48 /* mgst_ and 43 more */, "Empty keeps the current one; a new one restarts",
+    open_text("SDK token", "", true, 48 /* mgst_ and 43 more */, TR("Empty keeps the current one; a new one restarts", "留空保持现在的；填新的会重启"),
               on_hatch_sdk_token_done, s_hatch);
 }
 
@@ -1166,7 +1195,7 @@ static void on_hatch_host(lv_event_t *e)
     (void)e;
     char host[MUSE_HOST_MAX + 1];
     muse_settings_hatch_host(host);
-    open_text("Muse server", host, false, MUSE_HOST_MAX, "Empty for the default", on_hatch_host_done, s_hatch);
+    open_text(TR("Muse server", "Muse 服务器"), host, false, MUSE_HOST_MAX, TR("Empty for the default", "留空用默认"), on_hatch_host_done, s_hatch);
 }
 
 static void on_hatch_vm(lv_event_t *e)
@@ -1174,13 +1203,13 @@ static void on_hatch_vm(lv_event_t *e)
     (void)e;
     char vm[MUSE_VM_MAX + 1];
     muse_settings_hatch_vm(vm);
-    open_text("VM ID", vm, false, MUSE_VM_MAX, "Optional", on_hatch_vm_done, s_hatch);
+    open_text("VM ID", vm, false, MUSE_VM_MAX, TR("Optional", "可选"), on_hatch_vm_done, s_hatch);
 }
 
 static void on_hatch_token(lv_event_t *e)
 {
     (void)e;
-    open_text("Device token", "", true, MUSE_TOKEN_MAX, "Empty keeps the current one", on_hatch_token_done, s_hatch);
+    open_text(TR("Device token", "设备令牌"), "", true, MUSE_TOKEN_MAX, TR("Empty keeps the current one", "留空保持现在的"), on_hatch_token_done, s_hatch);
 }
 
 static void on_hatch_test(lv_event_t *e)
@@ -1195,12 +1224,12 @@ static void on_link_reset(lv_event_t *e)
     (void)e;
     int64_t now = esp_timer_get_time();
     if (s_link_reset_armed_us && now - s_link_reset_armed_us < 5000000) {
-        set_text(s_link_reset_lbl, "Resetting...");
+        set_text(s_link_reset_lbl, TR("Resetting...", "重置中..."));
         muse_link_reset_setup();
         return;
     }
     s_link_reset_armed_us = now;
-    set_text(s_link_reset_lbl, "Tap again to reset");
+    set_text(s_link_reset_lbl, TR("Tap again to reset", "再点一次重置"));
 }
 
 static void build_hatch_page(lv_obj_t *tile)
@@ -1209,30 +1238,34 @@ static void build_hatch_page(lv_obj_t *tile)
     s_hatch = page(tile, "MUSE", true, &list);
     s_link_reset_armed_us = 0;
     s_link_status = note(list, "");
-    button(list, "Reset pairing", COLOR_DANGER, on_link_reset, &s_link_reset_lbl);
+    button(list, TR("Reset pairing", "重置配对"), COLOR_DANGER, on_link_reset, &s_link_reset_lbl);
     s_hatch_status = note(list, "");
-    row(list, NULL, "Server", &s_hatch_host, on_hatch_host, NULL);
+    row(list, NULL, TR("Server", "服务器"), &s_hatch_host, on_hatch_host, NULL);
     row(list, NULL, "VM ID", &s_hatch_vm, on_hatch_vm, NULL);
-    row(list, NULL, "Device token", &s_hatch_token, on_hatch_token, NULL);
+    row(list, NULL, TR("Device token", "设备令牌"), &s_hatch_token, on_hatch_token, NULL);
     row(list, NULL, "SDK token", &s_hatch_sdk_token, on_hatch_sdk_token, NULL);
-    button(list, "Test connection", COLOR_ACCENT, on_hatch_test, NULL);
-    note(list, "Pair with the Muse app to use your account; a device token here overrides it, and a long one is "
-               "easier to send over Bluetooth. The VM ID picks one of your VMs. The SDK token is from "
-               "gadgets.muse.ai; one set here replaces the firmware's. "
-               "Reset pairing forgets Wi-Fi and the app pairing, then restarts.");
+    button(list, TR("Test connection", "测试连接"), COLOR_ACCENT, on_hatch_test, NULL);
+    note(list, TR("Pair with the Muse app to use your account; a device token here overrides it, and a long one is "
+                  "easier to send over Bluetooth. The VM ID picks one of your VMs. The SDK token is from "
+                  "gadgets.muse.ai; one set here replaces the firmware's. "
+                  "Reset pairing forgets Wi-Fi and the app pairing, then restarts.",
+                  "用 Muse 应用配对后就能用你的账号；在这里填的设备令牌会覆盖配对的，长令牌用蓝牙发更容易。"
+                  "VM ID 用来指定一台虚拟机。SDK 令牌来自 gadgets.muse.ai，在这里填的会替换固件自带的。"
+                  "重置配对会忘记无线网和应用配对，然后重启。"));
 }
 
 static void tick_hatch(void)
 {
     char link[96];
-    const char *paired = !muse_link_hatch_linked()    ? "not paired"
-                         : muse_link_sdk_token_changed() ? "paired with another SDK token, pair again to use this one"
-                                                         : "paired";
-    snprintf(link, sizeof(link), "Muse app: %s\n%s", paired, muse_link_state_name(muse_link_state()));
+    const char *paired = !muse_link_hatch_linked()    ? TR("not paired", "未配对")
+                         : muse_link_sdk_token_changed() ? TR("paired with another SDK token, pair again to use this one",
+                                                              "用了另一个 SDK 令牌配对，要用这个请重新配对")
+                                                         : TR("paired", "已配对");
+    snprintf(link, sizeof(link), TR("Muse app: %s\n%s", "Muse 应用：%s\n%s"), paired, muse_link_state_name(muse_link_state()));
     set_text(s_link_status, link);
     if (s_link_reset_armed_us && esp_timer_get_time() - s_link_reset_armed_us >= 5000000) {
         s_link_reset_armed_us = 0;
-        set_text(s_link_reset_lbl, "Reset pairing");
+        set_text(s_link_reset_lbl, TR("Reset pairing", "重置配对"));
     }
 
     muse_hatch_status_t h;
@@ -1252,21 +1285,21 @@ static void tick_hatch(void)
     muse_settings_hatch_vm(vm);
     set_text(s_hatch_host, host);
     /* One set here, else the one it connected to. */
-    set_text(s_hatch_vm, vm[0] ? vm : h.vm_id[0] ? h.vm_id : "Not set");
+    set_text(s_hatch_vm, vm[0] ? vm : h.vm_id[0] ? h.vm_id : TR("Not set", "未设置"));
     /* The device token is a credential, so none of it shows. Pairing stores one
      * (muse_link_hatch_linked); one typed in here overrides it. */
-    set_text(s_hatch_token, muse_settings_hatch_token_len() ? "Set here" :
-                            muse_link_hatch_linked() ? "Set" : "Not set");
+    set_text(s_hatch_token, muse_settings_hatch_token_len() ? TR("Set here", "在这里设置的") :
+                            muse_link_hatch_linked() ? TR("Set", "已设置") : TR("Not set", "未设置"));
     /* The hint gadgets.muse.ai shows. */
     const char *sdk = muse_link_sdk_token();
     if (sdk) {
         snprintf(buf, sizeof(buf), "%.12s...", sdk);
     }
     if (s_sdk_token_bad_us && esp_timer_get_time() - s_sdk_token_bad_us < 5000000) {
-        set_text(s_hatch_sdk_token, "Not a token");
+        set_text(s_hatch_sdk_token, TR("Not a token", "不是令牌"));
     } else {
         s_sdk_token_bad_us = 0;
-        set_text(s_hatch_sdk_token, sdk ? buf : "Not set");
+        set_text(s_hatch_sdk_token, sdk ? buf : TR("Not set", "未设置"));
     }
 }
 
@@ -1286,12 +1319,13 @@ static void on_ble_forget(lv_event_t *e)
 static void build_ble_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
-    s_ble = page(tile, "BLUETOOTH", true, &list);
-    s_ble_sw = switch_row(list, "Phone setup", muse_settings_ble_on(), on_ble_sw);
+    s_ble = page(tile, TR("BLUETOOTH", "蓝牙"), true, &list);
+    s_ble_sw = switch_row(list, TR("Phone setup", "手机设置"), muse_settings_ble_on(), on_ble_sw);
     s_ble_status = note(list, "");
-    button(list, "Forget paired phones", COLOR_DANGER, on_ble_forget, NULL);
-    note(list, "When on, Muse is visible to phones nearby. Open tools/ble_setup.html in Chrome, "
-               "connect, and enter the code Muse shows to pair.");
+    button(list, TR("Forget paired phones", "忘记配对的手机"), COLOR_DANGER, on_ble_forget, NULL);
+    note(list, TR("When on, Muse is visible to phones nearby. Open tools/ble_setup.html in Chrome, "
+                  "connect, and enter the code Muse shows to pair.",
+                  "打开后，附近的手机能看到 Muse。在 Chrome 里打开 tools/ble_setup.html，连接后输入 Muse 显示的代码配对。"));
 }
 
 static void tick_ble(void)
@@ -1301,14 +1335,14 @@ static void tick_ble(void)
     char buf[96];
     switch (b.state) {
     case MUSE_BLE_OFF:
-        strlcpy(buf, "Off", sizeof(buf));
+        strlcpy(buf, TR("Off", "关"), sizeof(buf));
         break;
     case MUSE_BLE_ADVERTISING:
-        snprintf(buf, sizeof(buf), "Visible as %s", b.name);
+        snprintf(buf, sizeof(buf), TR("Visible as %s", "可见为 %s"), b.name);
         break;
     case MUSE_BLE_CONNECTED:
     default:
-        snprintf(buf, sizeof(buf), "Phone connected\n%s", b.secure ? "Paired" : "Waiting for pairing");
+        snprintf(buf, sizeof(buf), TR("Phone connected\n%s", "手机已连接\n%s"), b.secure ? TR("Paired", "已配对") : TR("Waiting for pairing", "等待配对"));
         break;
     }
     set_text(s_ble_status, buf);
@@ -1336,6 +1370,35 @@ static void on_speaker_sw(lv_event_t *e)
 static void on_mode_choice(lv_event_t *e)
 {
     muse_settings_set_gadget_mode((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+static esp_timer_handle_t s_lang_restart_timer;
+
+static void lang_restart_cb(void *arg)
+{
+    (void)arg;
+    esp_restart();
+}
+
+static void on_lang_choice(lv_event_t *e)
+{
+    int lang = (int)(intptr_t)lv_event_get_user_data(e);
+    if (lang == muse_settings_lang()) {
+        return;
+    }
+    muse_settings_set_lang(lang);
+    /* Pages are built once, in the language of their build, while the
+     * face and the captions read the setting as they draw: restart so
+     * everything comes up in the new language. Pairing, Wi-Fi, the mode
+     * and the language itself are in NVS and survive. */
+    if (!s_lang_restart_timer) {
+        const esp_timer_create_args_t args = { .callback = lang_restart_cb, .name = "lang_restart" };
+        if (esp_timer_create(&args, &s_lang_restart_timer) != ESP_OK) {
+            esp_restart();
+            return;
+        }
+    }
+    esp_timer_start_once(s_lang_restart_timer, 600000);
 }
 
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
@@ -1384,19 +1447,27 @@ static void build_sound_page(lv_obj_t *tile)
     lv_obj_t *list;
     if (screen_only()) {
         /* No speaker or mic: the page is just the screen's brightness. */
-        s_sound = page(tile, "SCREEN", true, &list);
-        s_bright_sl = slider(list, "Brightness", 10, 100, muse_settings_brightness(), &s_bright_val, on_bright);
+        s_sound = page(tile, TR("SCREEN", "屏幕"), true, &list);
+        s_bright_sl = slider(list, TR("Brightness", "亮度"), 10, 100, muse_settings_brightness(), &s_bright_val, on_bright);
         set_val(s_bright_val, "%d%%", muse_settings_brightness());
         return;
     }
     s_sound = page(tile, SOUND_TITLE, true, &list);
     note(list, SOUND_MODE_HINT);
     for (int i = 0; i < GADGET_MODE_COUNT; i++) {
-        row(list, NULL, GADGET_MODE_NAMES[i], &s_mode_checks[i], on_mode_choice,
+        row(list, NULL, gadget_mode_name(i), &s_mode_checks[i], on_mode_choice,
             (void *)(intptr_t)i);
         lv_obj_set_style_text_color(s_mode_checks[i], lv_color_hex(COLOR_ACCENT), 0);
     }
     note(list, SOUND_MODE_DESC);
+#if CONFIG_MUSE_CJK_FONT
+    note(list, TR("Language:", "语言："));
+    for (int i = 0; i < MUSE_LANG_COUNT; i++) {
+        row(list, NULL, i == MUSE_LANG_ZH ? "中文" : "English", &s_lang_checks[i], on_lang_choice,
+            (void *)(intptr_t)i);
+        lv_obj_set_style_text_color(s_lang_checks[i], lv_color_hex(COLOR_ACCENT), 0);
+    }
+#endif
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
     s_notes_sw = switch_row(list, "Voice notes", muse_settings_voice_notes(), on_notes_sw);
     note(list, "Off: hold yellow to talk live, release to listen; blue ends the call. "
@@ -1413,7 +1484,7 @@ static void build_sound_page(lv_obj_t *tile)
     lv_obj_set_size(meter, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_pad_hor(meter, 8, 0);
     lv_obj_remove_flag(meter, LV_OBJ_FLAG_SCROLLABLE);
-    label(meter, &lv_font_montserrat_16, COLOR_DIM, "Mic level");
+    label(meter, &lv_font_montserrat_16, COLOR_DIM, TR("Mic level", "麦克风电平"));
     s_mic_val = label(meter, &lv_font_montserrat_16, COLOR_DIM, "");
     lv_obj_align(s_mic_val, narrow_panel() ? LV_ALIGN_TOP_LEFT : LV_ALIGN_TOP_RIGHT,
                  0, narrow_panel() ? 22 : 0);
@@ -1426,11 +1497,12 @@ static void build_sound_page(lv_obj_t *tile)
     if (muse_board->epaper) {
         lv_obj_add_flag(meter, LV_OBJ_FLAG_HIDDEN);
     } else {
-        note(list, "Talk at arm's length: the bar should reach green (-30 to -15 dBFS) without going orange.");
+        note(list, TR("Talk at arm's length: the bar should reach green (-30 to -15 dBFS) without going orange.",
+                      "隔一臂远说话：电平条到绿色（-30 到 -15 dBFS）、别冲到橙色最好。"));
     }
 
     if (!muse_board->epaper) {
-        s_bright_sl = slider(list, "Brightness", 10, 100, muse_settings_brightness(), &s_bright_val, on_bright);
+        s_bright_sl = slider(list, TR("Brightness", "亮度"), 10, 100, muse_settings_brightness(), &s_bright_val, on_bright);
         set_val(s_bright_val, "%d%%", muse_settings_brightness());
     }
     if (s_vol_val) set_val(s_vol_val, "%d%%", muse_settings_volume());
@@ -1453,6 +1525,12 @@ static void tick_sound(void)
     for (int i = 0; i < GADGET_MODE_COUNT; i++) {
         if (s_mode_checks[i]) set_text(s_mode_checks[i], i == gm ? LV_SYMBOL_OK : "");
     }
+#if CONFIG_MUSE_CJK_FONT
+    int lg = muse_settings_lang();
+    for (int i = 0; i < MUSE_LANG_COUNT; i++) {
+        if (s_lang_checks[i]) set_text(s_lang_checks[i], i == lg ? LV_SYMBOL_OK : "");
+    }
+#endif
     if (muse_board->epaper) return;
     float db = muse_voice_monitor_db();
     int v = (int)(db + 70.0f);
@@ -1483,26 +1561,26 @@ static void on_sleep_now(lv_event_t *e)
 static void build_sleep_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
-    s_sleep = page(tile, "AUTO-SLEEP", true, &list);
+    s_sleep = page(tile, TR("AUTO-SLEEP", "自动休眠"), true, &list);
     s_sleep_shown = -1;
-    note(list, "Turn the screen off after Muse has been idle for:");
+    note(list, TR("Turn the screen off after Muse has been idle for:", "Muse 空闲多久后关屏："));
     for (int i = 0; i < SLEEP_COUNT; i++) {
-        s_sleep_rows[i] = row(list, NULL, SLEEP_NAMES[i], &s_sleep_checks[i], on_sleep_choice,
+        s_sleep_rows[i] = row(list, NULL, sleep_display_name(i), &s_sleep_checks[i], on_sleep_choice,
                               (void *)(intptr_t)i);
         lv_obj_set_style_text_color(s_sleep_checks[i], lv_color_hex(COLOR_ACCENT), 0);
     }
-    button(list, LV_SYMBOL_EYE_CLOSE "  Sleep now", COLOR_ACCENT, on_sleep_now, NULL);
-    note(list, "Tap the screen or press either button to wake.");
+    button(list, TR(LV_SYMBOL_EYE_CLOSE "  Sleep now", LV_SYMBOL_EYE_CLOSE "  立即休眠"), COLOR_ACCENT, on_sleep_now, NULL);
+    note(list, TR("Tap the screen or press either button to wake.", "点屏幕或按任意一个键唤醒。"));
 }
 
 static const char *sleep_name(int secs)
 {
     for (int i = 0; i < SLEEP_COUNT; i++) {
         if (SLEEP_CHOICES[i] == secs) {
-            return SLEEP_NAMES[i];
+            return sleep_display_name(i);
         }
     }
-    return "Custom";
+    return TR("Custom", "自定义");
 }
 
 static void tick_sleep(void)
@@ -1530,20 +1608,22 @@ static void on_battery_reset(lv_event_t *e)
 static void build_battery_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
-    s_battery = page(tile, "BATTERY", true, &list);
+    s_battery = page(tile, TR("BATTERY", "电池"), true, &list);
     s_batt_shown_us = 0;
     s_batt_status = note(list, "");
-    s_batt_level = info_row(list, "Battery");
-    s_batt_drain = info_row(list, "Used");
-    s_batt_full = info_row(list, "A full charge");
-    s_batt_off = info_row(list, "Screen off");
-    s_batt_slept = info_row(list, "Chip asleep");
-    s_batt_wakes = info_row(list, "Wakes");
-    s_batt_busy = info_row(list, "CPU busy");
+    s_batt_level = info_row(list, TR("Battery", "电池"));
+    s_batt_drain = info_row(list, TR("Used", "已用"));
+    s_batt_full = info_row(list, TR("A full charge", "满电续航"));
+    s_batt_off = info_row(list, TR("Screen off", "关屏时间"));
+    s_batt_slept = info_row(list, TR("Chip asleep", "芯片休眠"));
+    s_batt_wakes = info_row(list, TR("Wakes", "唤醒次数"));
+    s_batt_busy = info_row(list, TR("CPU busy", "CPU 忙碌"));
     s_batt_awake = note(list, "");
-    button(list, LV_SYMBOL_REFRESH "  Start over", COLOR_ACCENT, on_battery_reset, NULL);
-    note(list, "Measures from unplugging USB until it's plugged back in. The gauge moves in 1% steps, so give it a "
-               "few hours. Chip asleep is time in light sleep; CPU busy is time a core was running a task.");
+    button(list, TR(LV_SYMBOL_REFRESH "  Start over", LV_SYMBOL_REFRESH "  重新开始"), COLOR_ACCENT, on_battery_reset, NULL);
+    note(list, TR("Measures from unplugging USB until it's plugged back in. The gauge moves in 1% steps, so give it a "
+                  "few hours. Chip asleep is time in light sleep; CPU busy is time a core was running a task.",
+                  "从拔掉 USB 开始测，到再插上为止。电量按 1% 一格走，给它几个小时。芯片休眠是浅睡眠的时间；"
+                  "CPU 忙碌是有核在跑任务的时间。"));
 }
 
 /* A per-mille figure as a percentage. */
@@ -1570,19 +1650,19 @@ static void tick_battery(void)
 
     int h = (int)(b.secs / 3600), m = (int)(b.secs / 60 % 60);
     if (h) {
-        snprintf(t, sizeof(t), "%d h %d min", h, m);
+        snprintf(t, sizeof(t), TR("%d h %d min", "%d 小时 %d 分"), h, m);
     } else {
-        snprintf(t, sizeof(t), "%d min", m);
+        snprintf(t, sizeof(t), TR("%d min", "%d 分"), m);
     }
     if (!b.started) {
-        strlcpy(buf, p.battery_pct < 0 ? "No battery" : "Unplug USB to start measuring.", sizeof(buf));
+        strlcpy(buf, p.battery_pct < 0 ? TR("No battery", "没有电池") : TR("Unplug USB to start measuring.", "拔掉 USB 开始测量。"), sizeof(buf));
     } else {
-        snprintf(buf, sizeof(buf), b.running ? "On battery for %s" : "Last run: %s on battery", t);
+        snprintf(buf, sizeof(buf), b.running ? TR("On battery for %s", "已用电池 %s") : TR("Last run: %s on battery", "上次用电池：%s"), t);
     }
     set_text(s_batt_status, buf);
 
     if (p.battery_pct < 0) {
-        strlcpy(buf, "None", sizeof(buf));
+        strlcpy(buf, TR("None", "无"), sizeof(buf));
     } else if (p.battery_mv) {
         snprintf(buf, sizeof(buf), "%s%d%%  %d.%02d V", p.charging ? LV_SYMBOL_CHARGE " " : "", p.battery_pct,
                  p.battery_mv / 1000, p.battery_mv % 1000 / 10);
@@ -1598,12 +1678,12 @@ static void tick_battery(void)
     } else if (muse_battery_drain(&b, &rate10, &full_h)) {
         snprintf(buf, sizeof(buf), "%d%%, %d.%d%%/h", used, rate10 / 10, rate10 % 10);
         set_text(s_batt_drain, buf);
-        snprintf(buf, sizeof(buf), "lasts ~%d h", full_h);
+        snprintf(buf, sizeof(buf), TR("lasts ~%d h", "约能用 %d 小时"), full_h);
         set_text(s_batt_full, buf);
     } else {
-        snprintf(buf, sizeof(buf), "%d%% so far", used > 0 ? used : 0);
+        snprintf(buf, sizeof(buf), TR("%d%% so far", "已用 %d%%"), used > 0 ? used : 0);
         set_text(s_batt_drain, buf);
-        set_text(s_batt_full, "measuring");
+        set_text(s_batt_full, TR("measuring", "测量中"));
     }
 
     set_pm(s_batt_off, b.started ? b.screen_off_pm : -1);
@@ -1618,7 +1698,7 @@ static void tick_battery(void)
     }
     buf[0] = '\0';
     if (b.started && b.awake[0]) {
-        snprintf(buf, sizeof(buf), "Also kept awake by: %s", b.awake);
+        snprintf(buf, sizeof(buf), TR("Also kept awake by: %s", "被这些保持唤醒：%s"), b.awake);
     }
     set_text(s_batt_awake, buf);
 }
@@ -1636,22 +1716,23 @@ static void on_power_off(lv_event_t *e)
 static void build_power_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
-    s_power = page(tile, "POWER", true, &list);
-    note(list, "Power Muse off completely?");
-    button(list, LV_SYMBOL_POWER "  Power off", COLOR_DANGER, on_power_off, NULL);
-    button(list, "Cancel", COLOR_TEXT, on_back, NULL);
+    s_power = page(tile, TR("POWER", "电源"), true, &list);
+    note(list, TR("Power Muse off completely?", "要完全关机吗？"));
+    button(list, TR(LV_SYMBOL_POWER "  Power off", LV_SYMBOL_POWER "  关机"), COLOR_DANGER, on_power_off, NULL);
+    button(list, TR("Cancel", "取消"), COLOR_TEXT, on_back, NULL);
     char text[128];
     const char *power = muse_board->power_button ? muse_board->power_button : muse_board->talk_button;
     const char *sleep = muse_board->power_button ? muse_board->power_button : muse_board->aux_button;
     if (power && !strcmp(power, "screen")) {
         /* Touch-only boards (the LCD-7 and LCD-1.28) wake on a tap. */
-        snprintf(text, sizeof(text), "Tap the screen to turn it back on.");
+        snprintf(text, sizeof(text), "%s", TR("Tap the screen to turn it back on.", "点屏幕重新开机。"));
     } else if (sleep) {
-        snprintf(text, sizeof(text), "Press the %s button to turn it back on. To just turn the screen off, press the %s button.",
+        snprintf(text, sizeof(text), TR("Press the %s button to turn it back on. To just turn the screen off, press the %s button.",
+                                        "按 %s 键重新开机。只关屏按 %s 键。"),
                  power, sleep);
     } else {
         /* No button turns the screen off (the 1.85C's BOOT talks). */
-        snprintf(text, sizeof(text), "Press the %s button to turn it back on.", power);
+        snprintf(text, sizeof(text), TR("Press the %s button to turn it back on.", "按 %s 键重新开机。"), power);
     }
     note(list, text);
 }
@@ -1678,24 +1759,24 @@ static void on_camera(lv_event_t *e)
 static void build_home(lv_obj_t *tile)
 {
     lv_obj_t *list;
-    s_home = page(tile, "SETTINGS", false, &list);
+    s_home = page(tile, TR("SETTINGS", "设置"), false, &list);
     row(list, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
     row(list, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);
-    row(list, LV_SYMBOL_BLUETOOTH, "Bluetooth", &s_home_ble, on_nav, (void *)&BLE);
+    row(list, LV_SYMBOL_BLUETOOTH, TR("Bluetooth", "蓝牙"), &s_home_ble, on_nav, (void *)&BLE);
     if (screen_only()) {
-        row(list, LV_SYMBOL_IMAGE, "Screen", &s_home_sound, on_nav, (void *)&SOUND);
+        row(list, LV_SYMBOL_IMAGE, TR("Screen", "屏幕"), &s_home_sound, on_nav, (void *)&SOUND);
     } else {
         row(list, LV_SYMBOL_VOLUME_MAX, SOUND_NAV, &s_home_sound, on_nav, (void *)&SOUND);
     }
-    row(list, LV_SYMBOL_EYE_CLOSE, "Sleep", &s_home_sleep, on_nav, (void *)&SLEEP);
-    row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);
+    row(list, LV_SYMBOL_EYE_CLOSE, TR("Sleep", "休眠"), &s_home_sleep, on_nav, (void *)&SLEEP);
+    row(list, LV_SYMBOL_BATTERY_FULL, TR("Battery", "电池"), &s_home_battery, on_nav, (void *)&BATTERY);
 #if CONFIG_MUSE_VIDEO
     if (muse_video_supported()) {
-        row(list, LV_SYMBOL_VIDEO, "Phone camera", &s_home_camera, on_camera, NULL);
+        row(list, LV_SYMBOL_VIDEO, TR("Phone camera", "手机相机"), &s_home_camera, on_camera, NULL);
     }
 #endif
     if (muse_board->power_off) {
-        row(list, LV_SYMBOL_POWER, "Power off", NULL, on_nav, (void *)&POWER);
+        row(list, LV_SYMBOL_POWER, TR("Power off", "关机"), NULL, on_nav, (void *)&POWER);
     }
     s_about = note(list, "");
 }
@@ -1704,8 +1785,9 @@ static void tick_home(void)
 {
     muse_wifi_status_t w;
     muse_wifi_status(&w);
-    static const char *const WIFI_VALUES[] = { "Off", "Not set", "Joining", "", "Failed", "Not nearby" };
-    set_text(s_home_wifi, w.state == MUSE_WIFI_CONNECTED ? w.ssid : WIFI_VALUES[w.state]);
+    const char *wifi_values[] = { TR("Off", "关"), TR("Not set", "未设置"), TR("Joining", "连接中"),
+                                  "", TR("Failed", "失败"), TR("Not nearby", "不在附近") };
+    set_text(s_home_wifi, w.state == MUSE_WIFI_CONNECTED ? w.ssid : wifi_values[w.state]);
 
     muse_hatch_status_t h;
     muse_hatch_status(&h);
@@ -1713,16 +1795,17 @@ static void tick_home(void)
 
     muse_ble_status_t b;
     muse_ble_status(&b);
-    set_text(s_home_ble, b.state == MUSE_BLE_OFF ? "Off" : (b.state == MUSE_BLE_CONNECTED ? "Connected" : "On"));
+    set_text(s_home_ble, b.state == MUSE_BLE_OFF ? TR("Off", "关")
+                         : (b.state == MUSE_BLE_CONNECTED ? TR("Connected", "已连接") : TR("On", "开")));
 
     if (screen_only()) {
         set_val(s_home_sound, "%d%%", muse_settings_brightness());
     } else if (!muse_board->audio_init) {
-        set_text(s_home_sound, muse_board->mic_init ? "Mic only" : "No audio");
+        set_text(s_home_sound, muse_board->mic_init ? TR("Mic only", "仅麦克风") : TR("No audio", "无音频"));
     } else if (muse_settings_speaker_on()) {
         set_val(s_home_sound, "Vol %d%%", muse_settings_volume());
     } else {
-        set_text(s_home_sound, "Muted");
+        set_text(s_home_sound, TR("Muted", "已静音"));
     }
     set_text(s_home_sleep, sleep_name(muse_settings_sleep_s()));
 
@@ -1736,12 +1819,12 @@ static void tick_home(void)
     set_text(s_home_battery, buf);
 #if CONFIG_MUSE_VIDEO
     if (s_home_camera) {
-        set_text(s_home_camera, muse_video_has_client() ? "Ready" : "No phone");
+        set_text(s_home_camera, muse_video_has_client() ? TR("Ready", "就绪") : TR("No phone", "无手机"));
     }
 #endif
 
     snprintf(buf, sizeof(buf), narrow_panel() ? "Muse %s\n%s" : "Muse %s  -  %s", esp_app_get_description()->version,
-             w.state == MUSE_WIFI_CONNECTED ? w.ip : "offline");
+             w.state == MUSE_WIFI_CONNECTED ? w.ip : TR("offline", "离线"));
     set_text(s_about, buf);
 }
 

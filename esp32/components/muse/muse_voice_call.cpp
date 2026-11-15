@@ -55,6 +55,7 @@
 #include <cstring>
 #include <sys/time.h>
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -153,7 +154,16 @@ static uint32_t v_press;             /* the last press number */
 static uint32_t v_press_told;        /* the press read() last reported as a flush */
 
 /* Session task only. */
-static muse_vc_call_t s_call;
+/* s_call, s_up and s_append live in PSRAM: together they are about
+ * 6.4 KB, and in internal RAM they leave the largest free heap block
+ * just under the 8 KB stack of the VM-lookup task the chat session
+ * spawns to resolve the VM — measured on the 1.75C, where lookups
+ * failed instantly (largest block 7936) and voice notes piled up
+ * unsent with CAN'T REACH MUSE while Link stayed up. They are
+ * staging/state buffers the CPU walks, not DMA targets, so PSRAM
+ * costs nothing measurable; muse_chat_session.cpp keeps its turn
+ * state in PSRAM the same way. */
+EXT_RAM_BSS_ATTR static muse_vc_call_t s_call;
 static muse_vc_turns_t *s_turns;     /* the call's turn table, in PSRAM */
 static uint32_t s_call_gen;          /* the generation s_call belongs to */
 static uint32_t s_pending_gen;       /* a start waiting for the session (or the last call) */
@@ -166,9 +176,9 @@ static char *s_line_buf;
 static uint8_t *s_dec;
 static int16_t *s_pcm;
 static muse_vc_resampler_t s_down;
-static muse_vc_uplink_t s_up;
-static char s_append[MUSE_VC_APPEND_MAX];
-static int16_t s_mic[MIC_PIECE];
+EXT_RAM_BSS_ATTR static muse_vc_uplink_t s_up;
+EXT_RAM_BSS_ATTR static char s_append[MUSE_VC_APPEND_MAX];
+EXT_RAM_BSS_ATTR static int16_t s_mic[MIC_PIECE];   /* PSRAM: see s_call above */
 static size_t s_mic_len, s_mic_off;
 static char s_reply[128];            /* the reply's last words, for the caption */
 static char s_error[EV_TEXT];        /* the server's error message, for the end caption */

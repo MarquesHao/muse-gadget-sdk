@@ -43,6 +43,7 @@ static struct {
     bool wifi_on;
     bool ble_on;
     uint8_t gadget_mode;
+    uint8_t lang;
     char ssid[MUSE_SSID_MAX + 1];
     char pass[MUSE_PASS_MAX + 1];
     char host[MUSE_HOST_MAX + 1];
@@ -56,6 +57,9 @@ static struct {
     .sleep_s = 120,
     .text_size = MUSE_TEXT_MEDIUM,
     .wifi_on = true,
+#if CONFIG_MUSE_GADGET_ZH
+    .lang = MUSE_LANG_ZH,   /* builds with the Chinese tables start in Chinese */
+#endif
     .host = DEFAULT_HOST,
 };
 
@@ -141,6 +145,7 @@ esp_err_t muse_settings_init(void)
         s.ble_on = b;
     }
     load_u8("gmode", &s.gadget_mode);
+    load_u8("lang", &s.lang);
     load_str("ssid", s.ssid, sizeof(s.ssid));
     load_str("pass", s.pass, sizeof(s.pass));
     load_str("host", s.host, sizeof(s.host));
@@ -149,6 +154,7 @@ esp_err_t muse_settings_init(void)
 
     s.volume = clampi(s.volume, 0, 100);
     s.gadget_mode = clampi(s.gadget_mode, 0, MUSE_GADGET_MODE_COUNT - 1);
+    s.lang = clampi(s.lang, 0, MUSE_LANG_COUNT - 1);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
     s.text_size = clampi(s.text_size, MUSE_TEXT_SMALL, MUSE_TEXT_LARGE);
@@ -179,6 +185,15 @@ void muse_settings_set_gadget_mode(int mode)
     s.gadget_mode = clampi(mode, 0, MUSE_GADGET_MODE_COUNT - 1);
     save_u8("gmode", s.gadget_mode);
     notify(MUSE_SETTING_GADGET_MODE);
+}
+
+int muse_settings_lang(void) { return s.lang; }
+
+void muse_settings_set_lang(int lang)
+{
+    s.lang = clampi(lang, 0, MUSE_LANG_COUNT - 1);
+    save_u8("lang", s.lang);
+    notify(MUSE_SETTING_LANG);
 }
 
 void muse_settings_set_voice_notes(bool on)

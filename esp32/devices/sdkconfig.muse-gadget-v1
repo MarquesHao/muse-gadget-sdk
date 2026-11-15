@@ -19,6 +19,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_gadget.csv"
 # plus the Sound page's main rows are shown in Chinese in this build.
 CONFIG_MUSE_CJK_FONT=y
 CONFIG_MUSE_CJK_FONT_NOTO=y
+# Run-time Chinese/English switch (V1.1 fix2): Chinese translations for the
+# state names, captions and settings pages, picked by the Language setting
+# (default Chinese in this build).
+CONFIG_MUSE_GADGET_ZH=y
 #
 # Custom device.guide for this build (protocols/DEVICE.md contract,
 # assembled into the firmware): tells the owner's Muse what this

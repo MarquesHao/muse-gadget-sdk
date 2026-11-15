@@ -21,6 +21,10 @@
 
 #include "muse_text.h"
 #include "sdkconfig.h"
+#if CONFIG_MUSE_GADGET_ZH
+#include "muse_lang_zh.h"
+#include "muse_settings.h"
+#endif
 #if !CONFIG_MUSE_UI_FREEINK
 #include "lvgl.h"
 #endif
@@ -271,11 +275,22 @@ const lv_font_t *muse_lang_montserrat(const lv_font_t *font)
 #else
 const char *muse_lang_status(const char *en)
 {
+#if CONFIG_MUSE_GADGET_ZH
+    /* Project builds: Chinese is a run-time choice, not a build-time one. */
+    if (muse_settings_lang() == MUSE_LANG_ZH) {
+        return muse_lang_zh_lookup(MUSE_LANG_ZH_STATUS, en);
+    }
+#endif
     return en;
 }
 
 const char *muse_lang_message(const char *en)
 {
+#if CONFIG_MUSE_GADGET_ZH
+    if (muse_settings_lang() == MUSE_LANG_ZH) {
+        return muse_lang_zh_lookup(MUSE_LANG_ZH_MESSAGE, en);
+    }
+#endif
     return en;
 }
 

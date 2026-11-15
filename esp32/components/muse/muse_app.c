@@ -76,11 +76,6 @@ void muse_app_run(const muse_board_t *board)
     ESP_ERROR_CHECK(muse_settings_init());
     muse_settings_set_listener(on_setting);
     muse_state_init();
-    /* Meeting storage prewarm: the one place a first-boot format may
-     * happen (this task's stack is internal RAM; the voice task's is not).
-     * Failure is fine here — boards without a storage partition and a
-     * corrupt store just make meeting mode report unavailable. */
-    (void)muse_meeting_mount();
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
     ESP_ERROR_CHECK(muse_review_init());
 #endif
@@ -112,6 +107,15 @@ void muse_app_run(const muse_board_t *board)
         muse_state_set_mode(MUSE_MODE_IDLE);
         muse_state_set_caption("%s", "");   /* the button icons say how to talk */
     }
+
+    /* Meeting storage prewarm, deliberately AFTER voice start: audio init
+     * gets first claim on internal/DMA RAM (with the mount and its wear-
+     * levelling buffers ahead of it, the I2S DMA allocation failed and
+     * voice init crashed on the 1.75C). Still on this task's internal-RAM
+     * stack, so the one-time first-boot format stays safe here. Failure
+     * is fine — boards without a storage partition and a corrupt store
+     * just make meeting mode report unavailable. */
+    (void)muse_meeting_mount();
 
     muse_hatch_start();
     /* Home Link owns the radios; these just hand it the saved settings. */

@@ -48,6 +48,7 @@ typedef enum {
     MUSE_SETTING_HATCH,
     MUSE_SETTING_VOICE_NOTES,
     MUSE_SETTING_GADGET_MODE,
+    MUSE_SETTING_LANG,
 } muse_setting_t;
 
 typedef void (*muse_setting_cb_t)(muse_setting_t what);
@@ -77,6 +78,16 @@ void muse_settings_set_voice_notes(bool on);
 enum { MUSE_GADGET_MODE_CALL, MUSE_GADGET_MODE_TEXT, MUSE_GADGET_MODE_MEETING, MUSE_GADGET_MODE_COUNT };
 int muse_settings_gadget_mode(void);
 void muse_settings_set_gadget_mode(int mode);
+
+/* The screen's language (project V1.1 fix2): English or Chinese, switchable
+ * at run time in Settings and kept across restarts. Chinese applies only
+ * where a translation exists and a font can draw it (muse_lang_zh.c, the
+ * touch settings pages); anything else stays English. The default is
+ * Chinese when the build carries the Chinese tables
+ * (CONFIG_MUSE_GADGET_ZH), English otherwise. */
+enum { MUSE_LANG_EN, MUSE_LANG_ZH, MUSE_LANG_COUNT };
+int muse_settings_lang(void);
+void muse_settings_set_lang(int lang);
 
 void muse_settings_wifi(char ssid[MUSE_SSID_MAX + 1], char pass[MUSE_PASS_MAX + 1]);
 void muse_settings_hatch_host(char out[MUSE_HOST_MAX + 1]);

@@ -37,6 +37,7 @@ if(CONFIG_MUSE_ENABLED)
         "muse_settings.c"
         "muse_text.c"
         "muse_lang.c"
+        "muse_lang_zh.c"
         "muse_link.c"
         "muse_ble.c")
     if(CONFIG_MUSE_UI_FREEINK)

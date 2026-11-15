@@ -128,15 +128,34 @@ static bool s_quick_syncing;   /* quick_refresh is setting the slider itself */
 static int s_quick_shown_mode = -1, s_quick_shown_vol = -1;   /* what the card last painted */
 /* Keep these names in sync with GADGET_MODE_NAMES in muse_settings_ui.c:
  * the quick panel and the Sound page each carry a copy, in enum order. */
+/* The screen's language at run time (project V1.1 fix2): Chinese only
+ * where a font can draw it, which in this file means a CJK build. */
+static bool ui_lang_zh(void)
+{
 #if CONFIG_MUSE_CJK_FONT
-static const char *const QUICK_MODE_NAMES[MUSE_GADGET_MODE_COUNT] = {
-    "语音通话", "文字回复", "会议录音",
-};
+    return muse_settings_lang() == MUSE_LANG_ZH;
 #else
-static const char *const QUICK_MODE_NAMES[MUSE_GADGET_MODE_COUNT] = {
+    return false;
+#endif
+}
+
+static const char *const QUICK_MODE_NAMES_EN[MUSE_GADGET_MODE_COUNT] = {
     "Voice call", "Text replies", "Meeting",
 };
+#if CONFIG_MUSE_CJK_FONT
+static const char *const QUICK_MODE_NAMES_ZH[MUSE_GADGET_MODE_COUNT] = {
+    "语音通话", "文字回复", "会议录音",
+};
 #endif
+static const char *quick_mode_name(int i)
+{
+#if CONFIG_MUSE_CJK_FONT
+    if (ui_lang_zh()) {
+        return QUICK_MODE_NAMES_ZH[i];
+    }
+#endif
+    return QUICK_MODE_NAMES_EN[i];
+}
 _Static_assert(MUSE_GADGET_MODE_COUNT == 3, "QUICK_MODE_NAMES names every gadget mode");
 
 static void update_tileview_swipe(void)
@@ -1824,11 +1843,7 @@ static void build_overlays(void)
         lv_obj_remove_flag(s_quick, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(s_quick, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
         lv_obj_t *q_title = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
-#if CONFIG_MUSE_CJK_FONT
-        lv_label_set_text(q_title, "模式");
-#else
-        lv_label_set_text(q_title, "Mode");
-#endif
+        lv_label_set_text(q_title, ui_lang_zh() ? "模式" : "Mode");
         for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
             lv_obj_t *row = lv_obj_create(s_quick);
             lv_obj_remove_style_all(row);
@@ -1841,7 +1856,7 @@ static void build_overlays(void)
             s_quick_checks[i] = make_label(row, &lv_font_montserrat_20, COLOR_ACCENT);
             lv_obj_set_width(s_quick_checks[i], 26);
             lv_obj_t *name = make_label(row, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
-            lv_label_set_text(name, QUICK_MODE_NAMES[i]);
+            lv_label_set_text(name, quick_mode_name(i));
         }
         lv_obj_t *vol_row = lv_obj_create(s_quick);
         lv_obj_remove_style_all(vol_row);
@@ -1850,11 +1865,7 @@ static void build_overlays(void)
         lv_obj_set_flex_align(vol_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_column(vol_row, 10, 0);
         lv_obj_t *vol_name = make_label(vol_row, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
-#if CONFIG_MUSE_CJK_FONT
-        lv_label_set_text(vol_name, "音量");
-#else
-        lv_label_set_text(vol_name, "Volume");
-#endif
+        lv_label_set_text(vol_name, ui_lang_zh() ? "音量" : "Volume");
         s_quick_vol_sl = lv_slider_create(vol_row);
         lv_slider_set_range(s_quick_vol_sl, 0, 100);
         lv_slider_set_value(s_quick_vol_sl, muse_settings_volume(), LV_ANIM_OFF);
@@ -1865,11 +1876,7 @@ static void build_overlays(void)
         s_quick_vol_val = make_label(vol_row, muse_lang_montserrat(&lv_font_montserrat_14), COLOR_LIT);
         lv_obj_set_width(s_quick_vol_val, 30);
         lv_obj_t *q_hint = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
-#if CONFIG_MUSE_CJK_FONT
-        lv_label_set_text(q_hint, "点外面关闭");
-#else
-        lv_label_set_text(q_hint, "Tap outside to close");
-#endif
+        lv_label_set_text(q_hint, ui_lang_zh() ? "点外面关闭" : "Tap outside to close");
     }
 
     /* Sleep cover: swallows the waking touch. */
@@ -2114,7 +2121,7 @@ static void update_power(float now)
         snprintf(buf, sizeof(buf), muse_lang_status("BATTERY %d%%"), p.battery_pct);
     }
     if (strcmp(buf, lv_label_get_text(s_power_lbl)) != 0) {
-        lv_obj_set_style_text_font(s_power_lbl, muse_lang_label_font(buf, &lv_font_unscii_8), 0);
+        lv_obj_set_style_text_font(s_power_lbl, ui_font_cjk(muse_lang_label_font(buf, &lv_font_unscii_8)), 0);
         lv_label_set_text(s_power_lbl, buf);
     }
 }
@@ -2184,7 +2191,8 @@ static void update_status(muse_mode_t mode, float now)
 
     if (name != s_shown_name) {
         const char *shown = muse_lang_status(name);
-        lv_obj_set_style_text_font(s_state_lbl, muse_lang_label_font(shown, s_small ? &lv_font_unscii_8 : &lv_font_unscii_16), 0);
+        lv_obj_set_style_text_font(s_state_lbl,
+                                   ui_font_cjk(muse_lang_label_font(shown, s_small ? &lv_font_unscii_8 : &lv_font_unscii_16)), 0);
         lv_label_set_text(s_state_lbl, shown);
         s_shown_name = name;
     }

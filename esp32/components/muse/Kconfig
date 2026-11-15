@@ -342,6 +342,19 @@ menu "Muse"
             rarer characters and Korean show as boxes. Takes about 910 KB of
             flash, against about 1.2 MB.
 
+    config MUSE_GADGET_ZH
+        bool "Chinese screen text with a run-time language switch (project)"
+        depends on MUSE_CJK_FONT
+        default n
+        help
+            Project option (the muse-gadget V1 builds): Chinese
+            translations for the state names and captions (muse_lang_zh.c)
+            and for the touch settings pages, chosen at run time by the
+            Language setting (Settings > Sound) instead of at build time.
+            The default language becomes Chinese; English stays one tap
+            away. Text with no translation, or drawn in a font without
+            hanzi (the button menu), stays English.
+
     config MUSE_LATIN_FONT
         bool "Show Vietnamese and other accented letters in captions"
         depends on MUSE_ENABLED && !MUSE_UI_FREEINK
