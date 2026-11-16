@@ -46,10 +46,13 @@ extern "C" {
 /* Boot-time mount: call once from a task with an internal-RAM stack
  * (muse_app_run does). Formats the partition on first use in the
  * device's life (an NVS flag remembers; later corruption is reported,
- * never silently reformatted). Boards whose partition table has no
- * "storage" partition get ESP_ERR_NOT_FOUND. muse_meeting_begin() never
- * formats — it runs on the voice task, whose PSRAM stack cannot survive
- * flash writes. */
+ * never silently reformatted). Also salvages recordings a power cut
+ * left with an unpatched placeholder header (whole blocks on disk get
+ * their header sizes back; a file with no whole block is removed) —
+ * this is the only mount point early and internal-stack enough for
+ * that. Boards whose partition table has no "storage" partition get
+ * ESP_ERR_NOT_FOUND. muse_meeting_begin() never formats — it runs on
+ * the voice task, whose PSRAM stack cannot survive flash writes. */
 esp_err_t muse_meeting_mount(void);
 bool muse_meeting_mounted(void);
 
