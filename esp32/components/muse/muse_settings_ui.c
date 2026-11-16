@@ -51,6 +51,14 @@
 #define LIST_W 330
 #define LIST_TOP 84
 #define ROW_H 58
+/* Minimal-face boards (only the 1.75C sets the flag) carry fixed chrome
+ * at the top of the screen itself — in muse_ui.c the ring, the battery
+ * arc and the status row are parented to the screen, above the
+ * tileview, and reach down to about y=50 over both tiles. Pages start
+ * lower there so their titles, back arrows and lists clear it; the
+ * text-entry page starts higher up the screen, so it moves further. */
+#define MINIMAL_CHROME_TOP 22
+#define MINIMAL_TEXT_TOP 38
 /* A round screen under 300 px (1.28", 240 px) gets a narrower column of
  * shorter rows in smaller type, kept inside the circle. */
 #define TINY_LIST_W 180
@@ -448,7 +456,10 @@ static lv_obj_t *back_button(lv_obj_t *p)
         lv_obj_align(b, LV_ALIGN_TOP_LEFT, 24, 12);
     } else {
         lv_obj_set_size(b, 56, 48);
-        lv_obj_align(b, LV_ALIGN_TOP_MID, -112, 28);
+        /* The fixed chrome's battery arc sweeps through where this
+         * arrow sits on a minimal-face board; it moves down with the
+         * page title (MINIMAL_CHROME_TOP) so the arc clears the glyph. */
+        lv_obj_align(b, LV_ALIGN_TOP_MID, -112, 28 + (muse_board->minimal_face ? MINIMAL_CHROME_TOP : 0));
     }
     lv_obj_add_event_cb(b, on_back, LV_EVENT_CLICKED, NULL);
     lv_obj_t *arrow = label(b, wide_layout() ? &lv_font_montserrat_28 : &lv_font_montserrat_20,
@@ -464,7 +475,8 @@ static lv_obj_t *page(lv_obj_t *tile, const char *title, bool back, lv_obj_t **l
      * large panels get bigger ones. */
     const bool wide = wide_layout();
     const bool compact = !muse_board->round && (muse_board->height <= 240 || muse_board->width < LIST_W);
-    const int list_top = wide ? 96 : compact ? (back ? 48 : 36) : s_tiny ? TINY_LIST_TOP : LIST_TOP;
+    const int list_top = (wide ? 96 : compact ? (back ? 48 : 36) : s_tiny ? TINY_LIST_TOP : LIST_TOP)
+                         + (muse_board->minimal_face ? MINIMAL_CHROME_TOP : 0);
     lv_obj_t *p = lv_obj_create(tile);
     lv_obj_remove_style_all(p);
     lv_obj_set_size(p, lv_pct(100), lv_pct(100));
@@ -475,7 +487,8 @@ static lv_obj_t *page(lv_obj_t *tile, const char *title, bool back, lv_obj_t **l
     lv_obj_t *t = label(p, wide ? &lv_font_montserrat_28 :
                         compact || s_tiny ? &lv_font_montserrat_16 : &lv_font_unscii_16, COLOR_ACCENT, title);
     lv_obj_set_style_text_letter_space(t, wide ? 1 : compact ? 0 : s_tiny ? 1 : 2, 0);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, wide ? 24 : compact ? (back ? 12 : 8) : s_tiny ? 18 : 44);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, (wide ? 24 : compact ? (back ? 12 : 8) : s_tiny ? 18 : 44)
+                                             + (muse_board->minimal_face ? MINIMAL_CHROME_TOP : 0));
     if (narrow_panel() && back) {
         single_line(t, muse_board->width - 56);
         lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
@@ -938,8 +951,12 @@ static void build_text_page(lv_obj_t *tile)
     }
 
     /* The keys out to the screen's edges, and the rest squeezed in above them:
-     * the back arrow beside the field, the title over both. */
-    int top = text_y(98);
+     * the back arrow beside the field, the title over both. On a
+     * minimal-face board the fixed chrome owns the top of the screen
+     * (MINIMAL_TEXT_TOP): title, field, arrow and keypad all move down
+     * by the same amount, keeping their spacing. */
+    const int text_top_extra = muse_board->minimal_face ? MINIMAL_TEXT_TOP : 0;
+    int top = text_y(98) + text_top_extra;
     if (narrow_panel()) {
         /* Portrait panels need a header inside the screen, not the round layout. */
         lv_obj_set_style_text_font(s_text_title, &lv_font_montserrat_16, 0);
@@ -951,12 +968,12 @@ static void build_text_page(lv_obj_t *tile)
         lv_obj_align(back, LV_ALIGN_TOP_LEFT, 4, 36);
         top = 92;
     } else {
-        lv_obj_align(s_text_title, LV_ALIGN_TOP_MID, 0, text_y(16));
+        lv_obj_align(s_text_title, LV_ALIGN_TOP_MID, 0, text_y(16) + text_top_extra);
         lv_obj_set_width(s_text_title, text_px(180));
         lv_obj_set_width(s_text_ta, text_px(224));
-        lv_obj_align(s_text_ta, LV_ALIGN_TOP_MID, 0, text_y(44));
+        lv_obj_align(s_text_ta, LV_ALIGN_TOP_MID, 0, text_y(44) + text_top_extra);
         lv_obj_set_size(back, text_px(48), h);
-        lv_obj_align(back, LV_ALIGN_TOP_MID, -text_px(140), text_y(44));
+        lv_obj_align(back, LV_ALIGN_TOP_MID, -text_px(140), text_y(44) + text_top_extra);
     }
     s_text_kp = muse_keypad_create(s_text, s_text_ta, muse_board->round);
     lv_obj_set_size(s_text_kp, muse_board->width, muse_board->height - top);

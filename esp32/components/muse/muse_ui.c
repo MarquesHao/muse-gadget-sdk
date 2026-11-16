@@ -1518,9 +1518,15 @@ static void build_screen(void)
         lv_obj_set_style_bg_opa(s_bar, LV_OPA_COVER, 0);
         lv_obj_align(s_bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     } else if (!s_small) {
-        /* Progress ring around the bezel. */
+        /* Progress ring around the bezel. On the minimal-face board the
+         * ring is fixed chrome: parented to the screen itself, above the
+         * tileview, so it stays put over both tiles while they slide
+         * under it — the settings page gets the same ring the face has,
+         * unmoving. The battery arc and the status row below join it
+         * there. The popups (quick panel, pairing card) live on the top
+         * layer, above the screen, so they still cover the chrome. */
         int d = (s_w < s_h ? s_w : s_h) - 8;
-        s_ring = lv_arc_create(face);
+        s_ring = lv_arc_create(muse_board->minimal_face && s_tv ? scr : face);
         lv_obj_set_size(s_ring, d, d);
         lv_obj_center(s_ring);
         lv_arc_set_bg_angles(s_ring, 0, 360);
@@ -1599,8 +1605,12 @@ static void build_screen(void)
     }
     build_button_icons(face);
 
-    /* Status line: connectivity icons + power. */
-    lv_obj_t *status = lv_obj_create(face);
+    /* Status line: connectivity icons + power. Fixed chrome on the
+     * minimal-face board (see the ring above): the screen is its
+     * parent there, not the face tile, so the row stays over both
+     * tiles. Its geometry is unchanged — the tile and the screen are
+     * both full-size, so the row lands in the same place. */
+    lv_obj_t *status = lv_obj_create(muse_board->minimal_face && s_tv ? scr : face);
     lv_obj_remove_style_all(status);
     lv_obj_remove_flag(status, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(status, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -1616,7 +1626,12 @@ static void build_screen(void)
          * away (their update paths keep writing to the hidden labels,
          * harmlessly). The battery becomes an arc along the top edge —
          * inside the mode ring's band — and a dot beside the Wi-Fi icon
-         * carries the state, coloured by update_status(). */
+         * carries the state, coloured by update_status(). The whole
+         * cluster sits on the screen, above the tiles (see the ring):
+         * none of it may take touches meant for the face or the settings
+         * page under it, so the clickable flag comes off every piece
+         * (the arc already drops its own, below). */
+        lv_obj_remove_flag(status, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(s_ble_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_power_lbl, LV_OBJ_FLAG_HIDDEN);
         s_state_dot = lv_obj_create(status);
@@ -1626,8 +1641,9 @@ static void build_screen(void)
         lv_obj_set_style_bg_opa(s_state_dot, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(s_state_dot, lv_color_hex(0x30d158), 0);
         lv_obj_remove_flag(s_state_dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(s_state_dot, LV_OBJ_FLAG_CLICKABLE);
 
-        s_batt_arc = lv_arc_create(face);
+        s_batt_arc = lv_arc_create(scr);
         lv_obj_set_size(s_batt_arc, 424, 424);
         lv_obj_center(s_batt_arc);
         lv_arc_set_bg_angles(s_batt_arc, 225, 315);   /* the span over the top */

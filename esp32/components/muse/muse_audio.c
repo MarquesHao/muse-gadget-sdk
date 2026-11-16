@@ -62,6 +62,122 @@ static float s_hpf_a;
 static float s_mic_scale = 1.0f;
 static float s_hpf_x1, s_hpf_y1;
 
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
+/*
+ * Microphone voice DSP, this board only. The forensic round (dev record
+ * 2026-11-16) cleared every other stage of the voice-note path — the
+ * stream is bit-exact PCM, the codec runs stock defaults, both mics are
+ * healthy — and pinned the muffled, quiet recordings on the capture
+ * itself: a raw, uncompensated take of a voice 20-40 cm away and usually
+ * off-axis, at about -36 dBFS where a phone's voice DSP would have
+ * lifted the consonant band and ridden the level. This block is that
+ * missing processing, in the one place all three consumers of
+ * muse_audio_read() share (voice notes, live calls, meeting audio):
+ *
+ *   high-pass (the shared one above) -> two one-pole high-shelf stages
+ *   (+7 dB each over a 1.4 kHz corner, +14 dB of shelf in all) -> a
+ *   chunk-wise AGC (20 ms chunks, gain ramped across the chunk from the
+ *   previous chunk's measurement, target -20 dBFS, +18/-6 dB range,
+ *   frozen while the chunk measures under the -45 dBFS gate so pauses
+ *   don't pump the room up) -> a tanh soft limiter under the int16
+ *   clamp, so the button clicks and pops the AGC now reaches for are
+ *   squashed, not clipped.
+ *
+ * Constants were tuned offline against real recordings (dev
+ * mic-dsp-sim.py replicates this block coefficient for coefficient):
+ * the 1-3.4 kHz share of the active speech spectrum goes from ~3% to
+ * ~10% and the voice level from ~-34 to ~-21 dBFS. Retune here, in
+ * this one place, if a future sample says otherwise.
+ *
+ * The block between the EXTRACT markers is compiled standalone by
+ * tests/test_muse_audio_dsp.py: keep it free of IDF/LVGL identifiers.
+ */
+/* MIC_DSP_EXTRACT_BEGIN */
+#define MIC_EQ_CORNER_HZ 1400.0f
+#define MIC_EQ_STAGE_DB 7.0f
+#define MIC_AGC_TARGET_DBFS (-20.0f)
+#define MIC_AGC_MAX_GAIN_DB 18.0f
+#define MIC_AGC_MIN_GAIN_DB (-6.0f)
+#define MIC_AGC_GATE_DBFS (-45.0f)
+#define MIC_AGC_ATTACK 0.50f    /* per chunk when the gain comes down */
+#define MIC_AGC_RELEASE 0.10f   /* per chunk when the gain goes up */
+#define MIC_LIMIT_KNEE 0.79f    /* soft-limiter knee, fraction of full scale */
+
+typedef struct {
+    float eq_a;         /* one-pole lowpass coefficient, both shelf stages */
+    float eq_k;         /* per-stage shelf multiplier (linear gain - 1) */
+    float eq_lp1, eq_lp2;
+    float gain_from;    /* the gain at the end of the previous chunk */
+    float gain_to;      /* the gain this chunk ramps toward */
+    float sumsq;        /* the running chunk's EQ'd energy, pre-gain */
+    int count;          /* samples in the running chunk */
+} mic_dsp_t;
+
+static void mic_dsp_reset(mic_dsp_t *d, float rate)
+{
+    float rc = 1.0f / (2.0f * (float)M_PI * MIC_EQ_CORNER_HZ);
+    float dt = 1.0f / rate;
+    d->eq_a = rc / (rc + dt);
+    d->eq_k = powf(10.0f, MIC_EQ_STAGE_DB / 20.0f) - 1.0f;
+    d->eq_lp1 = d->eq_lp2 = 0.0f;
+    d->gain_from = d->gain_to = 1.0f;
+    d->sumsq = 0.0f;
+    d->count = 0;
+}
+
+static float mic_dsp_limit(float y)
+{
+    const float knee = MIC_LIMIT_KNEE * 32768.0f;
+    float a = fabsf(y);
+    if (a <= knee) {
+        return y;
+    }
+    float mag = knee + (32768.0f - knee) * tanhf((a - knee) / (32768.0f - knee));
+    return y < 0.0f ? -mag : mag;
+}
+
+/* One sample in (already high-passed), one out: the two shelf stages,
+ * the AGC's ramped gain for this point in the chunk (i of n), and the
+ * limiter. The chunk's energy is tallied pre-gain for mic_dsp_chunk_end. */
+static float mic_dsp_post(mic_dsp_t *d, float y, int i, int n)
+{
+    d->eq_lp1 += (1.0f - d->eq_a) * (y - d->eq_lp1);
+    float e = y + d->eq_k * (y - d->eq_lp1);
+    d->eq_lp2 += (1.0f - d->eq_a) * (e - d->eq_lp2);
+    e += d->eq_k * (e - d->eq_lp2);
+    d->sumsq += e * e;
+    d->count++;
+    float g = d->gain_from + (d->gain_to - d->gain_from) * (float)(i + 1) / (float)n;
+    return mic_dsp_limit(e * g);
+}
+
+/* End of a chunk: ride the gain toward the level the chunk measured.
+ * Under the gate the gain freezes — a quiet room keeps the gain the
+ * speech earned, it doesn't earn more. */
+static void mic_dsp_chunk_end(mic_dsp_t *d)
+{
+    if (d->count > 0) {
+        float rms_db = 10.0f * log10f(d->sumsq / (float)d->count / (32768.0f * 32768.0f) + 1e-12f);
+        float desired = d->gain_to;
+        if (rms_db >= MIC_AGC_GATE_DBFS) {
+            desired = powf(10.0f, (MIC_AGC_TARGET_DBFS - rms_db) / 20.0f);
+            float hi = powf(10.0f, MIC_AGC_MAX_GAIN_DB / 20.0f);
+            float lo = powf(10.0f, MIC_AGC_MIN_GAIN_DB / 20.0f);
+            desired = desired > hi ? hi : desired < lo ? lo : desired;
+        }
+        float rate = desired < d->gain_to ? MIC_AGC_ATTACK : MIC_AGC_RELEASE;
+        float next = d->gain_to + (desired - d->gain_to) * rate;
+        d->gain_from = d->gain_to;
+        d->gain_to = next;
+    }
+    d->sumsq = 0.0f;
+    d->count = 0;
+}
+/* MIC_DSP_EXTRACT_END */
+
+static mic_dsp_t s_mic_dsp;
+#endif   /* CONFIG_MUSE_BOARD_WAVESHARE_S3_175C */
+
 static void lock(void)
 {
     if (s_lock) {
@@ -191,6 +307,12 @@ esp_err_t muse_audio_init(int volume, int mic_gain_db)
     float rc = 1.0f / (2.0f * (float)M_PI * HPF_HZ);
     float dt = 1.0f / MUSE_AUDIO_RATE;
     s_hpf_a = rc / (rc + dt);
+
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
+    mic_dsp_reset(&s_mic_dsp, MUSE_AUDIO_RATE);
+    ESP_LOGI(TAG, "mic DSP on: shelf 2x%.0f dB over %.0f Hz, AGC to %.0f dBFS (gate %.0f)",
+             MIC_EQ_STAGE_DB, MIC_EQ_CORNER_HZ, MIC_AGC_TARGET_DBFS, MIC_AGC_GATE_DBFS);
+#endif
 
     ESP_LOGI(TAG, "audio ready: %d Hz, %d ch, vol %d, mic gain %d dB", MUSE_AUDIO_RATE, CHANNELS, volume, mic_gain_db);
     return ESP_OK;
@@ -419,8 +541,16 @@ esp_err_t muse_audio_read(int16_t *mono, size_t frames)
             float y = s_hpf_a * (s_hpf_y1 + x - s_hpf_x1);
             s_hpf_x1 = x;
             s_hpf_y1 = y;
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
+            /* Voice DSP (see the block at the top of this file): shelf,
+             * ridden gain, soft limiter, ahead of the clamp. */
+            y = mic_dsp_post(&s_mic_dsp, y, (int)i, (int)n);
+#endif
             mono[i] = (int16_t)(y > 32767 ? 32767 : (y < -32768 ? -32768 : y));
         }
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
+        mic_dsp_chunk_end(&s_mic_dsp);
+#endif
         mono += n;
         frames -= n;
     }
