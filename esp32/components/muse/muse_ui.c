@@ -177,6 +177,33 @@ static void tile_changed_cb(lv_event_t *e)
     s_face_active = (lv_tileview_get_tile_active(tv) == s_face);
 }
 
+/* One-shot boot geometry check for the face tile. The tile is a plain
+ * object under the tileview and is scrollable by default, so any child
+ * drawn past its bottom edge hands it real vertical scroll range —
+ * while the tileview above it, the object meant to take swipes, only
+ * accepts horizontal ones on this tile. Log the range and every child
+ * that overflows the tile, once, after the first layout has settled:
+ * a regression then shows in the boot log, not only under a finger. */
+static void log_face_scroll_once(void)
+{
+    static bool s_logged;
+    if (s_logged || !s_face) return;
+    s_logged = true;
+    lv_obj_update_layout(s_face);
+    int32_t worst = 0;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(s_face); i++) {
+        lv_obj_t *ch = lv_obj_get_child(s_face, i);
+        if (lv_obj_get_y2(ch) > worst) worst = lv_obj_get_y2(ch);
+        if (lv_obj_get_y2(ch) > s_h) {
+            ESP_LOGI(TAG, "face tile child %u overflows: y %ld..%ld of %ld",
+                     (unsigned)i, (long)lv_obj_get_y(ch), (long)lv_obj_get_y2(ch), (long)s_h);
+        }
+    }
+    ESP_LOGI(TAG, "face tile: scrollable %d, scroll bottom %ld, worst child y2 %ld of %ld",
+             lv_obj_has_flag(s_face, LV_OBJ_FLAG_SCROLLABLE),
+             (long)lv_obj_get_scroll_bottom(s_face), (long)worst, (long)s_h);
+}
+
 /* From any task: the face tile is the currently visible tile. */
 bool muse_ui_face_active(void)
 {
@@ -1460,6 +1487,19 @@ static void build_screen(void)
         /* It never scrolls, but LVGL would size its scrollbars from all its
          * children every time it draws any part of it. */
         lv_obj_set_scrollbar_mode(s_face, LV_SCROLLBAR_MODE_OFF);
+        if (muse_board->minimal_face) {
+            /* "Never scrolls" has to be made true, not just unseen: the
+             * tile is a plain object and LVGL leaves it scrollable, and
+             * the frame image rests FR_FACE_DY below centre, drawn past
+             * the tile's bottom edge — measured on the 1.75C as 35 px of
+             * real vertical range (see log_face_scroll_once). A vertical
+             * drag is therefore taken by the tile and settles displaced,
+             * while the tileview above it only accepts horizontal swipes
+             * here. Drop the flag on this board: vertical drags find no
+             * scroller at all, horizontal ones still reach the tileview,
+             * and taps on the canvas are unaffected. */
+            lv_obj_remove_flag(s_face, LV_OBJ_FLAG_SCROLLABLE);
+        }
         /* Match the avatar's black canvas; the tile's theme background otherwise
          * shows as a different-coloured square around the character. */
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
@@ -2121,6 +2161,7 @@ static void update_chrome(float now)
     }
     s_next_settings_tick = now + SETTINGS_TICK_S;
 
+    log_face_scroll_once();
     if (s_tv) {
         int page = lv_tileview_get_tile_active(s_tv) == s_settings;
         bool subpage = muse_settings_ui_in_subpage();
