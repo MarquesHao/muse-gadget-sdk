@@ -835,19 +835,31 @@ static char *load_token(const char *key) {
     return token;
 }
 
-/* Park a token pair for the heartbeat to store (auth lock held).
- * The copies live in PSRAM: parking must not eat the internal RAM
- * whose scarcity caused all of this. */
+/* Copy a string into the park (auth lock held). The copies live in
+ * PSRAM: parking must not eat the internal RAM whose scarcity
+ * caused all of this. On a board without PSRAM the internal heap
+ * is the only heap there is, so fall back to it — the payloads are
+ * a few hundred bytes and live only until the next heartbeat. */
+static char *park_strdup(const char *s) {
+    char *p = heap_caps_malloc(strlen(s) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        p = heap_caps_malloc(strlen(s) + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (p) {
+        strcpy(p, s);
+    }
+    return p;
+}
+
+/* Park a token pair for the heartbeat to store (auth lock held). */
 static bool park_token_pair(const char *access_token, const char *refresh_token) {
-    char *a = heap_caps_malloc(strlen(access_token) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    char *r = heap_caps_malloc(strlen(refresh_token) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *a = park_strdup(access_token);
+    char *r = park_strdup(refresh_token);
     if (!a || !r) {
         heap_caps_free(a);
         heap_caps_free(r);
         return false;
     }
-    strcpy(a, access_token);
-    strcpy(r, refresh_token);
     heap_caps_free(s_vm_parked_access);
     heap_caps_free(s_vm_parked_refresh);
     s_vm_parked_access = a;
@@ -881,12 +893,14 @@ static bool store_token_pair_unlocked(const char *access_token,
 static void store_pairing_username_unlocked(const char *username) {
     if (on_vm_worker()) {
         /* Park it (a copy, or the erase as an empty park); the
-         * heartbeat stores/erases for real at the flush. */
+         * heartbeat stores/erases for real at the flush. If the
+         * copy cannot be made, park nothing: degrading a store
+         * into an erase would lose the username outright. */
         char *copy = NULL;
         if (username && *username) {
-            copy = heap_caps_malloc(strlen(username) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (copy) {
-                strcpy(copy, username);
+            copy = park_strdup(username);
+            if (!copy) {
+                return;
             }
         }
         heap_caps_free(s_vm_parked_username);

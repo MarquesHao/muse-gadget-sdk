@@ -274,6 +274,7 @@ void vm_device_tokens_free(vm_device_tokens_t *tokens) {
 // plain allocation stands in for it.
 #define MALLOC_CAP_8BIT (1 << 2)
 #define MALLOC_CAP_SPIRAM (1 << 10)
+#define MALLOC_CAP_INTERNAL (1 << 11)
 static void *heap_caps_malloc(size_t size, int caps) { (void)caps; return malloc(size); }
 static void heap_caps_free(void *p) { free(p); }
 

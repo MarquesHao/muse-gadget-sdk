@@ -53,6 +53,7 @@ FUNCTIONS = (
     "static bool complete_setup_and_stop_ble(",
     "static char *load_token_unlocked(",
     "static char *load_token(",
+    "static char *park_strdup(",
     "static bool park_token_pair(",
     "static bool store_token_pair_unlocked(",
     "static void flush_parked_vm_store(",
