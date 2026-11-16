@@ -56,6 +56,11 @@ static const char *TAG = "muse_frames";
 
 #define FR_W 466
 #define FR_H 466
+/* The minimal face rests lower on the screen (Hugh's hands-on
+ * feedback, 2026-11-16): the whole image — sequences, kit composites
+ * and stills all show through the one widget — shifts down by this
+ * much. Matches FACE_DY in muse_ui.c, which shifts the pixel face. */
+#define FR_FACE_DY 20
 #define FR_BYTES (FR_W * FR_H * 2)   /* RGB565 */
 #define FR_PERIOD_US 125000          /* 8 fps */
 #define FR_FILE_MAX (96 * 1024)      /* largest asset is a ~35 KB frame */
@@ -807,7 +812,7 @@ void muse_frames_attach(lv_obj_t *face)
 {
     s_img = lv_image_create(face);
     lv_obj_set_size(s_img, FR_W, FR_H);
-    lv_obj_align(s_img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(s_img, LV_ALIGN_CENTER, 0, muse_board->minimal_face ? FR_FACE_DY : 0);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_img, LV_OBJ_FLAG_HIDDEN);

@@ -41,6 +41,7 @@ static bool update_sleep(void) { return false; }
 static void update_chrome(float now) { (void)now; }
 static void quick_tick(void) {}
 static void quick_hide(void) {}
+static void boot_hint_tick(muse_mode_t m, float now) { (void)m; (void)now; }
 static bool muse_menu_tick(float now) { (void)now; return false; }
 static int lv_obj_get_scroll_x(void *obj) { (void)obj; return 0; }
 static void invalidate_muse(void) {}

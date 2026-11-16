@@ -1825,7 +1825,7 @@ static void build_home(lv_obj_t *tile)
         row(list, LV_SYMBOL_VOLUME_MAX, SOUND_NAV, &s_home_sound, on_nav, (void *)&SOUND);
     }
 #if CONFIG_MUSE_CJK_FONT
-    row(list, NULL, TR("Language", "语言"), &s_home_lang, on_nav, (void *)&LANGUAGE);
+    row(list, LV_SYMBOL_KEYBOARD, TR("Language", "语言"), &s_home_lang, on_nav, (void *)&LANGUAGE);
 #endif
     row(list, LV_SYMBOL_EYE_CLOSE, TR("Sleep", "休眠"), &s_home_sleep, on_nav, (void *)&SLEEP);
     row(list, LV_SYMBOL_BATTERY_FULL, TR("Battery", "电池"), &s_home_battery, on_nav, (void *)&BATTERY);

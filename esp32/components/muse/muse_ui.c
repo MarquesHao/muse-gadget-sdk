@@ -221,6 +221,24 @@ static lv_obj_t *s_state_dot;
 static int s_shown_batt = -2;          /* -2: nothing painted yet */
 static uint32_t s_shown_dot = 0x000000;
 static bool s_dot_shown = true;
+/* Minimal-face layout tuning (Hugh's hands-on feedback, 2026-11-16).
+ * STATUS_ROW_Y_MINIMAL: the battery arc (424 px across, centred) has
+ * its stroke bottoming out at y~27 over the status row's span, and the
+ * row used to start at y=20 — the arc crossed the Wi-Fi glyph and the
+ * state dot. The row now starts below the arc; the arc does not move.
+ * FACE_DY: the character rested hard against the top edge; it now sits
+ * this much lower. The frame player shifts by the same amount
+ * (FR_FACE_DY in muse_frames.c), so the pixel fallback and the frame
+ * library agree. */
+#define STATUS_ROW_Y_MINIMAL 34
+#define FACE_DY 20
+/* One-shot boot hint (minimal face): with the corner icons gone, the
+ * first idle after a boot names the top key at the bottom of the
+ * screen for a few seconds, once per boot. boot_hint_tick() drives it:
+ * stage 0 waits for the first idle, 1 is showing, 2 is done. */
+static lv_obj_t *s_boot_hint;
+static int s_boot_hint_stage;
+static float s_boot_hint_until;
 static lv_obj_t *s_caption_lbl;
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
@@ -1191,7 +1209,7 @@ static void build_answer(lv_obj_t *face, int ring_in)
     l->scale = s_w >= 400 && !muse_board->rim_controls ? 2 : 1;
     cw = lv_font_get_glyph_width(l->font, 'M', ' ') * l->scale;
     pitch = (lv_font_get_line_height(l->font) + CAPTION_LINE_SPACE) * l->scale;
-    int status_bottom = (muse_board->rim_controls ? 40 : 20 + s_dy) + 16 - s_h / 2;
+    int status_bottom = (muse_board->rim_controls ? 40 : muse_board->minimal_face ? STATUS_ROW_Y_MINIMAL : 20 + s_dy) + 16 - s_h / 2;
     l->px = MUSE_PX_W * MINI_CELL_PX;
     l->y = status_bottom + 2 + l->px / 2;   /* its sparkles clear of the status line */
     l->align = LV_TEXT_ALIGN_CENTER;
@@ -1495,6 +1513,9 @@ static void build_screen(void)
     /* The 128 px avatar ends at y=159; Japanese captions start at y=164. */
     s_big_y = -25;
 #endif
+    if (muse_board->minimal_face) {
+        s_big_y += FACE_DY;   /* rests lower; see the note at FACE_DY */
+    }
 
     /* The character. */
     muse_image_init();
@@ -1523,7 +1544,7 @@ static void build_screen(void)
     lv_obj_set_flex_flow(status, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(status, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(status, s_small ? 4 : 8, 0);
-    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, muse_board->rim_controls ? 40 : s_small ? 1 : 20 + s_dy);
+    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, muse_board->rim_controls ? 40 : s_small ? 1 : muse_board->minimal_face ? STATUS_ROW_Y_MINIMAL : 20 + s_dy);
     s_wifi_icon = make_label(status, &lv_font_montserrat_14, COLOR_DIM);
     s_ble_icon = make_label(status, &lv_font_montserrat_14, COLOR_DIM);
     s_power_lbl = make_label(status, &lv_font_unscii_8, COLOR_DIM);
@@ -1831,6 +1852,17 @@ static void build_overlays(void)
         s_dots[i] = d;
     }
 
+    if (muse_board->minimal_face) {
+        /* The one-shot boot hint (see s_boot_hint): its own label at the
+         * bottom of the screen, above the page dots — not the caption,
+         * whose text comes and goes with replies and must not fight it.
+         * boot_hint_tick() shows it once and retires it. */
+        s_boot_hint = make_label(scr, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
+        lv_label_set_text(s_boot_hint, ui_lang_zh() ? "顶键：按住说话 · 轻点通话" : "Top key: hold to talk · tap to call");
+        lv_obj_align(s_boot_hint, LV_ALIGN_BOTTOM_MID, 0, -34);
+        lv_obj_add_flag(s_boot_hint, LV_OBJ_FLAG_HIDDEN);
+    }
+
     /* A downloaded image: over everything on the screen (and in snapshots),
      * under the pairing code and sleep cover on the top layer. */
     s_image = lv_image_create(scr);
@@ -1965,6 +1997,12 @@ static void build_overlays(void)
         lv_obj_add_event_cb(s_quick_vol_sl, on_quick_volume_done, LV_EVENT_PRESS_LOST, NULL);
         s_quick_vol_val = make_label(vol_row, muse_lang_montserrat(&lv_font_montserrat_14), COLOR_LIT);
         lv_obj_set_width(s_quick_vol_val, 30);
+        if (muse_board->minimal_face) {
+            /* The corner icons are gone on this board, so the panel is
+             * where the top key explains itself. */
+            lv_obj_t *q_keys = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
+            lv_label_set_text(q_keys, ui_lang_zh() ? "顶键：按住说话 · 轻点通话" : "Top key: hold to talk · tap to call");
+        }
         lv_obj_t *q_hint = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
         lv_label_set_text(q_hint, ui_lang_zh() ? "点外面关闭" : "Tap outside to close");
     }
@@ -2544,6 +2582,37 @@ void muse_ui_request_snapshot(void)
     s_snapshot = true;
 }
 
+/* The one-shot boot hint (minimal face): show it the first time the
+ * face reaches idle after a boot, and take it away after a few seconds
+ * or as soon as anything else wants the screen — a state change, a
+ * swipe to settings. Once retired it never comes back this boot. */
+static void boot_hint_tick(muse_mode_t mode, float now)
+{
+    if (!s_boot_hint || s_boot_hint_stage == 2) return;
+    bool face_up = !s_tv || lv_obj_get_scroll_x(s_tv) == 0;
+    /* Pairing comes first: while the pairing card is up the hint would
+     * share the screen with it, and on an unpaired gadget the top key
+     * only answers "set up Muse first" — the hint waits, still armed,
+     * until the gadget is paired and the card is gone. update_chrome()
+     * ran earlier this frame, so both reads are fresh. */
+    muse_hatch_status_t h;
+    muse_hatch_status(&h);
+    bool pairing_up = s_pair && !lv_obj_has_flag(s_pair, LV_OBJ_FLAG_HIDDEN);
+    bool ready = h.state != MUSE_HATCH_NOT_SET && !pairing_up;
+    if (s_boot_hint_stage == 0) {
+        if (mode == MUSE_MODE_IDLE && face_up && ready) {
+            lv_obj_remove_flag(s_boot_hint, LV_OBJ_FLAG_HIDDEN);
+            s_boot_hint_until = now + 3.0f;
+            s_boot_hint_stage = 1;
+        }
+        return;
+    }
+    if (mode != MUSE_MODE_IDLE || !face_up || !ready || now >= s_boot_hint_until) {
+        lv_obj_add_flag(s_boot_hint, LV_OBJ_FLAG_HIDDEN);
+        s_boot_hint_stage = 2;
+    }
+}
+
 static void frame_tick(lv_timer_t *timer)
 {
 #if LV_USE_SNAPSHOT
@@ -2587,6 +2656,7 @@ static void frame_tick(lv_timer_t *timer)
 #endif
     update_chrome(now);
     quick_tick();
+    boot_hint_tick(mode, now);
     if (muse_menu_tick(now)) {
         quick_hide();
         image_hide_locked();
