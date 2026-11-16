@@ -76,21 +76,22 @@ static const char *TAG = "muse_frames";
 #define FR_SLEEPY_IDLE_S 180         /* idle this long: the sleepy face */
 #define FR_MAKING_AFTER_S 20.0f      /* thinking this long: a long task */
 
-/* The waking sequence's framing does not match idle's, in size or
- * in position (measured on the shipped frames): the figure's width
- * at face height is 239 of 466 px in waking vs 282 in idle, and the
- * brightness centroid of waking's handoff frames (f000/f055, same
- * pose) sits at (239,261) against idle f000's (239,278) — 17 px too
- * high — so at 1:1 the waking->idle handoff shrinks, grows and
- * drops all at once. Zoom waking — and only waking — by 1.18x
- * about the pivot that maps its handoff centroid exactly onto
- * idle's: pivot = (target - f * centroid) / (1 - f) = (239,167)
- * for f = 302/256. Idle itself, the stills and the kits stay at
- * 256 (1:1) with their existing placement; waking's own
- * mid-animation motion remains, now playing around idle's anchor. */
-#define FR_WAKING_ZOOM 302           /* LVGL scale units, 256 = 1:1 */
-#define FR_PIVOT_X 239
-#define FR_PIVOT_Y 167
+/* The waking sequence's framing does not match idle's (measured
+ * on the shipped frames): both are bottom-anchored figures cropped
+ * at the bottom edge, but waking's artwork sits higher — its
+ * handoff frame's top edge is at 24 against idle's 38, and its
+ * brightness centroid ~16 px higher — so at the shared placement
+ * the waking->idle handoff jumps up. An earlier fix zoomed waking
+ * 1.18x about a pivot to land its centroid exactly on idle's; the
+ * centroid matched, but the figure grew ~22% and its head left the
+ * top of the screen (Hugh, hands-on: still too high), so the zoom
+ * is gone. Waking now shows 1:1 like every other visual, shifted
+ * down by FR_WAKING_DY instead: simulated on the handoff frame,
+ * +15 leaves the top edge and both centroids within ~1.3 px of
+ * idle's. Only waking moves; idle itself, the stills and the kits
+ * keep their existing placement, and waking's own mid-animation
+ * motion remains, playing around idle's anchor. */
+#define FR_WAKING_DY 15
 
 /* Visuals the resolver can ask for. */
 typedef enum {
@@ -448,13 +449,16 @@ static bool build_kit(const char *name, uint16_t *out)
 /* ---- display (always under the board's display lock) ---- */
 
 /* The visual the next swap_buffers() puts up; only waking is shown
- * zoomed (see FR_WAKING_ZOOM). Set by every path that swaps. */
+ * shifted down (see FR_WAKING_DY). Set by every path that swaps. */
 static visual_t s_swap_vis = V_NONE;
 
 /* Display lock held by the caller (the show_* paths take it). */
-static void apply_zoom(visual_t v)
+static void apply_framing(visual_t v)
 {
-    lv_image_set_scale(s_img, v == V_WAKING ? FR_WAKING_ZOOM : 256);
+    lv_image_set_scale(s_img, 256);
+    lv_obj_align(s_img, LV_ALIGN_CENTER, 0,
+                 (muse_board->minimal_face ? FR_FACE_DY : 0) +
+                 (v == V_WAKING ? FR_WAKING_DY : 0));
 }
 
 static void show_front(void)
@@ -462,7 +466,7 @@ static void show_front(void)
     muse_board->display_lock(-1);
     s_dsc.data = (const uint8_t *)s_buf[s_front];
     lv_image_set_src(s_img, &s_dsc);
-    apply_zoom(s_swap_vis);
+    apply_framing(s_swap_vis);
     lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(s_img);
@@ -480,7 +484,7 @@ static void show_still(void)
 {
     muse_board->display_lock(-1);
     lv_image_set_src(s_img, &s_still_dsc);
-    apply_zoom(V_STILL);
+    apply_framing(V_STILL);
     lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(s_img);
@@ -929,7 +933,6 @@ void muse_frames_attach(lv_obj_t *face)
     s_img = lv_image_create(face);
     lv_obj_set_size(s_img, FR_W, FR_H);
     lv_obj_align(s_img, LV_ALIGN_CENTER, 0, muse_board->minimal_face ? FR_FACE_DY : 0);
-    lv_image_set_pivot(s_img, FR_PIVOT_X, FR_PIVOT_Y);   /* for the waking zoom */
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_img, LV_OBJ_FLAG_HIDDEN);
