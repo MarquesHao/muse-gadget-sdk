@@ -17,6 +17,7 @@
 #include "muse_settings.c"
 
 static bool saved, value;
+static bool mig_saved;   /* the one-time mic-gain migration marker */
 static int commits, notices;
 esp_err_t nvs_flash_init(void) { return ESP_OK; }
 esp_err_t nvs_flash_erase(void) { assert(!"must preserve existing NVS"); return ESP_FAIL; }
@@ -26,26 +27,32 @@ esp_err_t nvs_open(const char *ns,nvs_open_mode_t mode,nvs_handle_t *h) {
 esp_err_t nvs_get_u8(nvs_handle_t h,const char *key,uint8_t *v) {
     assert(h==1);
     if(!strcmp(key,"voice_notes") && saved) { *v=value; return ESP_OK; }
+    if(!strcmp(key,"micgain_mig") && mig_saved) { *v=1; return ESP_OK; }
     return ESP_FAIL;
 }
 esp_err_t nvs_get_u16(nvs_handle_t h,const char *key,uint16_t *v) { (void)h;(void)key;(void)v;return ESP_FAIL; }
 esp_err_t nvs_get_str(nvs_handle_t h,const char *key,char *v,size_t *n) { (void)h;(void)key;(void)v;(void)n;return ESP_FAIL; }
 esp_err_t nvs_set_u8(nvs_handle_t h,const char *key,uint8_t v) {
-    assert(h==1 && !strcmp(key,"voice_notes")); saved=true; value=v; return ESP_OK;
+    assert(h==1);
+    if(!strcmp(key,"micgain_mig")) { assert(v==1); mig_saved=true; return ESP_OK; }
+    assert(!strcmp(key,"voice_notes")); saved=true; value=v; return ESP_OK;
 }
 esp_err_t nvs_commit(nvs_handle_t h) { assert(h==1); ++commits; return ESP_OK; }
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (void *)1; }
 static void changed(muse_setting_t what) { assert(what==MUSE_SETTING_VOICE_NOTES); ++notices; }
 int main(int argc,char **argv) {
     (void)argv; assert(argc==2); assert(muse_settings_init()==ESP_OK);
-    assert(!muse_settings_voice_notes() && !saved && !commits);
+    /* First init writes exactly one thing: the mic-gain migration
+     * marker (the stored gain here is the 30 dB default, so no pull-back
+     * write). That is the commits==1 below; later counts shift by one. */
+    assert(!muse_settings_voice_notes() && !saved && commits==1 && mig_saved);
     muse_settings_set_listener(changed);
     muse_settings_set_voice_notes(true);
-    assert(muse_settings_voice_notes() && saved && value && commits==1 && notices==1);
+    assert(muse_settings_voice_notes() && saved && value && commits==2 && notices==1);
     atomic_store(&s_voice_notes,false); /* fresh process's zero-initialized default */
     assert(muse_settings_init()==ESP_OK);
     assert(muse_settings_voice_notes()==(CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE));
     muse_settings_set_voice_notes(false);
-    assert(!muse_settings_voice_notes() && !value && commits==2 && notices==2);
+    assert(!muse_settings_voice_notes() && !value && commits==3 && notices==2);
     return 0;
 }

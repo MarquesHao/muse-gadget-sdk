@@ -28,6 +28,9 @@ can be pinned on the host, and is pinned here:
   the dump guard is armed before the writer creates the file, s_op_err
   is reset only by the writer at BEGIN, a failed save is never reported
   as a success, and an error-path tail is dropped rather than padded;
+* the init retry contract: a first setup that fails under boot-time
+  memory pressure re-arms instead of latching its error for the whole
+  boot, and a partial setup is undone before any retry;
 * the device.guide assembly the firmware build performs for this
   project's custom guide, run for real through cmake in script mode,
   including its failure modes (missing / empty / oversize /
@@ -92,10 +95,19 @@ def wav_header_bytes() -> bytes:
 
 
 WRITER = segment(MEETING_C, "static void writer_task(", "\nstatic esp_err_t setup(")
+INIT_ONCE = segment(MEETING_C, "static esp_err_t init_once(void)", "\n/* Raw mount;")
+LOCK_INIT = segment(MEETING_C, "static esp_err_t lock_init_once(void)", "\nstatic void setup_undo(")
+SETUP_UNDO = segment(MEETING_C, "static void setup_undo(", "\nstatic esp_err_t setup(void)")
+SETUP = segment(MEETING_C, "static esp_err_t setup(void)", "\n/* setup() to success,")
 BEGIN = segment(MEETING_C, "esp_err_t muse_meeting_begin(", "\nbool muse_meeting_write(")
 WRITE = segment(MEETING_C, "bool muse_meeting_write(", "\nesp_err_t muse_meeting_end(")
 END = segment(MEETING_C, "esp_err_t muse_meeting_end(", "\nvoid muse_meeting_console_list(")
 SESSION = segment(VOICE_C, "static void meeting_session(void)", "\nstatic void voice_task(")
+SALVAGE_ONE = segment(MEETING_C, "static void salvage_one(", "\n/* Caller holds s_lock")
+SALVAGE_ALL = segment(MEETING_C, "static void salvage_orphans(void)",
+                      "\n/*\n * Boot-time mount,")
+MOUNT_FN = segment(MEETING_C, "esp_err_t muse_meeting_mount(void)",
+                   "\nbool muse_meeting_mounted(")
 
 
 class WavContractTest(unittest.TestCase):
@@ -293,6 +305,87 @@ class WriterPathTest(unittest.TestCase):
         self.assertIn("s_recording = false", END)
 
 
+class PowerLossSalvageTest(unittest.TestCase):
+    """A power cut mid-recording kills the writer with the boot, so the
+    topped-session salvage in the writer can never run for it: the file
+    keeps a placeholder header over real audio. The boot-time prewarm
+    scan is the rescue — same disposition (whole-block backfill / remove
+    when empty), crash-safe if power dies again mid-salvage."""
+
+    def test_scan_runs_in_the_boot_prewarm_before_unmount(self):
+        # The prewarm is the only mount on an internal-RAM stack before
+        # any session can finalize; the scan must happen while it holds
+        # the mount, i.e. before it unmounts again to free the RAM.
+        scan = MOUNT_FN.index("salvage_orphans()")
+        self.assertLess(MOUNT_FN.index("mount_or_format_once()"), scan)
+        self.assertLess(scan, MOUNT_FN.index("esp_vfs_fat_spiflash_unmount_rw_wl"))
+
+    def test_scan_runs_nowhere_else(self):
+        # begin() runs on the PSRAM-stack voice task (flash writes would
+        # crash it) and list/dump can run beside a live recording; the
+        # boot prewarm is the only call site.
+        self.assertEqual(MEETING_C.count("salvage_orphans"), 2)  # def + call
+        self.assertNotIn("salvage_one", BEGIN)
+        self.assertNotIn("salvage_one", END)
+
+    def test_scan_skips_the_file_being_recorded(self):
+        # A meeting-mode device can auto-start a recording before the
+        # prewarm runs; that file's zero header is legitimate.
+        self.assertIn("bool recording = s_recording", SALVAGE_ALL)
+        self.assertIn("strcmp(path + 6, current) == 0", SALVAGE_ALL)
+        self.assertIn("continue", SALVAGE_ALL)
+
+    def test_scan_walks_the_sequence_like_the_list(self):
+        self.assertIn('MEET_BASE "/MEET%04d.WAV"', SALVAGE_ALL)
+        self.assertIn("stat(path, &st) != 0", SALVAGE_ALL)
+        self.assertIn("break", SALVAGE_ALL)
+
+    def test_finalized_files_are_left_alone(self):
+        # All three size fields non-zero means MSG_END (or a salvage)
+        # already patched the file; a padded tail block keeps fact
+        # below the whole-block count but never at zero.
+        self.assertIn("get_u32(hdr + HDR_OFF_RIFF_SIZE) != 0", SALVAGE_ONE)
+        self.assertIn("get_u32(hdr + HDR_OFF_FACT_SAMPLES) != 0", SALVAGE_ONE)
+        self.assertIn("get_u32(hdr + HDR_OFF_DATA_SIZE) != 0", SALVAGE_ONE)
+
+    def test_foreign_layout_is_left_alone(self):
+        for marker in ('"RIFF"', '"WAVE"', '"fmt "', '"fact"', '"data"'):
+            self.assertIn(f"memcmp(hdr", SALVAGE_ONE)
+            self.assertIn(marker, SALVAGE_ONE)
+
+    def test_backfill_uses_whole_blocks_on_disk(self):
+        self.assertIn("audio / MUSE_MEETING_BLOCK_BYTES * MUSE_MEETING_BLOCK_BYTES",
+                      SALVAGE_ONE)
+        self.assertIn("MEET_HDR_BYTES - 8 + whole", SALVAGE_ONE)
+        self.assertIn("whole / MUSE_MEETING_BLOCK_BYTES * MUSE_MEETING_BLOCK_SAMPLES",
+                      SALVAGE_ONE)
+        for offset in ("HDR_OFF_RIFF_SIZE", "HDR_OFF_FACT_SAMPLES", "HDR_OFF_DATA_SIZE"):
+            self.assertIn(f"fseek(f, {offset}, SEEK_SET)", SALVAGE_ONE)
+
+    def test_partial_tail_is_truncated_before_the_patch(self):
+        # Crash-safety of the salvage itself: truncate first, so a
+        # second power cut leaves a zero header at a whole-block size
+        # and the next boot redoes the job; a failed truncate must not
+        # leave patched sizes disagreeing with the file length.
+        trunc = SALVAGE_ONE.index("ftruncate(fileno(f), (off_t)(MEET_HDR_BYTES + whole))")
+        patch = SALVAGE_ONE.index("fseek(f, HDR_OFF_RIFF_SIZE, SEEK_SET)")
+        self.assertLess(trunc, patch)
+        failed = SALVAGE_ONE.index("tail truncate failed")
+        self.assertIn("return", SALVAGE_ONE[failed:])
+
+    def test_no_whole_block_means_removal(self):
+        # A stub shorter than a header, and a header with less than one
+        # whole block after it, both hold no audio: remove, like the
+        # writer's zero-block topped case.
+        self.assertIn("if (size < MEET_HDR_BYTES)", SALVAGE_ONE)
+        self.assertIn("if (whole == 0)", SALVAGE_ONE)
+        self.assertEqual(SALVAGE_ONE.count("remove(path)"), 2)
+
+    def test_salvage_never_touches_the_session_error(self):
+        self.assertNotIn("s_op_err", SALVAGE_ONE)
+        self.assertNotIn("s_op_err", SALVAGE_ALL)
+
+
 class SessionPathTest(unittest.TestCase):
     def test_begin_failure_is_a_plain_storage_caption(self):
         self.assertIn('muse_state_set_caption("MEETING STORAGE UNAVAILABLE")', SESSION)
@@ -345,6 +438,40 @@ class SessionPathTest(unittest.TestCase):
         cleared = SESSION.index("muse_state_set_recording(false)")
         ended = SESSION.index("muse_meeting_end(enc_samples)")
         self.assertLess(cleared, ended)
+
+
+class InitRetryTest(unittest.TestCase):
+    """A first init that loses the boot-time memory race must not poison
+    meeting storage for the whole boot: the done state latches only on
+    success, a failure re-arms for the next caller's single retry, and a
+    partial setup is undone so the retry starts from nothing."""
+
+    def test_init_latches_done_only_on_success(self):
+        self.assertIn("atomic_store(&s_init_state, err == ESP_OK ? 2 : 0)",
+                      INIT_ONCE)
+
+    def test_init_failure_is_logged_for_the_retry(self):
+        self.assertIn("setup failed: %s (next use retries)", INIT_ONCE)
+
+    def test_lock_latches_only_once_the_mutex_exists(self):
+        created = LOCK_INIT.index("if (s_lock) {")
+        latched = LOCK_INIT.index("atomic_store(&s_lock_state, 2)")
+        self.assertLess(created, latched)
+        self.assertIn("atomic_store(&s_lock_state, 0)", LOCK_INIT)
+
+    def test_partial_setup_is_undone_before_a_retry(self):
+        for handle in ("s_wq", "s_freeq", "s_done"):
+            self.assertIn(f"{handle} = NULL", SETUP_UNDO)
+        self.assertIn("heap_caps_free(pool)", SETUP_UNDO)
+        # Both failure exits of setup() (allocations, writer creation)
+        # undo before returning NO_MEM.
+        self.assertEqual(SETUP.count("setup_undo(pool)"), 2)
+
+    def test_writer_task_keeps_its_internal_stack(self):
+        # V1.1 lesson: the writer stack stays in internal RAM (safe
+        # under flash writes); retry support must not move it to PSRAM.
+        self.assertIn('xTaskCreate(writer_task, "muse_meet_wr", 4096', SETUP)
+        self.assertNotIn("xTaskCreateWithCaps", SETUP)
 
 
 class ConsoleGuardTest(unittest.TestCase):

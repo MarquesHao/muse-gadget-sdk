@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -86,7 +87,7 @@ static bool s_setup;
 static QueueHandle_t s_wq, s_freeq;
 static SemaphoreHandle_t s_done;
 static SemaphoreHandle_t s_lock;   /* serializes mount + state snapshots across caller tasks */
-static atomic_int s_init_state;    /* 0 new, 1 initializing, 2 done */
+static atomic_int s_init_state;    /* 0 new/retryable, 1 initializing, 2 done (setup succeeded) */
 static atomic_int s_lock_state;    /* same protocol, for s_lock alone */
 static esp_err_t s_init_err = ESP_OK;
 static volatile esp_err_t s_op_err = ESP_OK;
@@ -102,6 +103,12 @@ static void put_u32(uint8_t *at, uint32_t v)
     at[1] = (v >> 8) & 0xff;
     at[2] = (v >> 16) & 0xff;
     at[3] = (v >> 24) & 0xff;
+}
+
+static uint32_t get_u32(const uint8_t *at)
+{
+    return (uint32_t)at[0] | (uint32_t)at[1] << 8 | (uint32_t)at[2] << 16
+           | (uint32_t)at[3] << 24;
 }
 
 static void writer_task(void *arg)
@@ -226,18 +233,47 @@ static void writer_task(void *arg)
  * on the 1.75C). First real use (begin/list/dump) runs full setup(). */
 static esp_err_t lock_init_once(void)
 {
-    int expected = 0;
-    if (atomic_compare_exchange_strong(&s_lock_state, &expected, 1)) {
-        if (!s_lock) {
-            s_lock = xSemaphoreCreateMutex();
+    for (;;) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&s_lock_state, &expected, 1)) {
+            if (!s_lock) {
+                s_lock = xSemaphoreCreateMutex();
+            }
+            if (s_lock) {
+                atomic_store(&s_lock_state, 2);
+                return ESP_OK;
+            }
+            /* Creation failed (boot-time memory pressure): re-arm so the
+             * next caller retries instead of caching the failure for the
+             * whole boot. Each caller attempts creation at most once. */
+            atomic_store(&s_lock_state, 0);
+            return ESP_ERR_NO_MEM;
         }
-        atomic_store(&s_lock_state, 2);
-        return s_lock ? ESP_OK : ESP_ERR_NO_MEM;
-    }
-    while (atomic_load(&s_lock_state) != 2) {
+        if (atomic_load(&s_lock_state) == 2) {
+            return ESP_OK;   /* state 2 is only stored once s_lock exists */
+        }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-    return s_lock ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+/* Undo a partial setup() so a later retry starts from nothing. Only
+ * setup() calls this, before s_setup is set, so no other task can be
+ * holding the queues yet. */
+static void setup_undo(meet_blk_t *pool)
+{
+    if (s_wq) {
+        vQueueDelete(s_wq);
+        s_wq = NULL;
+    }
+    if (s_freeq) {
+        vQueueDelete(s_freeq);
+        s_freeq = NULL;
+    }
+    if (s_done) {
+        vSemaphoreDelete(s_done);
+        s_done = NULL;
+    }
+    heap_caps_free(pool);
 }
 
 static esp_err_t setup(void)
@@ -253,6 +289,7 @@ static esp_err_t setup(void)
     s_freeq = xQueueCreate(MEET_POOL_BLOCKS, sizeof(meet_blk_t *));
     s_done = xSemaphoreCreateBinary();
     if (!pool || !s_wq || !s_freeq || !s_done) {
+        setup_undo(pool);
         return ESP_ERR_NO_MEM;
     }
     for (int i = 0; i < MEET_POOL_BLOCKS; i++) {
@@ -261,26 +298,37 @@ static esp_err_t setup(void)
     }
     /* Plain xTaskCreate: an internal-RAM stack, safe under flash writes. */
     if (xTaskCreate(writer_task, "muse_meet_wr", 4096, NULL, 5, NULL) != pdPASS) {
+        setup_undo(pool);
         return ESP_ERR_NO_MEM;
     }
     s_setup = true;
     return ESP_OK;
 }
 
-/* setup() exactly once, whichever task (voice, console, boot) gets here
- * first; the losers wait for the winner instead of double-allocating. */
+/* setup() to success, whichever task (voice, console, boot) gets here
+ * first; concurrent callers wait for the winner instead of
+ * double-allocating. A failed attempt does NOT latch: it usually means
+ * the caller raced the audio pipeline for internal RAM during boot, so
+ * the state re-arms and the next begin/list/dump retries setup() once
+ * memory has settled. Each caller runs setup() at most once. */
 static esp_err_t init_once(void)
 {
-    int expected = 0;
-    if (atomic_compare_exchange_strong(&s_init_state, &expected, 1)) {
-        s_init_err = setup();
-        atomic_store(&s_init_state, 2);
-        return s_init_err;
-    }
-    while (atomic_load(&s_init_state) != 2) {
+    for (;;) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&s_init_state, &expected, 1)) {
+            esp_err_t err = setup();
+            s_init_err = err;
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "setup failed: %s (next use retries)", esp_err_to_name(err));
+            }
+            atomic_store(&s_init_state, err == ESP_OK ? 2 : 0);
+            return err;
+        }
+        if (atomic_load(&s_init_state) == 2) {
+            return s_init_err;
+        }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-    return s_init_err;
 }
 
 /* Raw mount; the caller holds s_lock. format=true lets the VFS format a
@@ -357,6 +405,120 @@ static esp_err_t mount_or_format_once(void)
 }
 
 /*
+ * Power-loss salvage. A recording interrupted by a power cut or a reset
+ * never reaches MSG_END and the writer is gone with the boot, so nobody
+ * tops it: its file keeps the placeholder header (all three size fields
+ * zero) over however many whole blocks reached the disk (the writer
+ * flushes every ~32 KB). Such a file lists as 0 seconds and exports as
+ * a stub. The disposition is the topped-session one from the writer:
+ * patch the three header fields from the whole blocks actually on disk,
+ * and remove the file when it holds no whole block at all.
+ *
+ * The scan runs only from muse_meeting_mount(): the one mount point
+ * that is guaranteed an internal-RAM stack (flash writes from the voice
+ * task's PSRAM stack would crash it) and where no session can have
+ * finalized anything yet this boot. The one file a session may already
+ * have open — a meeting-mode device can auto-start a recording before
+ * the prewarm runs — wears a placeholder header legitimately and is
+ * skipped by name; every other file with a zero size field is dead.
+ */
+static void salvage_one(const char *path, long size)
+{
+    if (size < MEET_HDR_BYTES) {
+        /* Not even a full header landed: no whole block can follow it,
+         * so there is no audio to save, and the stub would squat on
+         * this MEETnnnn name forever. */
+        remove(path);
+        ESP_LOGW(TAG, "removed stub %s (%ld bytes, no complete header)", path, size);
+        return;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return;
+    }
+    uint8_t hdr[MEET_HDR_BYTES];
+    bool read_ok = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr);
+    fclose(f);
+    if (!read_ok) {
+        return;
+    }
+    if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0
+        || memcmp(hdr + 12, "fmt ", 4) != 0 || memcmp(hdr + 40, "fact", 4) != 0
+        || memcmp(hdr + 52, "data", 4) != 0) {
+        return;   /* not a meeting WAV layout we understand: leave it alone */
+    }
+    if (get_u32(hdr + HDR_OFF_RIFF_SIZE) != 0 && get_u32(hdr + HDR_OFF_FACT_SAMPLES) != 0
+        && get_u32(hdr + HDR_OFF_DATA_SIZE) != 0) {
+        return;   /* finalized (a padded tail block keeps fact below the
+                   * whole-block count, but never at zero): not ours */
+    }
+    uint32_t audio = (uint32_t)size - MEET_HDR_BYTES;
+    uint32_t whole = audio / MUSE_MEETING_BLOCK_BYTES * MUSE_MEETING_BLOCK_BYTES;
+    if (whole == 0) {
+        remove(path);   /* header but no whole block: no audio, no stub */
+        ESP_LOGW(TAG, "removed stub %s (header only, no audio)", path);
+        return;
+    }
+    f = fopen(path, "r+b");
+    if (!f) {
+        ESP_LOGW(TAG, "salvage %s: cannot reopen for patching", path);
+        return;
+    }
+    /* Truncate a partial tail block BEFORE patching the header: if
+     * power dies again mid-salvage, the file still wears a zero header
+     * at a whole-block size and the next boot simply redoes the job.
+     * Patching first would leave sizes that disagree with the length. */
+    if (audio > whole && ftruncate(fileno(f), (off_t)(MEET_HDR_BYTES + whole)) != 0) {
+        ESP_LOGW(TAG, "salvage %s: tail truncate failed, left unpatched", path);
+        fclose(f);
+        return;
+    }
+    uint8_t word[4];
+    put_u32(word, MEET_HDR_BYTES - 8 + whole);
+    bool ok = fseek(f, HDR_OFF_RIFF_SIZE, SEEK_SET) == 0 && fwrite(word, 1, 4, f) == 4;
+    put_u32(word, whole / MUSE_MEETING_BLOCK_BYTES * MUSE_MEETING_BLOCK_SAMPLES);
+    ok = ok && fseek(f, HDR_OFF_FACT_SAMPLES, SEEK_SET) == 0 && fwrite(word, 1, 4, f) == 4;
+    put_u32(word, whole);
+    ok = ok && fseek(f, HDR_OFF_DATA_SIZE, SEEK_SET) == 0 && fwrite(word, 1, 4, f) == 4;
+    if (ok) {
+        fflush(f);
+    }
+    fclose(f);
+    if (ok) {
+        ESP_LOGW(TAG, "salvaged %s (%" PRIu32 " bytes of audio, session never ended)",
+                 path, whole);
+    } else {
+        ESP_LOGW(TAG, "salvage %s: header patch failed, sizes stay zero", path);
+    }
+}
+
+/* Caller holds s_lock with the partition mounted (muse_meeting_mount).
+ * Recordings are created in sequence, so the first missing index ends
+ * the scan, exactly as in the console list. */
+static void salvage_orphans(void)
+{
+    /* Snapshot the live recording under the caller's lock — begin()
+     * arms these under the same lock — and skip its file: its zero
+     * header is legitimate while the writer has it open. Appending to
+     * that one file is the only meeting write that can be in flight. */
+    bool recording = s_recording;
+    char current[sizeof(s_current)];
+    strlcpy(current, s_current, sizeof(current));
+    char path[32];
+    struct stat st;
+    for (int i = 1; i < 10000; i++) {
+        snprintf(path, sizeof(path), MEET_BASE "/MEET%04d.WAV", i);
+        if (stat(path, &st) != 0) {
+            break;
+        }
+        if (recording && strcmp(path + 6, current) == 0) {
+            continue;
+        }
+        salvage_one(path, (long)st.st_size);
+    }
+}
+
+/*
  * Boot-time mount, called from muse_app_run (a normal internal-RAM stack).
  * This is the ONLY place a format may happen: the voice task's stack is
  * in PSRAM and flash writes during a format would crash it, so begin()
@@ -373,6 +535,12 @@ esp_err_t muse_meeting_mount(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     err = mount_or_format_once();
     if (err == ESP_OK) {
+        /* Rescue any recording a power cut left with a placeholder
+         * header (see salvage_one) while this internal-stack task is
+         * the one holding the mount; after the unmount below, no later
+         * mount point can promise both that and a not-yet-recording
+         * store. */
+        salvage_orphans();
         /* The prewarm's jobs were the one-time format and proving the
          * store works; nothing needs it mounted afterwards, and every
          * real use (begin/list/dump) mounts on demand. Unmount again

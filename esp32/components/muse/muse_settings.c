@@ -158,6 +158,22 @@ esp_err_t muse_settings_init(void)
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
     s.text_size = clampi(s.text_size, MUSE_TEXT_SMALL, MUSE_TEXT_LARGE);
+
+    /* One-time migration (2026-11-16): a stored mic gain above the 30 dB
+     * factory default — one device sat at the 36 dB ceiling — leaves the
+     * noise floor high and the clipping headroom thin, which reads as
+     * muddy recordings. Pull any stored value above 30 back to 30, once:
+     * the marker key makes it strictly one-shot, so whatever the user
+     * picks on the slider afterwards is respected. */
+    uint8_t mig;
+    if (nvs_get_u8(s_nvs, "micgain_mig", &mig) != ESP_OK) {
+        if (s.mic_gain > 30) {
+            ESP_LOGW(TAG, "mic gain migration: stored %d dB pulled back to 30 dB (one-time)", s.mic_gain);
+            s.mic_gain = 30;
+            save_u8("mic_gain", s.mic_gain);
+        }
+        save_u8("micgain_mig", 1);
+    }
     ESP_LOGI(TAG, "vol %d%s, mic %d dB, bright %d, sleep %ds, wifi %s (%s), ble %s, muse %s",
              s.volume, s.speaker_on ? "" : " (speaker off)", s.mic_gain, s.brightness, s.sleep_s, s.wifi_on ? "on" : "off",
              "network saved by Link", s.ble_on ? "on" : "off", s.token[0] ? "token set" : "no token");
