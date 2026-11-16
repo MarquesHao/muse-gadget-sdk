@@ -76,6 +76,13 @@ extern "C" {
 #include "muse_settings.h"
 #include "muse_wifi.h"
 }
+
+/* muse_frames.c quiets the frame player while resolve_vm() borrows
+ * the heap (see muse_frames.h). Weak: builds without the frame face
+ * (e-ink UI, Voice PE) don't link muse_frames.c — there the hold is
+ * simply absent and the lookup runs as it always did. Declared here
+ * rather than via muse_frames.h, which pulls in lvgl.h. */
+extern "C" __attribute__((weak)) bool muse_frames_hold(bool on);
 #include "muse_chat_priv.h"
 #include "sdkconfig.h"
 #if CONFIG_MUSE_REALTIME_VOICE
@@ -835,8 +842,38 @@ static void forget_vm(void)
     s_vm_direct = false;
 }
 
-/* Fills s_vm from the account API (or the token itself). */
+static bool resolve_vm_lookup(char *err, size_t err_cap);
+
 static bool resolve_vm(char *err, size_t err_cap)
+{
+    if (s_vm.vm_token) {
+        return true;
+    }
+    /* The lookup spawns a task with an 8 KB internal-RAM stack and
+     * runs HTTPS. Awake, the frame player's decode churn leaves the
+     * largest free internal block smaller than that stack, so the
+     * lookup dies before it starts and surfaces as "Can't reach
+     * Muse's server". Quiet the player — it drops its JPEG decoder
+     * and stops decoding — for the lookup's few seconds; it resumes
+     * whatever the outcome. The heap lines bracket the lookup so a
+     * failure shows the block size it faced. */
+    ESP_LOGI(TAG, "resolve: free %u, largest %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    bool held = muse_frames_hold && muse_frames_hold(true);
+    bool ok = resolve_vm_lookup(err, err_cap);
+    if (muse_frames_hold) {
+        muse_frames_hold(false);
+    }
+    ESP_LOGI(TAG, "resolve %s (frames held: %s): free %u, largest %u",
+             ok ? "ok" : "failed", held ? "yes" : "no",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return ok;
+}
+
+/* Fills s_vm from the account API (or the token itself). */
+static bool resolve_vm_lookup(char *err, size_t err_cap)
 {
     if (s_vm.vm_token) {
         return true;

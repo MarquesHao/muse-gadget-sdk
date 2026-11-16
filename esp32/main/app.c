@@ -765,7 +765,43 @@ static void restart_task(void *arg) {
 // restarts to reach its VM with the BLE stack never started.
 #define PAIR_THEN_RESTART CONFIG_MUSE_ENABLED
 
+/* Deferred token store for the VM lookup worker.
+ *
+ * The worker (hatch_vm_serve, see app_hatch_vm_credentials) runs on a
+ * PSRAM stack, because the internal heap cannot promise a lookup
+ * stack's block while the device is awake. A PSRAM-stack task must
+ * never write flash itself — the write switches the cache off under
+ * its own feet — so when a token refresh inside a serve wants to
+ * persist the new pair, store_token_pair_unlocked() parks a copy
+ * here instead, and the app heartbeat (internal stack; the same
+ * context deferred unpair/reset already use) writes it to NVS on
+ * its next tick. load_token_unlocked() reads the parked pair back
+ * meanwhile, so the serve that minted it uses it at once. The
+ * parked pair is only ever touched under the auth lock. */
+static volatile bool s_vm_serve_active;
+static char *s_vm_parked_access;
+static char *s_vm_parked_refresh;
+
 static char *load_token_unlocked(const char *key) {
+    /* A parked pair (see above) is newer than anything in NVS until
+     * the heartbeat flushes it; serve it from the park. */
+    if (s_vm_parked_access && s_vm_parked_refresh) {
+        const char *parked = NULL;
+        if (strcmp(key, "access_token") == 0) {
+            parked = s_vm_parked_access;
+        } else if (strcmp(key, "refresh_token") == 0) {
+            parked = s_vm_parked_refresh;
+        }
+        if (parked) {
+            char *buf = calloc(1, TOKEN_BUF_BYTES);
+            if (buf) {
+                size_t n = strlen(parked);
+                if (n >= TOKEN_BUF_BYTES) n = TOKEN_BUF_BYTES - 1;
+                memcpy(buf, parked, n);  /* calloc keeps it terminated */
+            }
+            return buf;
+        }
+    }
     char *buf = calloc(1, TOKEN_BUF_BYTES);
     if (!buf) return NULL;
     if (!config_get_str(key, buf, TOKEN_BUF_BYTES)) {
@@ -782,10 +818,36 @@ static char *load_token(const char *key) {
     return token;
 }
 
+/* Park a token pair for the heartbeat to store (auth lock held).
+ * The copies live in PSRAM: parking must not eat the internal RAM
+ * whose scarcity caused all of this. */
+static bool park_token_pair(const char *access_token, const char *refresh_token) {
+    char *a = heap_caps_malloc(strlen(access_token) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *r = heap_caps_malloc(strlen(refresh_token) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!a || !r) {
+        heap_caps_free(a);
+        heap_caps_free(r);
+        return false;
+    }
+    strcpy(a, access_token);
+    strcpy(r, refresh_token);
+    heap_caps_free(s_vm_parked_access);
+    heap_caps_free(s_vm_parked_refresh);
+    s_vm_parked_access = a;
+    s_vm_parked_refresh = r;
+    ESP_LOGI(TAG, "token pair parked; heartbeat will store it");
+    return true;
+}
+
 static bool store_token_pair_unlocked(const char *access_token,
                                       const char *refresh_token) {
     if (!access_token || !*access_token || !refresh_token || !*refresh_token) {
         return false;
+    }
+    if (s_vm_serve_active) {
+        /* The lookup worker runs on a PSRAM stack and must not write
+         * flash: park the pair; the heartbeat stores it for real. */
+        return park_token_pair(access_token, refresh_token);
     }
     bool ok = config_set_str("refresh_token", refresh_token);
     ok = config_set_str("access_token", access_token) && ok;
@@ -797,6 +859,31 @@ static bool store_token_pair_unlocked(const char *access_token,
         config_erase_key("refresh_token");
     }
     return ok;
+}
+
+/* Heartbeat context: write a parked token pair to NVS for real and
+ * drop the copies. Runs on the heartbeat's internal stack, like the
+ * deferred unpair/reset beside it in the loop. The pair stays
+ * readable from the park (under the auth lock) until the write is
+ * done, so no reader can catch the stale NVS copy in between. */
+static void flush_parked_token_pair(void) {
+    char *a = NULL;
+    char *r = NULL;
+    auth_lock_take();
+    if (s_vm_parked_access && s_vm_parked_refresh && !s_vm_serve_active) {
+        a = s_vm_parked_access;
+        r = s_vm_parked_refresh;
+        /* Not the worker here, so this takes the real NVS path. */
+        store_token_pair_unlocked(a, r);
+        s_vm_parked_access = NULL;
+        s_vm_parked_refresh = NULL;
+    }
+    auth_lock_give();
+    if (a) {
+        heap_caps_free(a);
+        heap_caps_free(r);
+        ESP_LOGI(TAG, "parked token pair stored");
+    }
 }
 
 static void store_pairing_username_unlocked(const char *username) {
@@ -2446,13 +2533,39 @@ static const vm_info_t *find_vm_by_id(const vm_info_t *vms, int count, const cha
     return NULL;
 }
 
-// Runs on an internal-RAM stack: the caller's may be in PSRAM, and this reads
-// and (on token refresh) writes NVS.
-static void hatch_vm_task(void *arg) {
-    hatch_vm_request_t *req = arg;
+/* The lookup runs on a persistent worker with a PSRAM stack.
+ * Upstream ran it on a fresh internal-RAM-stack task per lookup
+ * (the caller's stack may be PSRAM, and the lookup touches NVS);
+ * awake, though, the internal heap's largest free block sits at
+ * ~7.7 KB — below the 8 KB stack + TCB that create needs — so every
+ * connection attempt died before the lookup even started (the chat
+ * session's resolve lines log the block sizes). Reserving the stack
+ * statically instead was tried and rejected: the +8.4 KB of .bss
+ * starved audio start-up's DMA allocations and the board began
+ * panicking at boot. A PSRAM stack costs the internal heap nothing
+ * but the TCB; the one thing it must never do is write flash
+ * itself, so token stores inside a serve are parked for the
+ * heartbeat to write (see park_token_pair). The worker is created
+ * lazily on the first lookup and never exits; requests are
+ * serialized on s_vm_lock, and callers block until their lookup
+ * completes either way. */
+#define VM_TASK_STACK_BYTES 12288
+static TaskHandle_t s_vm_worker;
+static hatch_vm_request_t *s_vm_pending;
+static StaticSemaphore_t s_vm_lock_buf;
+static SemaphoreHandle_t s_vm_lock;
+
+/* Runs on the worker's PSRAM stack. Reads NVS and runs HTTPS; the
+ * token store on the refresh path parks instead of writing (see
+ * store_token_pair_unlocked). */
+static void hatch_vm_serve(hatch_vm_request_t *req) {
+    s_vm_serve_active = true;
     if (config_is_provisioned() && operation_gate_take(pdMS_TO_TICKS(15000), "Muse VM lookup")) {
         vm_info_t vms[VM_API_MAX_VMS];
         int count = fetch_vms_with_refresh_with_gate_held(vms, VM_API_MAX_VMS);
+        ESP_LOGI(TAG, "vm lookup fetch: %d VMs, free %u, largest %u", count,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         if (count > 0) {
             const vm_info_t *target = NULL;
             if (req->want_vm && req->want_vm[0]) {
@@ -2474,9 +2587,17 @@ static void hatch_vm_task(void *arg) {
         }
         operation_gate_give();
     }
+    s_vm_serve_active = false;
     xTaskNotifyGive(req->waiter);
     stack_monitor_record(NULL);
-    vTaskDelete(NULL);
+}
+
+static void hatch_vm_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        hatch_vm_serve(s_vm_pending);
+    }
 }
 
 bool app_hatch_vm_credentials(const char *want_vm, char *vm_id, size_t id_cap,
@@ -2486,10 +2607,30 @@ bool app_hatch_vm_credentials(const char *want_vm, char *vm_id, size_t id_cap,
         .vm_name = vm_name, .name_cap = name_cap,
         .waiter = xTaskGetCurrentTaskHandle(),
     };
-    if (xTaskCreate(hatch_vm_task, "muse_vm", 8192, &req, 4, NULL) != pdPASS) {
-        return false;
+    /* Log the heap moment for the record: this is the line whose
+     * numbers proved the diagnosis (largest block below the old
+     * per-lookup stack), and it keeps proving the lookup no longer
+     * depends on it. */
+    ESP_LOGI(TAG, "vm lookup: free %u, largest %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (!s_vm_lock) {
+        s_vm_lock = xSemaphoreCreateMutexStatic(&s_vm_lock_buf);
     }
+    xSemaphoreTake(s_vm_lock, portMAX_DELAY);
+    if (!s_vm_worker) {
+        if (xTaskCreateWithCaps(hatch_vm_task, "muse_vm", VM_TASK_STACK_BYTES,
+                                NULL, 4, &s_vm_worker,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            xSemaphoreGive(s_vm_lock);
+            return false;
+        }
+        ESP_LOGI(TAG, "vm lookup worker started (PSRAM stack)");
+    }
+    s_vm_pending = &req;
+    xTaskNotifyGive(s_vm_worker);
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    xSemaphoreGive(s_vm_lock);
     *vm_token = req.vm_token;
     return req.ok;
 }
@@ -3004,6 +3145,12 @@ void app_run(void) {
             reset_setup_from_control("deferred setup reset", SETUP_RESET_FORGET_WIFI);
         } else if (unpair) {
             reset_setup_from_control("deferred unpair", SETUP_RESET_KEEP_WIFI);
+        }
+
+        /* A token pair the VM lookup worker parked (its PSRAM stack
+         * must not write flash) gets its real NVS store here. */
+        if (s_vm_parked_access) {
+            flush_parked_token_pair();
         }
 
 #if CONFIG_MUSE_ENABLED

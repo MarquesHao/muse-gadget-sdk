@@ -76,6 +76,22 @@ static const char *TAG = "muse_frames";
 #define FR_SLEEPY_IDLE_S 180         /* idle this long: the sleepy face */
 #define FR_MAKING_AFTER_S 20.0f      /* thinking this long: a long task */
 
+/* The waking sequence's framing does not match idle's, in size or
+ * in position (measured on the shipped frames): the figure's width
+ * at face height is 239 of 466 px in waking vs 282 in idle, and the
+ * brightness centroid of waking's handoff frames (f000/f055, same
+ * pose) sits at (239,261) against idle f000's (239,278) — 17 px too
+ * high — so at 1:1 the waking->idle handoff shrinks, grows and
+ * drops all at once. Zoom waking — and only waking — by 1.18x
+ * about the pivot that maps its handoff centroid exactly onto
+ * idle's: pivot = (target - f * centroid) / (1 - f) = (239,167)
+ * for f = 302/256. Idle itself, the stills and the kits stay at
+ * 256 (1:1) with their existing placement; waking's own
+ * mid-animation motion remains, now playing around idle's anchor. */
+#define FR_WAKING_ZOOM 302           /* LVGL scale units, 256 = 1:1 */
+#define FR_PIVOT_X 239
+#define FR_PIVOT_Y 167
+
 /* Visuals the resolver can ask for. */
 typedef enum {
     V_NONE = 0,   /* pixel face (widget hidden) */
@@ -141,6 +157,16 @@ static int s_front;
 static uint8_t *s_file;      /* PSRAM scratch: one asset file, whole */
 static jpeg_dec_handle_t s_jdec;
 static bool s_broken[V_COUNT];   /* asset failed once: pixel face for it */
+
+/* muse_frames_hold(): the requester sets s_hold_req; the player
+ * acknowledges in s_hold_ack once it has closed the decoder and
+ * stopped decoding. s_player_alive/done let a hold on a build whose
+ * player never started (or gave up on the library) succeed at once —
+ * nothing is decoding then, which is all the requester needs. */
+static volatile bool s_hold_req;
+static volatile bool s_hold_ack;
+static volatile bool s_player_alive;
+static volatile bool s_player_done;
 
 /* Decode timing, for the acceptance log line. */
 static uint32_t s_dec_n, s_dec_total_ms, s_dec_max_ms, s_dec_skipped;
@@ -421,11 +447,22 @@ static bool build_kit(const char *name, uint16_t *out)
 
 /* ---- display (always under the board's display lock) ---- */
 
+/* The visual the next swap_buffers() puts up; only waking is shown
+ * zoomed (see FR_WAKING_ZOOM). Set by every path that swaps. */
+static visual_t s_swap_vis = V_NONE;
+
+/* Display lock held by the caller (the show_* paths take it). */
+static void apply_zoom(visual_t v)
+{
+    lv_image_set_scale(s_img, v == V_WAKING ? FR_WAKING_ZOOM : 256);
+}
+
 static void show_front(void)
 {
     muse_board->display_lock(-1);
     s_dsc.data = (const uint8_t *)s_buf[s_front];
     lv_image_set_src(s_img, &s_dsc);
+    apply_zoom(s_swap_vis);
     lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(s_img);
@@ -443,6 +480,7 @@ static void show_still(void)
 {
     muse_board->display_lock(-1);
     lv_image_set_src(s_img, &s_still_dsc);
+    apply_zoom(V_STILL);
     lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(s_img);
@@ -588,6 +626,7 @@ static bool enter_still(visual_t v)
         ESP_LOGW(TAG, "%s: asset unusable, fallback face for this state", VIS_NAMES[v]);
         return false;
     }
+    s_swap_vis = v;
     swap_buffers();
     return true;
 }
@@ -627,6 +666,7 @@ static int mouth_for_level(float level)
 static void player_task(void *arg)
 {
     (void)arg;
+    s_player_alive = true;
     int64_t born = esp_timer_get_time();
 
     /* Mount once boot has settled (see the file header). A partition
@@ -637,6 +677,14 @@ static void player_task(void *arg)
     int tries = 0;   /* real mount attempts only — the gate waits below
                       * must not eat the retry budget */
     while (!mounted && !hopeless) {
+        if (s_hold_req) {
+            /* Asked to be quiet before the library is even up: there
+             * is nothing to release yet — just don't mount (mounting
+             * allocates) until the requester is done. */
+            s_hold_ack = true;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
         int64_t now = esp_timer_get_time();
         bool gate = (muse_state_mode(NULL) != MUSE_MODE_BOOT && now - born >= FR_BOOT_DELAY_US)
                     || now - born >= FR_BOOT_ANYWAY_US;
@@ -666,6 +714,7 @@ static void player_task(void *arg)
         }
     }
     if (!mounted) {
+        s_player_done = true;
         vTaskSuspend(NULL);   /* nothing to do this boot */
     }
     ESP_LOGI(TAG, "library up: free internal %u, largest %u, free psram %u",
@@ -683,6 +732,28 @@ static void player_task(void *arg)
     float level_lp = 0;
 
     for (;;) {
+        if (s_hold_req) {
+            if (!s_hold_ack) {
+                /* Go quiet: drop the JPEG decoder (its scratch is
+                 * internal RAM) and decode nothing until released.
+                 * The frame on screen stays up. */
+                if (s_jdec) {
+                    jpeg_dec_close(s_jdec);
+                    s_jdec = NULL;
+                }
+                s_hold_ack = true;
+                ESP_LOGI(TAG, "held: free %u, largest %u",
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            }
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
+        }
+        if (s_hold_ack) {
+            s_hold_ack = false;
+            deadline = 0;   /* resume the schedule from now: no catch-up skip */
+            ESP_LOGI(TAG, "resumed");
+        }
         visual_t want = resolve_target();
         /* The waking sequence gets the first calm moment after the
          * mount, even though the boot mode is long past by then; an
@@ -731,6 +802,7 @@ static void player_task(void *arg)
                 seq_ready = false;
                 ok = enter_seq_frame(want, 0, back_buffer());
                 if (ok) {
+                    s_swap_vis = want;
                     swap_buffers();
                     deadline = esp_timer_get_time() + FR_PERIOD_US;
                 }
@@ -741,6 +813,7 @@ static void player_task(void *arg)
                 if (!ok) {
                     s_broken[want] = true;
                 } else {
+                    s_swap_vis = want;
                     swap_buffers();
                     mouth_since = esp_timer_get_time();
                 }
@@ -783,6 +856,7 @@ static void player_task(void *arg)
                 continue;
             }
             if (now >= deadline && seq_ready) {
+                s_swap_vis = cur;
                 swap_buffers();
                 seq_idx = seq_next;
                 seq_ready = false;
@@ -832,6 +906,7 @@ static void player_task(void *arg)
             if (m != mouth && now - mouth_since >= 90000) {
                 s_dec_what = "speaking";
                 if (decode_jpeg_file(MOUTH_FILES[m], back_buffer())) {
+                    s_swap_vis = V_SPEAKING;
                     swap_buffers();
                     mouth = m;
                     mouth_since = now;
@@ -854,6 +929,7 @@ void muse_frames_attach(lv_obj_t *face)
     s_img = lv_image_create(face);
     lv_obj_set_size(s_img, FR_W, FR_H);
     lv_obj_align(s_img, LV_ALIGN_CENTER, 0, muse_board->minimal_face ? FR_FACE_DY : 0);
+    lv_image_set_pivot(s_img, FR_PIVOT_X, FR_PIVOT_Y);   /* for the waking zoom */
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_img, LV_OBJ_FLAG_HIDDEN);
@@ -925,4 +1001,24 @@ void muse_frames_attach(lv_obj_t *face)
 bool muse_frames_boot_still_up(void)
 {
     return s_still_up;
+}
+
+bool muse_frames_hold(bool on)
+{
+    if (!on) {
+        s_hold_req = false;
+        return true;
+    }
+    if (!s_player_alive || s_player_done) {
+        return true;   /* nothing is decoding: already quiet */
+    }
+    s_hold_req = true;
+    for (int waited = 0; waited < 2000; waited += 25) {
+        if (s_hold_ack) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    ESP_LOGW(TAG, "hold not acknowledged in 2 s; caller proceeds anyway");
+    return false;
 }

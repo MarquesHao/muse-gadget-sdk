@@ -270,7 +270,17 @@ void vm_device_tokens_free(vm_device_tokens_t *tokens) {
 
 #include "app_defines.inc"
 
+// The parked token pair lives in PSRAM on the device; on the host a
+// plain allocation stands in for it.
+#define MALLOC_CAP_8BIT (1 << 2)
+#define MALLOC_CAP_SPIRAM (1 << 10)
+static void *heap_caps_malloc(size_t size, int caps) { (void)caps; return malloc(size); }
+static void heap_caps_free(void *p) { free(p); }
+
 static SemaphoreHandle_t s_auth_lock = NULL;
+static volatile bool s_vm_serve_active = false;
+static char *s_vm_parked_access = NULL;
+static char *s_vm_parked_refresh = NULL;
 static int64_t s_last_vm_auth_refresh_attempt_us = 0;
 static int64_t s_last_vm_auth_refusal_us = 0;
 static int64_t s_last_link_session_retry_us = 0;

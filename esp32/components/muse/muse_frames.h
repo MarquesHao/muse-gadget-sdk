@@ -53,6 +53,20 @@ void muse_frames_attach(lv_obj_t *face);
  */
 bool muse_frames_boot_still_up(void);
 
+/*
+ * Ask the player to go quiet for a few seconds: finish the frame it
+ * is on, close the JPEG decoder (its scratch lives in internal RAM)
+ * and decode nothing until released with muse_frames_hold(false).
+ * The chat session holds the player this way while it resolves the
+ * VM — that lookup spawns a task with an 8 KB internal-RAM stack and
+ * runs HTTPS, and the awake heap's largest free block is usually
+ * smaller than the stack. Returns true once the player has
+ * acknowledged (or is not running at all); false if it did not
+ * acknowledge within 2 s, in which case the caller proceeds anyway.
+ * The frame on screen simply stays up while held.
+ */
+bool muse_frames_hold(bool on);
+
 #ifdef __cplusplus
 }
 #endif
