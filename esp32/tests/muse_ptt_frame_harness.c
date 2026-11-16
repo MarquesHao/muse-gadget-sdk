@@ -44,6 +44,9 @@ static void quick_hide(void) {}
 static void boot_hint_tick(muse_mode_t m, float now) { (void)m; (void)now; }
 static bool muse_menu_tick(float now) { (void)now; return false; }
 static int lv_obj_get_scroll_x(void *obj) { (void)obj; return 0; }
+/* The harness's screen sits settled on the face tile, whose scroll
+ * offset here is 0 -- the same 0 lv_obj_get_scroll_x reports. */
+static int face_scroll_x(void) { return 0; }
 static void invalidate_muse(void) {}
 static void update_status(muse_mode_t m,float now) { (void)now; assert(m==mode); }
 static void update_control_hints(muse_mode_t m) { assert(m==mode); }   /* StopWatch rim icons */

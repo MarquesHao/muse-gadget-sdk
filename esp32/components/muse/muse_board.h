@@ -101,8 +101,9 @@ typedef struct {
     bool rim_controls;
     /* Minimal face chrome (project P8 follow-up, the owner's 1.75C): no
      * corner button icons (speaker circle, mic and power hints) — modes are
-     * switched from the tap-face quick panel; the battery percentage text
-     * becomes an arc along the top edge, and the state text becomes a small
+     * switched from the quick settings tile (swipe right from the face);
+     * the battery percentage text becomes an arc along the top edge, and
+     * the state text becomes a small
      * status dot beside the Wi-Fi icon. Other boards keep the full chrome. */
     bool minimal_face;
     /* The menu turns a right-edge aux button's hint on end, which LVGL draws

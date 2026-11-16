@@ -26,8 +26,10 @@ over Wi-Fi.
 ## Modes
 
 The owner picks one mode and it stays until changed: in Settings, on the
-Sound page, or by tapping the face while it is idle, which opens a quick
-panel with the same three mode rows and the volume slider.
+Sound page, or by swiping right on the face, which opens a quick settings
+page with the same three mode rows and the volume slider. Swiping left on
+the face opens Settings. Tapping the face only makes Muse happy; it opens
+nothing.
 
 - Voice call: tapping the top button starts or ends a live call; holding it
   records a voice note that is sent on release. Replies are spoken aloud and
@@ -44,8 +46,8 @@ panel with the same three mode rows and the volume slider.
 
 ## Volume and the face
 
-Speaker volume is set on the gadget itself, in the quick panel or on the
-Sound page; if the owner says replies are too quiet or too loud, point them
-there. The face mirrors the conversation with its usual expressions, yawns
+Speaker volume is set on the gadget itself, on the quick settings page
+(swipe right on the face) or on the Sound page; if the owner says replies
+are too quiet or too loud, point them there. The face mirrors the conversation with its usual expressions, yawns
 when left alone for a while, and sleeps flat with the red recording dot
 while a meeting is being recorded.

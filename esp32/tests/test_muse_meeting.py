@@ -58,8 +58,8 @@ OVERLAY = (ROOT / "devices/sdkconfig.muse-gadget-v1").read_text()
 # pinning its exact bytes makes any accidental guide drift a test
 # failure instead of a silent firmware change. An intentional guide
 # edit updates these two constants in the same commit.
-GUIDE_ASSEMBLED_BYTES = 1856
-GUIDE_ASSEMBLED_SHA256 = "10657d4a0699ac7bb255fa7b1ca8e37fcdfbd0458df5f57cc7dc1447614aac46"
+GUIDE_ASSEMBLED_BYTES = 1989
+GUIDE_ASSEMBLED_SHA256 = "085250811e237e4f350da57db557cdd82d641c7df4e73a0d11a2046425d30519"
 
 
 def segment(source: str, start: str, end: str) -> str:
@@ -525,7 +525,7 @@ class DeviceGuideAssemblyTest(unittest.TestCase):
             self.assertNotIn("<!--", text)  # license comment stripped
             for phrase in ("two buttons", "Voice call", "Text replies", "Meeting",
                            "starts recording the room at once", "stored only on the gadget",
-                           "nothing is uploaded", "quick\npanel", "volume"):
+                           "nothing is uploaded", "quick settings", "swiping right", "volume"):
                 self.assertIn(phrase, text)
 
     def test_default_guide_still_assembles(self):

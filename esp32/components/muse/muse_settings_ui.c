@@ -158,9 +158,9 @@ LV_FONT_DECLARE(muse_font_cjk_16)
 #else
 #define TR(en, zh) (en)
 #endif
-/* The mode names below are the Sound page's copy of the quick panel's
- * QUICK_MODE_NAMES in muse_ui.c: keep the two lists in sync, in enum
- * order, in both languages. */
+/* The mode names below are the Sound page's copy of the quick settings
+ * tile's QUICK_MODE_NAMES in muse_ui.c: keep the two lists in sync, in
+ * enum order, in both languages. */
 static const char *const GADGET_MODE_NAMES_EN[] = { "Voice call", "Text replies", "Meeting" };
 #if CONFIG_MUSE_CJK_FONT
 static const char *const GADGET_MODE_NAMES_ZH[] = { "语音通话", "文字回复", "会议录音" };

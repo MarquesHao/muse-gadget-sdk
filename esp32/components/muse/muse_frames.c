@@ -97,6 +97,28 @@ static const char *TAG = "muse_frames";
  * with no step at the first swap. */
 #define FR_WAKING_DY 15
 
+/* Core the player task is pinned to. Decoding a 466x466 frame takes
+ * ~100 ms of wall time (P8 acceptance log), and the measured time is
+ * wall time, so whatever shares the core inflates it directly: on
+ * the UI core the player sat under the LVGL task (priority 5) plus
+ * the voice and audio work, and every frame flush preempted the
+ * decode mid-frame. Core 0 is the network core — its tasks are
+ * mostly blocked while a sequence plays, and the ones that do wake
+ * (Wi-Fi, lwIP) run above the player's priority 3, so they preempt
+ * the decode instead of being delayed by it. This mirrors the video
+ * pipeline, whose decoder also runs on core 0 for the same reason
+ * (muse_video.c's DECODE_CORE). On a unicore build core 0 is the
+ * only core, so nothing changes there. The player's stack stays in
+ * PSRAM (MUSE_BIG_CAPS): internal RAM is the scarce resource the
+ * VM lookup already starved on once, and a permanent internal stack
+ * would shrink its largest block for the whole boot — the video
+ * decoder can afford an internal stack only because it is transient.
+ * Whether the move actually pays is a device question: the decode
+ * stats line (dec_stats_note) is the A/B instrument, and the player
+ * logs its core at start so a capture shows which side of the A/B
+ * it came from. */
+#define FR_PLAYER_CORE 0
+
 /* Visuals the resolver can ask for. */
 typedef enum {
     V_NONE = 0,   /* pixel face (widget hidden) */
@@ -727,6 +749,7 @@ static void player_task(void *arg)
 {
     (void)arg;
     s_player_alive = true;
+    ESP_LOGI(TAG, "player running on core %d", xPortGetCoreID());
     int64_t born = esp_timer_get_time();
 
     /* Mount once boot has settled (see the file header). A partition
@@ -1058,10 +1081,12 @@ void muse_frames_attach(lv_obj_t *face)
      * writes flash itself (wear-levelling reads can still coincide
      * with the meeting writer's cache-off windows; while a recording
      * runs the player sits on the rest still and stays off the disk).
-     * Core and priority sit below the UI task on its own core, so a
-     * decode burst never delays the UI's own rendering. */
+     * Pinned to FR_PLAYER_CORE (see its comment): the decode runs on
+     * the network core, not the UI core, so a decode burst and the
+     * UI's own rendering no longer preempt each other. Priority 3
+     * stays below the network tasks on that core. */
     if (xTaskCreatePinnedToCoreWithCaps(player_task, "muse_frames", 8192, NULL, 3, NULL,
-                                        MUSE_UI_CORE, MUSE_BIG_CAPS) != pdPASS) {
+                                        FR_PLAYER_CORE, MUSE_BIG_CAPS) != pdPASS) {
         ESP_LOGW(TAG, "player task unavailable: no library face");
     }
 }

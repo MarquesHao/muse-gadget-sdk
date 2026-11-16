@@ -117,18 +117,18 @@ static bool s_note_listening;   /* a toggled note is recording: keep its face up
 static volatile bool s_face_active = true;
 static lv_obj_t *s_face;
 
-/* Quick panel (project V1.1, P1): tapping Muse while idle (and not
- * recording a meeting) opens a small card on the top layer with the
- * three-mode switch and the volume slider — the same controls as the
- * Sound settings page, without swiping there.
- * A tap anywhere outside the card closes it. */
-static lv_obj_t *s_quick, *s_quick_catch;
-static lv_obj_t *s_quick_checks[MUSE_GADGET_MODE_COUNT], *s_quick_vol_val, *s_quick_vol_sl;
-static bool s_quick_open;
-static bool s_quick_syncing;   /* quick_refresh is setting the slider itself */
-static int s_quick_shown_mode = -1, s_quick_shown_vol = -1;   /* what the card last painted */
+/* Quick settings tile (project tweak, 2026-11-16): swiping right from
+ * the face lands on a small page with the three-mode switch and the
+ * volume slider — the same controls as the Sound settings page. It used
+ * to be a card that popped up when the face was tapped (V1.1 P1); Hugh
+ * found the popup in the way, so the tap now only makes Muse happy and
+ * the controls live on their own tile, left of the face. */
+static lv_obj_t *s_quick_tile;
+static lv_obj_t *s_qset_checks[MUSE_GADGET_MODE_COUNT], *s_qset_vol_val, *s_qset_vol_sl;
+static bool s_qset_syncing;   /* quickset_refresh is setting the slider itself */
+static int s_qset_shown_mode = -1, s_qset_shown_vol = -1;   /* what the tile last painted */
 /* Keep these names in sync with GADGET_MODE_NAMES in muse_settings_ui.c:
- * the quick panel and the Sound page each carry a copy, in enum order. */
+ * the quick settings tile and the Sound page each carry a copy, in enum order. */
 /* The screen's language at run time (project V1.1 fix2): Chinese only
  * where a font can draw it, which in this file means a CJK build. */
 static bool ui_lang_zh(void)
@@ -159,10 +159,20 @@ static const char *quick_mode_name(int i)
 }
 _Static_assert(MUSE_GADGET_MODE_COUNT == 3, "QUICK_MODE_NAMES names every gadget mode");
 
+/* The tileview scroll offset with the face tile settled on screen. The
+ * face is the middle tile (quick settings to its left, settings to its
+ * right), so a settled face reads one tile width, not zero; the checks
+ * that used to compare against 0 go through here. The tile's own x is
+ * read rather than assuming a width, so it stays right on any screen. */
+static int face_scroll_x(void)
+{
+    return s_face ? lv_obj_get_x(s_face) : 0;
+}
+
 static void update_tileview_swipe(void)
 {
     if (!s_tv) return;
-    bool enabled = s_swipe_enabled && !s_touch_talk_down && !s_quick_open;
+    bool enabled = s_swipe_enabled && !s_touch_talk_down;
 #if CONFIG_MUSE_VOICE_NOTE_TOGGLE
     enabled = enabled && !s_note_listening;
 #endif
@@ -210,7 +220,7 @@ bool muse_ui_face_active(void)
     return s_face_active;
 }
 static lv_obj_t *s_settings;
-static lv_obj_t *s_dots[2];
+static lv_obj_t *s_dots[3];
 static lv_obj_t *s_wifi_icon;
 static lv_obj_t *s_ble_icon;
 static lv_obj_t *s_cover;
@@ -267,6 +277,7 @@ static lv_obj_t *s_boot_hint;
 static int s_boot_hint_stage;
 static float s_boot_hint_until;
 static lv_obj_t *s_caption_lbl;
+static lv_obj_t *s_dialog;   /* minimal face only: the game-style box the caption sits in */
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
 static lv_obj_t *s_review_position;
@@ -628,7 +639,7 @@ static void on_touch_mic(lv_event_t *e)
 /* Icons beside the physical buttons, in place of an instruction caption. */
 static void build_button_icons(lv_obj_t *face)
 {
-    if (muse_board->minimal_face) return;   /* no corner icons: the quick panel is the way in */
+    if (muse_board->minimal_face) return;   /* no corner icons: the quick settings tile is the way in */
     if (muse_board->rim_controls) return;   /* dedicated rim hints below */
     const muse_button_hint_t *t = &muse_board->talk_hint, *a = &muse_board->aux_hint;
     s_mic_icon = make_mic(face, s_tall ? 24 : s_small ? 12 : 26);
@@ -653,119 +664,81 @@ static void build_button_icons(lv_obj_t *face)
     lv_obj_align(s_aux_icon, a->align, a->x, a->y);
 }
 
-static void quick_refresh(void)
+/* Keep the tile's rows honest while it sits next to the face: the mode
+ * can also change on the Sound page, and the volume with it. Driven from
+ * the same 250 ms chrome tick that refreshes the settings pages; the
+ * shown-value cache keeps it a no-op when nothing moved. */
+static void quickset_refresh(void)
 {
-    if (!s_quick) return;
+    if (!s_qset_vol_sl) return;
     int gm = muse_settings_gadget_mode();
-    if (gm != s_quick_shown_mode) {
-        s_quick_shown_mode = gm;
+    if (gm != s_qset_shown_mode) {
+        s_qset_shown_mode = gm;
         for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
-            if (s_quick_checks[i]) {
-                lv_label_set_text(s_quick_checks[i], i == gm ? LV_SYMBOL_OK : "");
+            if (s_qset_checks[i]) {
+                lv_label_set_text(s_qset_checks[i], i == gm ? LV_SYMBOL_OK : "");
             }
         }
     }
     /* The slider follows the setting (it can change on the Sound page too),
      * except while it is being dragged. */
-    if (s_quick_vol_sl && !lv_obj_has_state(s_quick_vol_sl, LV_STATE_PRESSED)) {
+    if (!lv_obj_has_state(s_qset_vol_sl, LV_STATE_PRESSED)) {
         int v = muse_settings_volume();
-        if (v != s_quick_shown_vol) {
-            s_quick_shown_vol = v;
-            s_quick_syncing = true;   /* a programmatic set must not re-enter on_quick_volume */
-            lv_slider_set_value(s_quick_vol_sl, v, LV_ANIM_OFF);
-            s_quick_syncing = false;
-            if (s_quick_vol_val) {
+        if (v != s_qset_shown_vol) {
+            s_qset_shown_vol = v;
+            s_qset_syncing = true;   /* a programmatic set must not re-enter on_quickset_volume */
+            lv_slider_set_value(s_qset_vol_sl, v, LV_ANIM_OFF);
+            s_qset_syncing = false;
+            if (s_qset_vol_val) {
                 char buf[8];
                 snprintf(buf, sizeof(buf), "%d", v);
-                lv_label_set_text(s_quick_vol_val, buf);
+                lv_label_set_text(s_qset_vol_val, buf);
             }
         }
     }
 }
 
-static void quick_hide(void)
-{
-    if (!s_quick_open) return;
-    s_quick_open = false;
-    lv_obj_add_flag(s_quick_catch, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_quick, LV_OBJ_FLAG_HIDDEN);
-    update_tileview_swipe();
-}
-
-static void quick_show(void)
-{
-    if (!s_quick || s_quick_open) return;
-    s_quick_shown_mode = s_quick_shown_vol = -1;   /* repaint on open */
-    quick_refresh();
-    /* No move_foreground: build order on the top layer (pairing card, then
-     * catcher, then this card, then the sleep cover) already stacks them
-     * right, and the cover must stay above the card. */
-    lv_obj_remove_flag(s_quick_catch, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_quick, LV_OBJ_FLAG_HIDDEN);
-    s_quick_open = true;
-    update_tileview_swipe();
-}
-
-/* Per frame: the panel lives only while the face shows, idle. Anything
- * else (a press starting a note, a call, sleep) takes it away. */
-static void quick_tick(void)
-{
-    if (!s_quick_open) return;
-    if (!s_face_active || muse_state_mode(NULL) != MUSE_MODE_IDLE || muse_state_recording()) {
-        quick_hide();
-        return;
-    }
-    quick_refresh();
-}
-
-static void on_quick_mode(lv_event_t *e)
+static void on_quickset_mode(lv_event_t *e)
 {
     int mode = (int)(intptr_t)lv_event_get_user_data(e);
     muse_settings_set_gadget_mode(mode);
-    quick_refresh();
-    if (mode == MUSE_GADGET_MODE_MEETING) {
-        quick_hide();   /* recording starts at once: show its face, not the card */
+    quickset_refresh();
+    if (mode == MUSE_GADGET_MODE_MEETING && s_tv) {
+        /* Recording starts at once: go back to the face that shows it
+         * (the retired tap-face card hid itself for the same reason). */
+        lv_tileview_set_tile(s_tv, s_face, LV_ANIM_ON);
     }
 }
 
-static void on_quick_volume(lv_event_t *e)
+static void on_quickset_volume(lv_event_t *e)
 {
-    if (s_quick_syncing) return;
+    if (s_qset_syncing) return;
     /* Dragging fires this per pixel: apply the level now, but persist it
-     * once, on release (on_quick_volume_done) — muse_settings_set_volume
+     * once, on release (on_quickset_volume_done) — muse_settings_set_volume
      * writes NVS on every call. */
     int v = lv_slider_get_value(lv_event_get_target(e));
     muse_audio_set_volume(v);
-    if (s_quick_vol_val) {
+    if (s_qset_vol_val) {
         char buf[8];
         snprintf(buf, sizeof(buf), "%d", v);
-        lv_label_set_text(s_quick_vol_val, buf);
+        lv_label_set_text(s_qset_vol_val, buf);
     }
 }
 
-static void on_quick_volume_done(lv_event_t *e)
+static void on_quickset_volume_done(lv_event_t *e)
 {
     int v = lv_slider_get_value(lv_event_get_target(e));
     muse_settings_set_volume(v);
-    s_quick_shown_vol = v;
-}
-
-static void on_quick_catch(lv_event_t *e)
-{
-    (void)e;
-    quick_hide();
+    s_qset_shown_vol = v;
 }
 
 static void on_canvas_clicked(lv_event_t *e)
 {
     (void)e;
+    /* A tap on Muse is only a pat now: the happy face. The mode/volume
+     * card that used to pop up here moved to the quick settings tile
+     * (swipe right) — Hugh found the popup in the way. */
     muse_state_make_happy();
-    /* Same gate quick_tick() enforces every frame: without the recording
-     * check the card would open over a meeting recording and be hidden
-     * again on the next frame. */
-    if (s_face_active && muse_state_mode(NULL) == MUSE_MODE_IDLE && !muse_state_recording()) {
-        quick_show();
-    }
 }
 
 static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compact)
@@ -820,7 +793,7 @@ static const lv_font_t *caption_font(void)
 }
 
 /* A copy of a UI font whose fallback is the CJK font, so the labels this
- * project shows in Chinese (gadget-mode names, the quick panel) render
+ * project shows in Chinese (gadget-mode names, the quick settings tile) render
  * their hanzi instead of boxes. Same trick as caption_font(): LVGL's
  * fonts are shared const objects, so the copies live in a small static
  * table keyed by the base font. Without CONFIG_MUSE_CJK_FONT this is
@@ -829,8 +802,8 @@ static const lv_font_t *ui_font_cjk(const lv_font_t *base)
 {
 #if CONFIG_MUSE_CJK_FONT
     /* Distinct bases in use: exactly two call patterns — the quick
-     * panel's title/name font and its 14 px labels, each passed through
-     * muse_lang_montserrat() — so at most two entries on any one board
+     * settings tile's title/name font and its 14 px labels, each passed
+     * through muse_lang_montserrat() — so at most two entries on any one board
      * (font_pick's compact alternative is fixed per board). Six slots
      * leave a wide margin, and a full table only loses the CJK fallback
      * for that label, with the log below saying so. */
@@ -1466,6 +1439,77 @@ static void apply_text_size(void)
 }
 #endif
 
+/* The quick settings tile's contents: the retired tap-face card's
+ * controls on their own page — the three gadget modes, the volume
+ * slider and (on the minimal-face board) the top-key hint. Rows speak
+ * the settings pages' language: dark cards, radius 12. The column
+ * starts below the fixed chrome (battery arc and status row) that the
+ * minimal-face board keeps on the screen over every tile. */
+static void build_quick_tile(lv_obj_t *tile)
+{
+    lv_obj_t *col = lv_obj_create(tile);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, s_small ? s_w - 16 : 400, LV_SIZE_CONTENT);
+    lv_obj_align(col, LV_ALIGN_TOP_MID, 0, muse_board->minimal_face ? 84 : 48);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(col, 10, 0);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = make_label(col, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
+    lv_label_set_text(title, ui_lang_zh() ? "快速设置" : "Quick settings");
+
+    for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
+        lv_obj_t *row = lv_obj_create(col);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, lv_pct(100), 48);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(row, 12, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_hor(row, 14, 0);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, on_quickset_mode, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        s_qset_checks[i] = make_label(row, &lv_font_montserrat_20, COLOR_ACCENT);
+        lv_obj_set_width(s_qset_checks[i], 26);
+        lv_obj_t *name = make_label(row, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
+        lv_label_set_text(name, quick_mode_name(i));
+    }
+
+    lv_obj_t *vol_row = lv_obj_create(col);
+    lv_obj_remove_style_all(vol_row);
+    lv_obj_set_size(vol_row, lv_pct(100), 48);
+    lv_obj_set_style_bg_color(vol_row, lv_color_hex(0x1c1c1e), 0);
+    lv_obj_set_style_bg_opa(vol_row, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(vol_row, 12, 0);
+    lv_obj_set_flex_flow(vol_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(vol_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_hor(vol_row, 14, 0);
+    lv_obj_set_style_pad_column(vol_row, 10, 0);
+    lv_obj_t *vol_name = make_label(vol_row, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
+    lv_label_set_text(vol_name, ui_lang_zh() ? "音量" : "Volume");
+    s_qset_vol_sl = lv_slider_create(vol_row);
+    lv_slider_set_range(s_qset_vol_sl, 0, 100);
+    lv_slider_set_value(s_qset_vol_sl, muse_settings_volume(), LV_ANIM_OFF);
+    lv_obj_set_flex_grow(s_qset_vol_sl, 1);
+    lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_PRESS_LOST, NULL);
+    s_qset_vol_val = make_label(vol_row, muse_lang_montserrat(&lv_font_montserrat_14), COLOR_LIT);
+    lv_obj_set_width(s_qset_vol_val, 30);
+
+    if (muse_board->minimal_face) {
+        lv_obj_t *keys = make_label(col, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
+        lv_label_set_text(keys, ui_lang_zh() ? "顶键：按住说话 · 轻点通话"
+                                            : "Top key: hold to talk · tap to call");
+    }
+
+    s_qset_shown_mode = s_qset_shown_vol = -1;   /* first refresh paints the checks and the value */
+    quickset_refresh();
+}
+
 static void build_screen(void)
 {
 #if CONFIG_MUSE_LATIN_FONT
@@ -1478,12 +1522,24 @@ static void build_screen(void)
 
     lv_obj_t *face = scr;
     if (muse_board->touch) {
-        /* Swipe left from Muse for settings. */
+        /* Swipe right from Muse for quick settings, left for settings:
+         * the face is the middle tile and the screen starts on it. */
         s_tv = lv_tileview_create(scr);
         lv_obj_set_style_bg_color(s_tv, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_tv, LV_OPA_COVER, 0);
         lv_obj_set_scrollbar_mode(s_tv, LV_SCROLLBAR_MODE_OFF);
-        s_face = lv_tileview_add_tile(s_tv, 0, 0, LV_DIR_RIGHT);
+        s_quick_tile = lv_tileview_add_tile(s_tv, 0, 0, LV_DIR_RIGHT);
+        lv_obj_set_scrollbar_mode(s_quick_tile, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_style_bg_color(s_quick_tile, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_quick_tile, LV_OPA_COVER, 0);
+        if (!s_small) {
+            /* The tile's content always fits a full-size screen, so like
+             * the minimal face tile below it must not hand a vertical
+             * drag a scroll range to settle displaced in; small screens
+             * keep the scroll for their taller stack. */
+            lv_obj_remove_flag(s_quick_tile, LV_OBJ_FLAG_SCROLLABLE);
+        }
+        s_face = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
         /* It never scrolls, but LVGL would size its scrollbars from all its
          * children every time it draws any part of it. */
         lv_obj_set_scrollbar_mode(s_face, LV_SCROLLBAR_MODE_OFF);
@@ -1504,9 +1560,11 @@ static void build_screen(void)
          * shows as a different-coloured square around the character. */
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
-        s_settings = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT);
+        s_settings = lv_tileview_add_tile(s_tv, 2, 0, LV_DIR_LEFT);
+        lv_tileview_set_tile(s_tv, s_face, LV_ANIM_OFF);   /* the face is home */
         lv_obj_add_event_cb(s_tv, tile_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
         face = s_face;
+        build_quick_tile(s_quick_tile);
     }
 
     if (!s_small && muse_board->no_ring) {
@@ -1523,8 +1581,8 @@ static void build_screen(void)
          * tileview, so it stays put over both tiles while they slide
          * under it — the settings page gets the same ring the face has,
          * unmoving. The battery arc and the status row below join it
-         * there. The popups (quick panel, pairing card) live on the top
-         * layer, above the screen, so they still cover the chrome. */
+         * there. The pairing card lives on the top layer, above the
+         * screen, so it still covers the chrome. */
         int d = (s_w < s_h ? s_w : s_h) - 8;
         s_ring = lv_arc_create(muse_board->minimal_face && s_tv ? scr : face);
         lv_obj_set_size(s_ring, d, d);
@@ -1772,11 +1830,49 @@ static void build_screen(void)
         lv_obj_align(s_bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
         return;
     }
+    if (muse_board->minimal_face) {
+        /* Game-style dialog box (Hugh's ask, 2026-11-16): the caption
+         * gets a dark translucent box with a light frame in the bottom
+         * quarter of the screen, RPG-dialog style, instead of floating
+         * over the face where it was hard to read. The caption label
+         * moves inside it below; its text, font and paging are
+         * untouched — only the container changes. The box follows the
+         * caption's lifecycle in the UI tick: up while a caption shows,
+         * gone with it, so the face is clear the rest of the time (to
+         * make it permanent instead, drop the tick's hide below). The
+         * speaking mouth frames end around y 325 on screen (measured on
+         * the kit's talk frames), so a top edge at 350 leaves the mouth
+         * uncovered; the caption rides at the box's top, clear of the
+         * round glass's narrowing bottom. Created here, after the
+         * caption label, so it stacks over the face art and under the
+         * meter and answer label built later. */
+        s_dialog = lv_obj_create(face);
+        lv_obj_remove_style_all(s_dialog);
+        lv_obj_set_size(s_dialog, 384, 108);
+        lv_obj_align(s_dialog, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_set_style_bg_color(s_dialog, lv_color_hex(0x0d0d17), 0);
+        lv_obj_set_style_bg_opa(s_dialog, LV_OPA_80, 0);
+        lv_obj_set_style_border_color(s_dialog, lv_color_hex(0xe8e4ff), 0);
+        lv_obj_set_style_border_width(s_dialog, 2, 0);
+        lv_obj_set_style_outline_color(s_dialog, lv_color_hex(0xe8e4ff), 0);
+        lv_obj_set_style_outline_width(s_dialog, 1, 0);
+        lv_obj_set_style_outline_pad(s_dialog, 3, 0);
+        lv_obj_set_style_outline_opa(s_dialog, LV_OPA_50, 0);
+        lv_obj_set_style_radius(s_dialog, 10, 0);
+        lv_obj_remove_flag(s_dialog, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(s_dialog, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(s_dialog, LV_OBJ_FLAG_HIDDEN);
+    }
     /* Fixed height: a longer caption ends in dots rather than growing into the ring. */
     lv_obj_set_size(s_caption_lbl, CAPTION_W, cap_h);
     lv_obj_set_style_text_line_space(s_caption_lbl, CAPTION_LINE_SPACE, 0);
     lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_align(s_caption_lbl, LV_ALIGN_CENTER, 0, cap_top + cap_h / 2);
+    if (s_dialog) {
+        /* Into the box: same size, riding at its top. */
+        lv_obj_set_parent(s_caption_lbl, s_dialog);
+        lv_obj_align(s_caption_lbl, LV_ALIGN_TOP_MID, 0, 12);
+    }
 
     /* Chunky level meter. */
     int span = METER_SEGS * (METER_SEG_PX + METER_GAP_PX) - METER_GAP_PX;
@@ -1918,8 +2014,8 @@ static void build_overlays(void)
 {
     lv_obj_t *scr = lv_screen_active();
 
-    /* Page dots. */
-    for (int i = 0; i < 2 && s_tv; i++) {
+    /* Page dots: quick settings, face, settings. */
+    for (int i = 0; i < 3 && s_tv; i++) {
         lv_obj_t *d = lv_obj_create(scr);
         lv_obj_remove_style_all(d);
         lv_obj_set_size(d, 8, 8);
@@ -1927,7 +2023,7 @@ static void build_overlays(void)
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_DOT_OFF), 0);
         lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, i ? 8 : -8, -14);
+        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (i - 1) * 16, -14);
         s_dots[i] = d;
     }
 
@@ -2016,75 +2112,6 @@ static void build_overlays(void)
     /* Wraps: "bottom right button" is wider than the AIPI's card. */
     lv_obj_set_width(s_pair_hint, lv_pct(100));
     lv_label_set_long_mode(s_pair_hint, LV_LABEL_LONG_MODE_WRAP);
-
-    if (muse_board->touch) {
-        /* Quick panel: an invisible full-screen catcher under a small card,
-         * both on the top layer like the pairing card. The catcher takes
-         * every tap outside the card and closes it. */
-        s_quick_catch = lv_obj_create(lv_layer_top());
-        lv_obj_remove_style_all(s_quick_catch);
-        lv_obj_set_size(s_quick_catch, lv_pct(100), lv_pct(100));
-        lv_obj_add_flag(s_quick_catch, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_event_cb(s_quick_catch, on_quick_catch, LV_EVENT_CLICKED, NULL);
-
-        s_quick = lv_obj_create(lv_layer_top());
-        lv_obj_remove_style_all(s_quick);
-        lv_obj_set_size(s_quick, s_small ? s_w - 24 : 320, LV_SIZE_CONTENT);
-        lv_obj_center(s_quick);
-        lv_obj_set_flex_flow(s_quick, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(s_quick, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_ver(s_quick, s_small ? 10 : 16, 0);
-        lv_obj_set_style_pad_hor(s_quick, s_small ? 10 : 16, 0);
-        lv_obj_set_style_pad_row(s_quick, 8, 0);
-        lv_obj_set_style_radius(s_quick, s_small ? 10 : 24, 0);
-        lv_obj_set_style_bg_opa(s_quick, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(s_quick, lv_color_hex(0x1a1530), 0);
-        lv_obj_set_style_border_color(s_quick, lv_color_hex(COLOR_ACCENT), 0);
-        lv_obj_set_style_border_width(s_quick, 2, 0);
-        lv_obj_remove_flag(s_quick, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(s_quick, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
-        lv_obj_t *q_title = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
-        lv_label_set_text(q_title, ui_lang_zh() ? "模式" : "Mode");
-        for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
-            lv_obj_t *row = lv_obj_create(s_quick);
-            lv_obj_remove_style_all(row);
-            lv_obj_set_size(row, lv_pct(100), 36);
-            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-            lv_obj_set_style_pad_column(row, 10, 0);
-            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(row, on_quick_mode, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-            s_quick_checks[i] = make_label(row, &lv_font_montserrat_20, COLOR_ACCENT);
-            lv_obj_set_width(s_quick_checks[i], 26);
-            lv_obj_t *name = make_label(row, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
-            lv_label_set_text(name, quick_mode_name(i));
-        }
-        lv_obj_t *vol_row = lv_obj_create(s_quick);
-        lv_obj_remove_style_all(vol_row);
-        lv_obj_set_size(vol_row, lv_pct(100), 36);
-        lv_obj_set_flex_flow(vol_row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(vol_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(vol_row, 10, 0);
-        lv_obj_t *vol_name = make_label(vol_row, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
-        lv_label_set_text(vol_name, ui_lang_zh() ? "音量" : "Volume");
-        s_quick_vol_sl = lv_slider_create(vol_row);
-        lv_slider_set_range(s_quick_vol_sl, 0, 100);
-        lv_slider_set_value(s_quick_vol_sl, muse_settings_volume(), LV_ANIM_OFF);
-        lv_obj_set_flex_grow(s_quick_vol_sl, 1);
-        lv_obj_add_event_cb(s_quick_vol_sl, on_quick_volume, LV_EVENT_VALUE_CHANGED, NULL);
-        lv_obj_add_event_cb(s_quick_vol_sl, on_quick_volume_done, LV_EVENT_RELEASED, NULL);
-        lv_obj_add_event_cb(s_quick_vol_sl, on_quick_volume_done, LV_EVENT_PRESS_LOST, NULL);
-        s_quick_vol_val = make_label(vol_row, muse_lang_montserrat(&lv_font_montserrat_14), COLOR_LIT);
-        lv_obj_set_width(s_quick_vol_val, 30);
-        if (muse_board->minimal_face) {
-            /* The corner icons are gone on this board, so the panel is
-             * where the top key explains itself. */
-            lv_obj_t *q_keys = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
-            lv_label_set_text(q_keys, ui_lang_zh() ? "顶键：按住说话 · 轻点通话" : "Top key: hold to talk · tap to call");
-        }
-        lv_obj_t *q_hint = make_label(s_quick, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
-        lv_label_set_text(q_hint, ui_lang_zh() ? "点外面关闭" : "Tap outside to close");
-    }
 
     /* Sleep cover: swallows the waking touch. */
     s_cover = lv_obj_create(lv_layer_top());
@@ -2179,19 +2206,25 @@ static void update_chrome(float now)
 
     log_face_scroll_once();
     if (s_tv) {
-        int page = lv_tileview_get_tile_active(s_tv) == s_settings;
-        bool subpage = muse_settings_ui_in_subpage();
-        s_swipe_enabled = !page || !subpage;
+        /* Three tiles now: quick settings (0), face (1), settings (2). */
+        lv_obj_t *active = lv_tileview_get_tile_active(s_tv);
+        int page = active == s_settings ? 2 : active == s_face ? 1 : 0;
+        bool subpage = page == 2 && muse_settings_ui_in_subpage();
+        s_swipe_enabled = page != 2 || !subpage;
         update_tileview_swipe();
-        int shown = page * 2 + subpage;
+        int shown = page * 2 + (subpage ? 1 : 0);
         if (shown != s_shown_page) {
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 3; i++) {
+                if (!s_dots[i]) continue;
                 lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(i == page ? COLOR_ACCENT : COLOR_DOT_OFF), 0);
-                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page && subpage);
+                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page == 2 && subpage);
             }
             s_shown_page = shown;
         }
-        muse_settings_ui_tick(lv_obj_get_scroll_x(s_tv) > 0);
+        quickset_refresh();
+        /* The settings pages count as on screen once the tileview has
+         * scrolled past the face tile's own offset. */
+        muse_settings_ui_tick(lv_obj_get_scroll_x(s_tv) > face_scroll_x());
     }
 
     /* Joining, the icon blinks: the compact layout has no state label. */
@@ -2597,6 +2630,13 @@ static void update_status(muse_mode_t mode, float now)
         if (s_reply_lbl) {
             lv_obj_add_flag(answer >= 0 ? s_caption_lbl : s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
         }
+        if (s_dialog) {
+            /* The game dialog box lives and dies with the caption it
+             * frames: visible only while the caption label is the one
+             * showing text — never during an answer layout, when the
+             * reply label has the screen and the box stays down. */
+            lv_obj_set_flag(s_dialog, LV_OBJ_FLAG_HIDDEN, answer >= 0 || !shown[0]);
+        }
 #if CONFIG_MUSE_SMALL_FULL_REPLY
         s_caption_shown = shown[0] != '\0';
 #endif
@@ -2669,7 +2709,7 @@ void muse_ui_request_snapshot(void)
 static void boot_hint_tick(muse_mode_t mode, float now)
 {
     if (!s_boot_hint || s_boot_hint_stage == 2) return;
-    bool face_up = !s_tv || lv_obj_get_scroll_x(s_tv) == 0;
+    bool face_up = !s_tv || lv_obj_get_scroll_x(s_tv) == face_scroll_x();
     /* Pairing comes first: while the pairing card is up the hint would
      * share the screen with it, and on an unpaired gadget the top key
      * only answers "set up Muse first" — the hint waits, still armed,
@@ -2735,18 +2775,16 @@ static void frame_tick(lv_timer_t *timer)
     }
 #endif
     update_chrome(now);
-    quick_tick();
     boot_hint_tick(mode, now);
     if (muse_menu_tick(now)) {
-        quick_hide();
         image_hide_locked();
         return;   /* the menu covers the face */
     }
     if (s_image_dsc.data) {
         return;   /* the image covers the face */
     }
-    if (s_tv && lv_obj_get_scroll_x(s_tv) != 0) {
-        /* Off screen, or sliding to or from settings: hold still so the
+    if (s_tv && lv_obj_get_scroll_x(s_tv) != face_scroll_x()) {
+        /* Off screen, or sliding between tiles: hold still so the
          * slide gets the whole frame time. */
         return;
     }
