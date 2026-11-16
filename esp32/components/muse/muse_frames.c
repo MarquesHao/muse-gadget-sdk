@@ -547,36 +547,43 @@ static void fade_out(void)
     hide_face();
 }
 
-/* Waking's exit dips through black, like fade_out() above but
- * shorter (~150 ms each way) and leaving the widget up at opa 0:
- * the waking and idle artwork was shot at different distances —
- * the face grows ~19% at the cut — and the dip turns that size
- * step into a blink. Only the waking handoff uses this. The
- * fade-out runs in the player task when the one-shot plays out;
- * s_dip then makes the next swap start black (show_front), and
- * the player fades the new visual in right after entering it.
- * The display lock is taken per step, as in fade_out(), so the
- * UI task is never blocked by the delays. */
+/* Waking's exit dips through black, like fade_out() above but in
+ * finer steps (~240 ms each way) and leaving the widget up at
+ * opa 0: the waking and idle artwork was shot at different
+ * distances — the face grows ~19% at the cut — and the dip turns
+ * that size step into a blink. The ramp runs the full range from
+ * LV_OPA_COVER in 32-opa steps: starting mid-way (or stepping
+ * coarsely) is itself a visible jump at the cut. Only the waking
+ * handoff uses this. The fade-out runs in the player task when
+ * the one-shot plays out; s_dip then makes the next swap start
+ * black (show_front), and the player fades the new visual in
+ * right after entering it. The display lock is taken per step,
+ * as in fade_out(), so the UI task is never blocked by the
+ * delays. */
 static void dip_fade_out(void)
 {
     s_dip = true;
-    for (int opa = 128; opa >= 0; opa -= 64) {
+    for (int opa = LV_OPA_COVER; opa > 0; opa -= 32) {
         muse_board->display_lock(-1);
         lv_obj_set_style_opa(s_img, (lv_opa_t)opa, 0);
         lv_obj_invalidate(s_img);
         muse_board->display_unlock();
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
+    muse_board->display_lock(-1);
+    lv_obj_set_style_opa(s_img, LV_OPA_TRANSP, 0);
+    lv_obj_invalidate(s_img);
+    muse_board->display_unlock();
 }
 
 static void dip_fade_in(void)
 {
-    for (int opa = 64; opa < 255; opa += 64) {
+    for (int opa = 0; opa < LV_OPA_COVER; opa += 32) {
         muse_board->display_lock(-1);
         lv_obj_set_style_opa(s_img, (lv_opa_t)opa, 0);
         lv_obj_invalidate(s_img);
         muse_board->display_unlock();
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
     muse_board->display_lock(-1);
     lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
