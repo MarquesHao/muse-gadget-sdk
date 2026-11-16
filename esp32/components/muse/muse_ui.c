@@ -1243,6 +1243,32 @@ static void build_answer(lv_obj_t *face, int ring_in)
     /* Centre the reading area between the avatar and the round bezel. */
     int available = reply_bottom(l->w, ring_in) - top;
     l->top = top + (available - l->h) / 2;
+    if (muse_board->minimal_face) {
+        /* Hugh's follow-up (2026-11-16): the reply body joins the
+         * caption in the game dialog box — read-aloud replies were
+         * still on the layouts above, floating over the face where he
+         * couldn't read them. Both layouts become the box's page: two
+         * lines at the caption font, as wide as the box leaves room
+         * for, riding where the caption rides in it. Only the geometry
+         * changes: the voice task still pages the reply by the byte
+         * being spoken (muse_hatch_caption_at) into pages of this
+         * size, pages still overlap by a line so nothing is skipped,
+         * and Muse's own moves and the layouts' hides keep the values
+         * computed above — only the text moves. */
+        int box_pitch = lv_font_get_line_height(caption_font()) + CAPTION_LINE_SPACE;
+        int box_cw = lv_font_get_glyph_width(caption_font(), 'M', ' ');
+        for (int i = 0; i < 2; i++) {
+            answer_layout_t *a = &s_answers[i];
+            a->scale = 1;
+            a->w = 360;   /* the box is 384 wide, less 12 px insets */
+            a->cols = a->w / box_cw;
+            a->lines = 2;
+            a->h = 2 * box_pitch - CAPTION_LINE_SPACE;
+            /* The box's top (108 tall, bottom-aligned, lifted 8) plus
+             * the caption's 12 px inset, measured from the centre. */
+            a->top = s_h - 8 - 108 + 12 - s_h / 2;
+        }
+    }
     ESP_LOGI(TAG, "reply pages: %d x %d heard, %d x %d read", s_answers[ANSWER_HEARD].cols,
              s_answers[ANSWER_HEARD].lines, l->cols, l->lines);
 
@@ -1836,9 +1862,13 @@ static void build_screen(void)
          * quarter of the screen, RPG-dialog style, instead of floating
          * over the face where it was hard to read. The caption label
          * moves inside it below; its text, font and paging are
-         * untouched — only the container changes. The box follows the
-         * caption's lifecycle in the UI tick: up while a caption shows,
-         * gone with it, so the face is clear the rest of the time (to
+         * untouched — only the container changes. The reply body
+         * joins it there: build_answer gives the answer layouts the
+         * box's page geometry on this board, so the reply label rides
+         * in the same band while a reply is read out. The box follows
+         * the text's lifecycle in the UI tick: up while the caption
+         * or the reply shows, gone with it, so the face is clear the
+         * rest of the time (to
          * make it permanent instead, drop the tick's hide below). The
          * speaking mouth frames end around y 325 on screen (measured on
          * the kit's talk frames), so a top edge at 350 leaves the mouth
@@ -2631,11 +2661,12 @@ static void update_status(muse_mode_t mode, float now)
             lv_obj_add_flag(answer >= 0 ? s_caption_lbl : s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
         }
         if (s_dialog) {
-            /* The game dialog box lives and dies with the caption it
-             * frames: visible only while the caption label is the one
-             * showing text — never during an answer layout, when the
-             * reply label has the screen and the box stays down. */
-            lv_obj_set_flag(s_dialog, LV_OBJ_FLAG_HIDDEN, answer >= 0 || !shown[0]);
+            /* The game dialog box lives and dies with the text it
+             * frames: the caption while listening, the reply body
+             * while an answer layout is up (on this board the layouts
+             * are the box's own page — see build_answer). Visible
+             * while the showing label has text, gone with it. */
+            lv_obj_set_flag(s_dialog, LV_OBJ_FLAG_HIDDEN, !shown[0]);
         }
 #if CONFIG_MUSE_SMALL_FULL_REPLY
         s_caption_shown = shown[0] != '\0';

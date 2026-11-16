@@ -17,6 +17,12 @@ reached by swiping right from the face, while swiping left still goes
 to settings -- and the caption gets a game-style dialog box in the
 bottom quarter of the minimal-face board's screen instead of floating
 over the face art, shown only while a caption is up.
+
+His follow-up the same evening: the reply body joins the caption in
+that box -- read-aloud replies were still on the answer layouts,
+floating over the face where he couldn't read them. On the
+minimal-face board both answer layouts take the box's page geometry
+and the box stays up for whichever text is showing.
 """
 
 from __future__ import annotations
@@ -118,10 +124,48 @@ class CaptionDialogTest(unittest.TestCase):
     def test_caption_moves_into_the_box(self) -> None:
         self.assertIn("lv_obj_set_parent(s_caption_lbl, s_dialog)", self.src)
 
-    def test_box_lives_and_dies_with_the_caption(self) -> None:
+    def test_box_lives_and_dies_with_the_showing_text(self) -> None:
+        # The box frames the caption while listening and the reply body
+        # while an answer is up: it is visible whenever the showing
+        # label has text, in either phase.
         self.assertIn(
-            "lv_obj_set_flag(s_dialog, LV_OBJ_FLAG_HIDDEN, answer >= 0 || !shown[0])",
+            "lv_obj_set_flag(s_dialog, LV_OBJ_FLAG_HIDDEN, !shown[0])",
             self.src)
+        self.assertNotIn("answer >= 0 || !shown[0]", self.src)
+
+
+class ReplyInDialogTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = UI.read_text(encoding="utf-8")
+
+    def test_both_answer_layouts_become_the_box_page(self) -> None:
+        build = body_of(self.src, "static void build_answer")
+        at = build.index("a->lines = 2;")
+        gate = build.rindex("if (muse_board->minimal_face)", 0, at)
+        self.assertGreater(at, gate)   # the override is minimal-face only
+        # Both layouts (heard and read) are overridden, in one loop.
+        self.assertIn("for (int i = 0; i < 2; i++)", build)
+        self.assertIn("answer_layout_t *a = &s_answers[i];", build)
+        self.assertIn("a->scale = 1;", build)
+        self.assertIn("a->w = 360;", build)   # the 384 box less its insets
+        self.assertIn("a->h = 2 * box_pitch - CAPTION_LINE_SPACE;", build)
+
+    def test_box_page_rides_where_the_caption_rides(self) -> None:
+        build = body_of(self.src, "static void build_answer")
+        # The box's top (108 tall, bottom-aligned, lifted 8) plus the
+        # caption's 12 px inset, from the centre: the same band the
+        # caption label occupies inside the box.
+        self.assertIn("a->top = s_h - 8 - 108 + 12 - s_h / 2;", build)
+
+    def test_pager_still_follows_the_layout(self) -> None:
+        # No second page size anywhere: the UI tick keeps sizing the
+        # pager from the layout, so the box geometry above is what the
+        # voice task pages the reply into.
+        tick = body_of(self.src, "static void update_status")
+        self.assertIn("muse_chat_set_caption_px(s_answers[layout].w, reply_glyph_px)", tick)
+        self.assertIn("s_answers[layout].lines - 1,\n                                s_answers[layout].lines)",
+                      tick)
 
 
 if __name__ == "__main__":
