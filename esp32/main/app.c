@@ -765,22 +765,39 @@ static void restart_task(void *arg) {
 // restarts to reach its VM with the BLE stack never started.
 #define PAIR_THEN_RESTART CONFIG_MUSE_ENABLED
 
-/* Deferred token store for the VM lookup worker.
+/* Deferred config writes for the VM lookup worker.
  *
  * The worker (hatch_vm_serve, see app_hatch_vm_credentials) runs on a
  * PSRAM stack, because the internal heap cannot promise a lookup
  * stack's block while the device is awake. A PSRAM-stack task must
  * never write flash itself — the write switches the cache off under
- * its own feet — so when a token refresh inside a serve wants to
- * persist the new pair, store_token_pair_unlocked() parks a copy
- * here instead, and the app heartbeat (internal stack; the same
- * context deferred unpair/reset already use) writes it to NVS on
- * its next tick. load_token_unlocked() reads the parked pair back
- * meanwhile, so the serve that minted it uses it at once. The
- * parked pair is only ever touched under the auth lock. */
-static volatile bool s_vm_serve_active;
+ * its own feet — so the config writes a serve can reach (storing a
+ * refreshed token pair, storing/erasing the pairing username,
+ * noting the paired SDK token, unpairing on a revoked credential)
+ * park their payload here instead, and the app heartbeat (internal
+ * stack; the same context deferred unpair/reset already use)
+ * performs them for real on its next tick. load_token_unlocked()
+ * reads the parked pair back meanwhile, so the serve that minted
+ * it uses it at once.
+ *
+ * The park-or-write decision is by task identity — the caller IS
+ * the worker — never by a shared "serve in progress" flag: a flag
+ * the worker sets without the lock can flip between the
+ * heartbeat's check and its store, which would park the
+ * heartbeat's own write and free the payload under it. Parked
+ * state is written only under the auth lock; the heartbeat peeks
+ * at it lock-free to decide whether a flush is due, and the flush
+ * re-checks everything under the lock. */
+static TaskHandle_t s_vm_worker;
+static bool on_vm_worker(void) {
+    return s_vm_worker && xTaskGetCurrentTaskHandle() == s_vm_worker;
+}
 static char *s_vm_parked_access;
 static char *s_vm_parked_refresh;
+static char *s_vm_parked_username;
+static bool s_vm_parked_username_set;
+static bool s_vm_parked_sdk_hint;
+static bool s_vm_parked_unpair;
 
 static char *load_token_unlocked(const char *key) {
     /* A parked pair (see above) is newer than anything in NVS until
@@ -844,7 +861,7 @@ static bool store_token_pair_unlocked(const char *access_token,
     if (!access_token || !*access_token || !refresh_token || !*refresh_token) {
         return false;
     }
-    if (s_vm_serve_active) {
+    if (on_vm_worker()) {
         /* The lookup worker runs on a PSRAM stack and must not write
          * flash: park the pair; the heartbeat stores it for real. */
         return park_token_pair(access_token, refresh_token);
@@ -861,22 +878,65 @@ static bool store_token_pair_unlocked(const char *access_token,
     return ok;
 }
 
-/* Heartbeat context: write a parked token pair to NVS for real and
- * drop the copies. Runs on the heartbeat's internal stack, like the
- * deferred unpair/reset beside it in the loop. The pair stays
- * readable from the park (under the auth lock) until the write is
- * done, so no reader can catch the stale NVS copy in between. */
-static void flush_parked_token_pair(void) {
+static void store_pairing_username_unlocked(const char *username) {
+    if (on_vm_worker()) {
+        /* Park it (a copy, or the erase as an empty park); the
+         * heartbeat stores/erases for real at the flush. */
+        char *copy = NULL;
+        if (username && *username) {
+            copy = heap_caps_malloc(strlen(username) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (copy) {
+                strcpy(copy, username);
+            }
+        }
+        heap_caps_free(s_vm_parked_username);
+        s_vm_parked_username = copy;
+        s_vm_parked_username_set = true;
+        return;
+    }
+    if (username && *username) {
+        config_set_str("username", username);
+    } else {
+        config_erase_key("username");
+    }
+}
+
+/* Heartbeat context: perform the config writes the lookup worker
+ * parked, for real, and drop the payloads. Runs on the heartbeat's
+ * internal stack, like the deferred unpair/reset beside it in the
+ * loop. The parked pair stays readable from the park (under the
+ * auth lock) until its write is done, so no reader can catch the
+ * stale NVS copy in between. The unpair goes last: it erases the
+ * credentials the other writes just stored, which is the state a
+ * serve that saw a revocation means to leave behind. */
+static void flush_parked_vm_store(void) {
     char *a = NULL;
     char *r = NULL;
+    char *u = NULL;
     auth_lock_take();
-    if (s_vm_parked_access && s_vm_parked_refresh && !s_vm_serve_active) {
+    if (s_vm_parked_access && s_vm_parked_refresh) {
         a = s_vm_parked_access;
         r = s_vm_parked_refresh;
-        /* Not the worker here, so this takes the real NVS path. */
+        /* The heartbeat is never the worker, so this writes. */
         store_token_pair_unlocked(a, r);
         s_vm_parked_access = NULL;
         s_vm_parked_refresh = NULL;
+    }
+    if (s_vm_parked_username_set) {
+        u = s_vm_parked_username;
+        store_pairing_username_unlocked(u);
+        s_vm_parked_username = NULL;
+        s_vm_parked_username_set = false;
+    }
+    if (s_vm_parked_sdk_hint) {
+        identity_note_paired_sdk_token();
+        s_vm_parked_sdk_hint = false;
+    }
+    if (s_vm_parked_unpair) {
+        if (!config_unpair()) {
+            ESP_LOGE(TAG, "parked unpair: credential deletion could not be verified");
+        }
+        s_vm_parked_unpair = false;
     }
     auth_lock_give();
     if (a) {
@@ -884,15 +944,9 @@ static void flush_parked_token_pair(void) {
         heap_caps_free(r);
         ESP_LOGI(TAG, "parked token pair stored");
     }
+    heap_caps_free(u);
 }
 
-static void store_pairing_username_unlocked(const char *username) {
-    if (username && *username) {
-        config_set_str("username", username);
-    } else {
-        config_erase_key("username");
-    }
-}
 
 // The token service refused a refresh or mint with a 401: the credential was
 // revoked, replaced by a newer pairing or already used, and will never work
@@ -905,7 +959,11 @@ static void handle_device_token_revoked_unlocked(const char *context) {
     s_last_vm_auth_refusal_us = 0;
     s_vm_auth_refresh_interval_us = VM_AUTH_REFRESH_RETRY_INTERVAL_US;
     s_vm_auth_refusals = 0;
-    if (!config_unpair()) {
+    if (on_vm_worker()) {
+        /* Unpairing erases config; the heartbeat performs it at the
+         * flush, alongside the rest of the deferred unpair. */
+        s_vm_parked_unpair = true;
+    } else if (!config_unpair()) {
         ESP_LOGE(TAG, "%s: pairing credential deletion could not be verified",
                  context);
     }
@@ -936,7 +994,13 @@ static bool mint_and_store_device_tokens_unlocked(const char *source_token,
     int rc = vm_api_mint_device_token(source_token, identity_node_id(), &tokens);
     if (rc == 0) {
         bool ok = store_token_pair_unlocked(tokens.access_token, tokens.refresh_token);
-        if (ok) identity_note_paired_sdk_token();
+        if (ok && on_vm_worker()) {
+            /* Noting the hint writes config; the heartbeat does it
+             * at the flush (see flush_parked_vm_store). */
+            s_vm_parked_sdk_hint = true;
+        } else if (ok) {
+            identity_note_paired_sdk_token();
+        }
         if (ok && username) store_pairing_username_unlocked(username);
         vm_device_tokens_free(&tokens);
         return ok;
@@ -2544,22 +2608,21 @@ static const vm_info_t *find_vm_by_id(const vm_info_t *vms, int count, const cha
  * starved audio start-up's DMA allocations and the board began
  * panicking at boot. A PSRAM stack costs the internal heap nothing
  * but the TCB; the one thing it must never do is write flash
- * itself, so token stores inside a serve are parked for the
- * heartbeat to write (see park_token_pair). The worker is created
+ * itself, so the config writes inside a serve are parked for the
+ * heartbeat to perform (see the parked-store block at
+ * load_token_unlocked). The worker is created
  * lazily on the first lookup and never exits; requests are
  * serialized on s_vm_lock, and callers block until their lookup
  * completes either way. */
 #define VM_TASK_STACK_BYTES 12288
-static TaskHandle_t s_vm_worker;
 static hatch_vm_request_t *s_vm_pending;
 static StaticSemaphore_t s_vm_lock_buf;
 static SemaphoreHandle_t s_vm_lock;
 
 /* Runs on the worker's PSRAM stack. Reads NVS and runs HTTPS; the
- * token store on the refresh path parks instead of writing (see
- * store_token_pair_unlocked). */
+ * config writes on its paths park instead of writing (see the
+ * parked-store block at load_token_unlocked). */
 static void hatch_vm_serve(hatch_vm_request_t *req) {
-    s_vm_serve_active = true;
     if (config_is_provisioned() && operation_gate_take(pdMS_TO_TICKS(15000), "Muse VM lookup")) {
         vm_info_t vms[VM_API_MAX_VMS];
         int count = fetch_vms_with_refresh_with_gate_held(vms, VM_API_MAX_VMS);
@@ -2587,7 +2650,6 @@ static void hatch_vm_serve(hatch_vm_request_t *req) {
         }
         operation_gate_give();
     }
-    s_vm_serve_active = false;
     xTaskNotifyGive(req->waiter);
     stack_monitor_record(NULL);
 }
@@ -2621,12 +2683,23 @@ bool app_hatch_vm_credentials(const char *want_vm, char *vm_id, size_t id_cap,
     if (!s_vm_worker) {
         if (xTaskCreateWithCaps(hatch_vm_task, "muse_vm", VM_TASK_STACK_BYTES,
                                 NULL, 4, &s_vm_worker,
-                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS
+            && xTaskCreate(hatch_vm_task, "muse_vm", VM_TASK_STACK_BYTES,
+                           NULL, 4, &s_vm_worker) != pdPASS) {
+            /* No PSRAM for the worker stack and no internal block
+             * either: the lookup cannot run (a board without PSRAM
+             * falls back to the internal stack, with the parked
+             * writes still applying — they key on the task). */
             xSemaphoreGive(s_vm_lock);
             return false;
         }
-        ESP_LOGI(TAG, "vm lookup worker started (PSRAM stack)");
+        ESP_LOGI(TAG, "vm lookup worker started");
     }
+    /* The wait below must only ever be woken by this lookup's
+     * completion: drain any notification other paths left on the
+     * calling task, or the take returns at once and the caller
+     * reads req while the worker is still writing it. */
+    ulTaskNotifyTake(pdTRUE, 0);
     s_vm_pending = &req;
     xTaskNotifyGive(s_vm_worker);
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -3147,10 +3220,11 @@ void app_run(void) {
             reset_setup_from_control("deferred unpair", SETUP_RESET_KEEP_WIFI);
         }
 
-        /* A token pair the VM lookup worker parked (its PSRAM stack
-         * must not write flash) gets its real NVS store here. */
-        if (s_vm_parked_access) {
-            flush_parked_token_pair();
+        /* Config writes the VM lookup worker parked (its PSRAM
+         * stack must not write flash) get performed here. */
+        if (s_vm_parked_access || s_vm_parked_username_set
+            || s_vm_parked_sdk_hint || s_vm_parked_unpair) {
+            flush_parked_vm_store();
         }
 
 #if CONFIG_MUSE_ENABLED

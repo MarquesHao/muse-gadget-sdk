@@ -64,6 +64,10 @@ bool muse_frames_boot_still_up(void);
  * acknowledged (or is not running at all); false if it did not
  * acknowledge within 2 s, in which case the caller proceeds anyway.
  * The frame on screen simply stays up while held.
+ *
+ * muse_chat_session.cpp declares this function again as a weak
+ * symbol (it cannot include this header without pulling in LVGL);
+ * if the signature ever changes, change both declarations.
  */
 bool muse_frames_hold(bool on);
 

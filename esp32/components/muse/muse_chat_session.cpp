@@ -849,14 +849,17 @@ static bool resolve_vm(char *err, size_t err_cap)
     if (s_vm.vm_token) {
         return true;
     }
-    /* The lookup spawns a task with an 8 KB internal-RAM stack and
-     * runs HTTPS. Awake, the frame player's decode churn leaves the
-     * largest free internal block smaller than that stack, so the
-     * lookup dies before it starts and surfaces as "Can't reach
-     * Muse's server". Quiet the player — it drops its JPEG decoder
-     * and stops decoding — for the lookup's few seconds; it resumes
-     * whatever the outcome. The heap lines bracket the lookup so a
-     * failure shows the block size it faced. */
+    /* The lookup runs HTTPS on the Link side's worker (a PSRAM
+     * stack since the fix for the failures this replaces: per-lookup
+     * tasks with an 8 KB internal-RAM stack could not even be
+     * created awake, which surfaced as "Can't reach Muse's
+     * server"). The handshake still allocates in internal RAM —
+     * TLS control blocks and the crypto engine's DMA buffers — and
+     * the frame player's decode churn is what squeezes that heap.
+     * Quiet the player — it drops its JPEG decoder and stops
+     * decoding — for the lookup's few seconds; it resumes whatever
+     * the outcome. The heap lines bracket the lookup so a failure
+     * shows the block sizes it faced. */
     ESP_LOGI(TAG, "resolve: free %u, largest %u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));

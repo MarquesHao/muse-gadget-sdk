@@ -277,10 +277,17 @@ void vm_device_tokens_free(vm_device_tokens_t *tokens) {
 static void *heap_caps_malloc(size_t size, int caps) { (void)caps; return malloc(size); }
 static void heap_caps_free(void *p) { free(p); }
 
+typedef void *TaskHandle_t;
+static TaskHandle_t s_vm_worker = NULL;
+static TaskHandle_t xTaskGetCurrentTaskHandle(void) { return NULL; }
+
 static SemaphoreHandle_t s_auth_lock = NULL;
-static volatile bool s_vm_serve_active = false;
 static char *s_vm_parked_access = NULL;
 static char *s_vm_parked_refresh = NULL;
+static char *s_vm_parked_username = NULL;
+static bool s_vm_parked_username_set = false;
+static bool s_vm_parked_sdk_hint = false;
+static bool s_vm_parked_unpair = false;
 static int64_t s_last_vm_auth_refresh_attempt_us = 0;
 static int64_t s_last_vm_auth_refusal_us = 0;
 static int64_t s_last_link_session_retry_us = 0;
