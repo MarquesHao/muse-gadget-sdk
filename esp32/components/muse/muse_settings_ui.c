@@ -166,6 +166,47 @@ static const char *gadget_mode_name(int i)
 #endif
     return GADGET_MODE_NAMES_EN[i];
 }
+/* The Muse page's Link and Hatch state names, in this page's language.
+ * muse_link_state_name() / muse_hatch_state_name() themselves stay
+ * English: the button menu translates them through its own table and
+ * the BLE status JSON reports them verbatim. These pages draw with the
+ * CJK fallback, so their ticks map the names here instead — the same
+ * per-file dispatch as gadget_mode_name() above. A state with no case
+ * below falls back to the English name. */
+static const char *link_state_display_name(muse_link_state_t state)
+{
+#if CONFIG_MUSE_CJK_FONT
+    if (muse_settings_lang() == MUSE_LANG_ZH) {
+        switch (state) {
+        case MUSE_LINK_BOOT: return "启动中";
+        case MUSE_LINK_UNPAIRED: return "等待配对";
+        case MUSE_LINK_PAIRING: return "应用已连接";
+        case MUSE_LINK_CONFIRM: return "确认配对";
+        case MUSE_LINK_CONNECTING: return "连接中";
+        case MUSE_LINK_ONLINE: return "在线";
+        case MUSE_LINK_OFFLINE: return "离线";
+        case MUSE_LINK_ERROR: return "出错";
+        }
+    }
+#endif
+    return muse_link_state_name(state);
+}
+static const char *hatch_state_display_name(muse_hatch_state_t state)
+{
+#if CONFIG_MUSE_CJK_FONT
+    if (muse_settings_lang() == MUSE_LANG_ZH) {
+        switch (state) {
+        case MUSE_HATCH_NOT_SET: return "未设置";
+        case MUSE_HATCH_OFFLINE: return "离线";
+        case MUSE_HATCH_UNTESTED: return "已保存";
+        case MUSE_HATCH_TESTING: return "连接中";
+        case MUSE_HATCH_REACHABLE: return "已连接";
+        case MUSE_HATCH_UNREACHABLE: return "连不上";
+        }
+    }
+#endif
+    return muse_hatch_state_name(state);
+}
 #define SOUND_TITLE TR("SOUND", "声音")
 #define SOUND_NAV TR("Sound", "声音")
 #define SOUND_MODE_HINT TR("Mode:", "模式：")
@@ -1298,7 +1339,7 @@ static void tick_hatch(void)
                          : muse_link_sdk_token_changed() ? TR("paired with another SDK token, pair again to use this one",
                                                               "用了另一个 SDK 令牌配对，要用这个请重新配对")
                                                          : TR("paired", "已配对");
-    snprintf(link, sizeof(link), TR("Muse app: %s\n%s", "Muse 应用：%s\n%s"), paired, muse_link_state_name(muse_link_state()));
+    snprintf(link, sizeof(link), TR("Muse app: %s\n%s", "Muse 应用：%s\n%s"), paired, link_state_display_name(muse_link_state()));
     set_text(s_link_status, link);
     if (s_link_reset_armed_us && esp_timer_get_time() - s_link_reset_armed_us >= 5000000) {
         s_link_reset_armed_us = 0;
@@ -1309,9 +1350,9 @@ static void tick_hatch(void)
     muse_hatch_status(&h);
     char buf[96];
     if (h.detail[0]) {
-        snprintf(buf, sizeof(buf), "%s\n%s", muse_hatch_state_name(h.state), h.detail);
+        snprintf(buf, sizeof(buf), "%s\n%s", hatch_state_display_name(h.state), h.detail);
     } else {
-        strlcpy(buf, muse_hatch_state_name(h.state), sizeof(buf));
+        strlcpy(buf, hatch_state_display_name(h.state), sizeof(buf));
     }
     set_text(s_hatch_status, buf);
     lv_obj_set_style_text_color(s_hatch_status, lv_color_hex(h.state == MUSE_HATCH_REACHABLE ? COLOR_OK :
@@ -1850,7 +1891,7 @@ static void tick_home(void)
 
     muse_hatch_status_t h;
     muse_hatch_status(&h);
-    set_text(s_home_hatch, muse_hatch_state_name(h.state));
+    set_text(s_home_hatch, hatch_state_display_name(h.state));
 
     muse_ble_status_t b;
     muse_ble_status(&b);
