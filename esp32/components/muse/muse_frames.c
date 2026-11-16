@@ -30,6 +30,7 @@
 #include "png.h"
 
 #include "muse_board.h"
+#include "muse_boot_still.h"
 #include "muse_meeting.h"
 #include "muse_mem.h"
 #include "muse_state.h"
@@ -48,8 +49,14 @@
  * scratch and this task's stack are in PSRAM, and storage is only
  * mounted seconds after boot — after the voice session's first VM
  * lookup has had its pick of internal RAM. The mount then stays, like
- * it does after any meeting use. Any failure anywhere leaves the pixel
- * face up: the image widget just never unhides.
+ * it does after any meeting use.
+ *
+ * The fallback face, for the seconds before the mount and for any
+ * failure after it, is the embedded boot still (muse_boot_still.h)
+ * when this build links one: muse_frames_attach() decodes it before
+ * the player task starts and it stays resident in PSRAM all boot.
+ * Only a build with no still falls back to the pixel face — the image
+ * widget then simply never unhides.
  */
 
 static const char *TAG = "muse_frames";
@@ -86,6 +93,7 @@ typedef enum {
     V_REST,
     V_HAPPY,
     V_MUSIC,
+    V_STILL,     /* the embedded boot still is up (fallback only) */
     V_COUNT
 } visual_t;
 
@@ -109,7 +117,7 @@ static const char *const VIS_NAMES[V_COUNT] = {
     [V_LEVELUP] = "levelup", [V_SPEAKING] = "speaking",
     [V_LISTENING] = "listening", [V_THINKING] = "thinking",
     [V_SLEEPY] = "sleepy",   [V_DIZZY] = "dizzy",     [V_REST] = "rest",
-    [V_HAPPY] = "happy",     [V_MUSIC] = "music",
+    [V_HAPPY] = "happy",     [V_MUSIC] = "music",     [V_STILL] = "still",
 };
 
 /* Kit states are composited from sprites/<name>/; still states are a
@@ -125,6 +133,9 @@ static bool vis_is_still(visual_t v)
 
 static lv_obj_t *s_img;
 static lv_image_dsc_t s_dsc;
+static uint16_t *s_still;          /* PSRAM: the decoded boot still */
+static lv_image_dsc_t s_still_dsc;
+static bool s_still_up;            /* still decoded: it is the fallback */
 static uint16_t *s_buf[2];   /* PSRAM frame buffers; s_front is on screen */
 static int s_front;
 static uint8_t *s_file;      /* PSRAM scratch: one asset file, whole */
@@ -171,6 +182,30 @@ static bool read_file(const char *path, size_t *len_out)
     return true;
 }
 
+/* Decode one 466x466 JPEG with an already-open handle into out
+ * (FR_BYTES of RGB565). No stats, no handle management: the caller
+ * owns the handle. */
+static bool jpeg_decode(jpeg_dec_handle_t dec, const uint8_t *jpg, size_t len, uint16_t *out)
+{
+    jpeg_dec_io_t io = {
+        .inbuf = (uint8_t *)jpg,
+        .inbuf_len = (int)len,
+        .outbuf = (uint8_t *)out,
+        .out_size = FR_BYTES,
+    };
+    jpeg_dec_header_info_t info;
+    bool ok = jpeg_dec_parse_header(dec, &io, &info) == JPEG_ERR_OK
+              && info.width == FR_W && info.height == FR_H;
+    int need = 0;
+    if (ok) {
+        ok = jpeg_dec_get_outbuf_len(dec, &need) == JPEG_ERR_OK && need == FR_BYTES;
+    }
+    if (ok) {
+        ok = jpeg_dec_process(dec, &io) == JPEG_ERR_OK;
+    }
+    return ok;
+}
+
 /* Decode the JPEG in s_file[0..len) into out (FR_BYTES of RGB565).
  * False on any failure; a decoder failure also drops the handle so the
  * next call reopens it. */
@@ -187,22 +222,7 @@ static bool decode_jpeg_mem(const uint8_t *jpg, size_t len, uint16_t *out)
         }
     }
     int64_t t0 = esp_timer_get_time();
-    jpeg_dec_io_t io = {
-        .inbuf = (uint8_t *)jpg,
-        .inbuf_len = (int)len,
-        .outbuf = (uint8_t *)out,
-        .out_size = FR_BYTES,
-    };
-    jpeg_dec_header_info_t info;
-    bool ok = jpeg_dec_parse_header(s_jdec, &io, &info) == JPEG_ERR_OK
-              && info.width == FR_W && info.height == FR_H;
-    int need = 0;
-    if (ok) {
-        ok = jpeg_dec_get_outbuf_len(s_jdec, &need) == JPEG_ERR_OK && need == FR_BYTES;
-    }
-    if (ok) {
-        ok = jpeg_dec_process(s_jdec, &io) == JPEG_ERR_OK;
-    }
+    bool ok = jpeg_decode(s_jdec, jpg, len, out);
     if (!ok) {
         jpeg_dec_close(s_jdec);
         s_jdec = NULL;
@@ -419,6 +439,34 @@ static void hide_face(void)
     muse_board->display_unlock();
 }
 
+static void show_still(void)
+{
+    muse_board->display_lock(-1);
+    lv_image_set_src(s_img, &s_still_dsc);
+    lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(s_img);
+    muse_board->display_unlock();
+}
+
+/* The face to fall back on when a visual cannot be shown: the
+ * embedded boot still when this build has one (it is already decoded
+ * and resident), the pixel face — widget hidden — otherwise. Returns
+ * the visual to record as current. */
+static visual_t fallback_face(visual_t cur)
+{
+    if (s_still_up) {
+        if (cur != V_STILL) {
+            show_still();
+        }
+        return V_STILL;
+    }
+    if (cur != V_NONE) {
+        hide_face();
+    }
+    return V_NONE;
+}
+
 static void swap_buffers(void)
 {
     s_front ^= 1;
@@ -430,8 +478,9 @@ static uint16_t *back_buffer(void)
     return s_buf[s_front ^ 1];
 }
 
-/* levelup's exit: fade the last frame out (the black tile and the
- * pixel face show through), then the caller moves on to idle. */
+/* levelup's exit: fade the last frame out (whatever is under the
+ * widget shows through — the blanked canvas on still builds), then
+ * the caller moves on to idle. */
 static void fade_out(void)
 {
     for (int opa = 200; opa >= 0; opa -= 55) {
@@ -521,7 +570,7 @@ static visual_t resolve_target(void)
 
 /* Decode visual v's still content (kit composite or poses still) into
  * the back buffer and swap it in. False (and v marked broken) when the
- * asset is unusable; the pixel face stays up then. */
+ * asset is unusable; the fallback face stays up then. */
 static bool enter_still(visual_t v)
 {
     bool ok;
@@ -536,7 +585,7 @@ static bool enter_still(visual_t v)
     }
     if (!ok) {
         s_broken[v] = true;
-        ESP_LOGW(TAG, "%s: asset unusable, pixel face for this state", VIS_NAMES[v]);
+        ESP_LOGW(TAG, "%s: asset unusable, fallback face for this state", VIS_NAMES[v]);
         return false;
     }
     swap_buffers();
@@ -550,7 +599,7 @@ static bool enter_seq_frame(visual_t v, int idx, uint16_t *into)
     s_dec_what = VIS_NAMES[v];
     if (!decode_jpeg_file(path, into)) {
         s_broken[v] = true;
-        ESP_LOGW(TAG, "%s: frame %d unusable, pixel face for this state", VIS_NAMES[v], idx);
+        ESP_LOGW(TAG, "%s: frame %d unusable, fallback face for this state", VIS_NAMES[v], idx);
         return false;
     }
     return true;
@@ -599,7 +648,7 @@ static void player_task(void *arg)
         if (err == ESP_OK) {
             mounted = true;
         } else if (err == ESP_ERR_NOT_FOUND || tries >= 5) {
-            ESP_LOGW(TAG, "storage unavailable (%s): pixel face stays", esp_err_to_name(err));
+            ESP_LOGW(TAG, "storage unavailable (%s): no library face this boot", esp_err_to_name(err));
             hopeless = true;
         } else {
             tries++;
@@ -612,7 +661,7 @@ static void player_task(void *arg)
         s_buf[1] = heap_caps_aligned_alloc(32, FR_BYTES, MUSE_BIG_CAPS);
         s_file = heap_caps_malloc(FR_FILE_MAX, MUSE_BIG_CAPS);
         if (!s_buf[0] || !s_buf[1] || !s_file) {
-            ESP_LOGE(TAG, "frame buffers unavailable: pixel face stays");
+            ESP_LOGE(TAG, "frame buffers unavailable: no library face this boot");
             mounted = false;
         }
     }
@@ -624,7 +673,7 @@ static void player_task(void *arg)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    visual_t cur = V_NONE;        /* what the widget shows now */
+    visual_t cur = s_still_up ? V_STILL : V_NONE;   /* what the widget shows now */
     int seq_idx = 0;              /* frame in the front buffer */
     int seq_next = 0;             /* frame in the back buffer, if ready */
     bool seq_ready = false;       /* back buffer holds seq_next */
@@ -641,7 +690,7 @@ static void player_task(void *arg)
         if (!s_waking_done && want != V_PAUSED) {
             if (cur == V_WAKING && (want == V_IDLE || want == V_HAPPY || want == V_WAKING)) {
                 want = V_WAKING;   /* let it play out */
-            } else if (cur == V_NONE && (want == V_IDLE || want == V_HAPPY)) {
+            } else if ((cur == V_NONE || cur == V_STILL) && (want == V_IDLE || want == V_HAPPY)) {
                 want = V_WAKING;   /* first entry */
             } else if (want != V_WAKING) {
                 s_waking_done = true;   /* interrupted or pre-empted */
@@ -669,10 +718,7 @@ static void player_task(void *arg)
             if (want == V_LEVELUP) {
                 s_levelup_pending = false;   /* same: idle must get its face back */
             }
-            if (cur != V_NONE && cur != want) {
-                hide_face();
-                cur = V_NONE;
-            }
+            cur = fallback_face(cur);
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
@@ -708,10 +754,7 @@ static void player_task(void *arg)
                 if (want == V_LEVELUP) {
                     s_levelup_pending = false;
                 }
-                if (cur != V_NONE) {
-                    hide_face();
-                }
-                cur = V_NONE;
+                cur = fallback_face(cur);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
             }
@@ -771,8 +814,7 @@ static void player_task(void *arg)
                     if (cur == V_LEVELUP) {
                         s_levelup_pending = false;
                     }
-                    hide_face();
-                    cur = V_NONE;
+                    cur = fallback_face(cur);
                     continue;
                 }
                 seq_next = next;
@@ -795,8 +837,7 @@ static void player_task(void *arg)
                     mouth_since = now;
                 } else {
                     s_broken[cur] = true;
-                    hide_face();
-                    cur = V_NONE;
+                    cur = fallback_face(cur);
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(30));
@@ -823,6 +864,52 @@ void muse_frames_attach(lv_obj_t *face)
     s_dsc.header.stride = FR_W * 2;
     s_dsc.data_size = FR_BYTES;
 
+    /* The embedded boot still, when this build links one: decode it
+     * now — in the UI task, before the player starts — so the face on
+     * screen from the first refresh is the current one, and the pixel
+     * canvas underneath (blanked by muse_ui.c on minimal-face boards)
+     * never shows through while the library mounts. The decoder is
+     * opened and closed inside this block, so its internal scratch is
+     * freed before the voice session makes its first allocations; the
+     * decoded frame itself lives in PSRAM and stays resident all boot
+     * as the player's fallback (see fallback_face()). No lock is taken
+     * here: like the widget creation above, this runs in the UI's own
+     * context during build_screen(). */
+    size_t still_len = 0;
+    const uint8_t *still_jpg = muse_boot_still_jpg(&still_len);
+    if (still_jpg) {
+        s_still = heap_caps_aligned_alloc(32, FR_BYTES, MUSE_BIG_CAPS);
+        jpeg_dec_handle_t dec = NULL;
+        jpeg_dec_config_t cfg = {
+            .output_type = JPEG_PIXEL_FORMAT_RGB565_LE,
+            .rotate = JPEG_ROTATE_0D,
+        };
+        bool ok = false;
+        if (s_still && jpeg_dec_open(&cfg, &dec) == JPEG_ERR_OK && dec) {
+            ok = jpeg_decode(dec, still_jpg, still_len, s_still);
+            jpeg_dec_close(dec);
+        }
+        if (ok) {
+            s_still_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+            s_still_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+            s_still_dsc.header.w = FR_W;
+            s_still_dsc.header.h = FR_H;
+            s_still_dsc.header.stride = FR_W * 2;
+            s_still_dsc.data_size = FR_BYTES;
+            s_still_dsc.data = (const uint8_t *)s_still;
+            s_still_up = true;
+            lv_image_set_src(s_img, &s_still_dsc);
+            lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
+            lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_invalidate(s_img);
+            ESP_LOGI(TAG, "boot still up: %u bytes of JPEG", (unsigned)still_len);
+        } else {
+            ESP_LOGW(TAG, "boot still unusable: library/pixel fallback only");
+            heap_caps_free(s_still);
+            s_still = NULL;
+        }
+    }
+
     /* PSRAM stack: this task reads the storage partition but never
      * writes flash itself (wear-levelling reads can still coincide
      * with the meeting writer's cache-off windows; while a recording
@@ -831,6 +918,11 @@ void muse_frames_attach(lv_obj_t *face)
      * decode burst never delays the UI's own rendering. */
     if (xTaskCreatePinnedToCoreWithCaps(player_task, "muse_frames", 8192, NULL, 3, NULL,
                                         MUSE_UI_CORE, MUSE_BIG_CAPS) != pdPASS) {
-        ESP_LOGW(TAG, "player task unavailable: pixel face stays");
+        ESP_LOGW(TAG, "player task unavailable: no library face");
     }
+}
+
+bool muse_frames_boot_still_up(void)
+{
+    return s_still_up;
 }

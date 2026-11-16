@@ -33,12 +33,25 @@ extern "C" {
  * storage partition read-only through muse_meeting, decodes frames into
  * PSRAM double buffers and swaps them in under the display lock.
  *
- * Anything unavailable — no storage partition, a mount the firmware
- * refuses, a missing or undecodable asset — leaves the pixel face
- * showing: the image widget simply stays hidden. Runs in the LVGL task
+ * When the build links an embedded boot still (muse_boot_still.h),
+ * attach decodes and shows it before returning, and it stays the
+ * fallback for anything unavailable — no storage partition, a mount
+ * the firmware refuses, a missing or undecodable asset. Only a build
+ * with no still leaves the pixel face showing in those cases: the
+ * image widget then simply stays hidden. Runs in the LVGL task
  * (build_screen), like every other widget creation.
  */
 void muse_frames_attach(lv_obj_t *face);
+
+/*
+ * Whether the embedded boot still decoded and is up (see
+ * muse_boot_still.h). muse_ui.c reads this right after
+ * muse_frames_attach() to decide the pixel canvas's fate from the
+ * same signal the player falls back on — the decode outcome, not
+ * merely the still being linked — so a still that failed to decode
+ * leaves the pixel face alive as the fallback instead of blanking it.
+ */
+bool muse_frames_boot_still_up(void);
 
 #ifdef __cplusplus
 }

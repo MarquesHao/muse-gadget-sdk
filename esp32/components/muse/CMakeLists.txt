@@ -47,6 +47,17 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND embed "eink/fonts/montserrat.ttf" "eink/fonts/symbols.ttf" "eink/fonts/unscii.ttf")
     else()
         list(APPEND srcs "muse_ui.c" "muse_menu.c" "muse_settings_ui.c" "muse_keypad.c" "muse_lv_mem.c" "muse_frames.c")
+        # The frame face's embedded boot/fallback still (tools/gen_boot_still.py)
+        # stands in for the committed no-still stub when a board-local one exists
+        # here; this avatar/ is gitignored, like the custom avatar below, because
+        # the artwork is the board owner's own, not the repository's to ship.
+        file(GLOB boot_still CONFIGURE_DEPENDS "${COMPONENT_DIR}/avatar/muse_boot_still.c")
+        if(boot_still)
+            message(STATUS "Boot still: components/muse/avatar/muse_boot_still.c")
+            list(APPEND srcs "avatar/muse_boot_still.c")
+        else()
+            list(APPEND srcs "muse_boot_still.c")
+        endif()
     endif()
     if(CONFIG_MUSE_HATCH)
         list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")

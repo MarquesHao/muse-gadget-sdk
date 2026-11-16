@@ -338,6 +338,7 @@ static const char *const MODE_NAMES[MUSE_MODE_COUNT] = {
 static lv_image_dsc_t s_muse_src;
 static lv_draw_buf_t *s_strips[STRIPS];
 static bool s_strip_busy[STRIPS];
+static bool s_pixel_blank;   /* minimal-face + embedded still: never render the pixel face */
 static uint16_t *s_cells;       /* each cell's colour as last invalidated */
 static uint16_t *s_cell_row;    /* one screen row of Muse */
 static bool s_cells_valid;
@@ -380,7 +381,15 @@ static lv_result_t muse_dec_get_area(lv_image_decoder_t *dec, lv_image_decoder_d
     if (!buf) {
         return LV_RESULT_INVALID;
     }
-    muse_pixel_scale((uint16_t *)buf->data, buf->header.stride / sizeof(uint16_t), full->x1, full->x2, y1, y2);
+    if (s_pixel_blank) {
+        /* The frame face owns the character on this board, from the
+         * embedded boot still on (muse_frames.c): the pixel face is
+         * disconnected and the canvas stays a plain black backing —
+         * what the levelup fade lands on — instead of the old face. */
+        memset(buf->data, 0, (size_t)buf->header.stride * (size_t)(y2 - y1 + 1));
+    } else {
+        muse_pixel_scale((uint16_t *)buf->data, buf->header.stride / sizeof(uint16_t), full->x1, full->x2, y1, y2);
+    }
     area->x1 = full->x1;
     area->x2 = full->x2;
     area->y1 = y1;
@@ -408,6 +417,8 @@ static void muse_image_init(void)
     s_muse_src.header.stride = s_canvas_px * sizeof(uint16_t);
     s_muse_src.data = (const uint8_t *)&s_muse_src;   /* LVGL skips sources without data */
     muse_pixel_set_size(s_canvas_px);
+    /* s_pixel_blank is decided in build_screen(), after the frame
+     * face has had its say (see muse_frames_attach there). */
 
     for (int i = 0; i < STRIPS; i++) {
         s_strips[i] = lv_draw_buf_create(s_canvas_px, STRIP_ROWS, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO);
@@ -1526,10 +1537,22 @@ static void build_screen(void)
     lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_canvas, on_canvas_clicked, LV_EVENT_CLICKED, NULL);
     /* The frame-library face (P8) layers over the canvas; the ring,
-     * icons and labels are created after this, so they stay on top. It
-     * shows nothing until its player has frames, and the pixel face
-     * remains the fallback everywhere the library is unavailable. */
+     * icons and labels are created after this, so they stay on top.
+     * With an embedded boot still decoded, the still is up from the
+     * first refresh and is the fallback everywhere the library is
+     * unavailable; without one, the image shows nothing until its
+     * player has frames and the pixel face remains the fallback, as
+     * before. */
     muse_frames_attach(face);
+    /* The pixel canvas's fate follows the same signal the frame
+     * player falls back on — the boot still's decode outcome, asked
+     * only now that attach has run: still up, and the old face is
+     * disconnected for good (the decoder blanks it, see
+     * muse_dec_get_area); still missing or undecodable, and the
+     * pixel face stays alive underneath as the real fallback. The
+     * decoder only runs at refresh time, after build_screen() is
+     * done, so setting the flag here is early enough. */
+    s_pixel_blank = muse_board->minimal_face && muse_frames_boot_still_up();
     if (s_ring) {
         /* The canvas's black corners reach the bezel; keep the ring on top. */
         lv_obj_move_foreground(s_ring);
