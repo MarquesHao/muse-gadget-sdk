@@ -88,9 +88,13 @@ static const char *TAG = "muse_frames";
  * is gone. Waking now shows 1:1 like every other visual, shifted
  * down by FR_WAKING_DY instead: simulated on the handoff frame,
  * +15 leaves the top edge and both centroids within ~1.3 px of
- * idle's. Only waking moves; idle itself, the stills and the kits
- * keep their existing placement, and waking's own mid-animation
- * motion remains, playing around idle's anchor. */
+ * idle's. Only waking moves; idle itself, the poses stills and the
+ * kits keep their existing placement, and waking's own
+ * mid-animation motion remains, playing around idle's anchor. The
+ * embedded boot still shares the shift: it is generated from
+ * waking's first frame (tools/gen_boot_still.py), so the boot
+ * sequence still -> waking -> idle reads as one continuous picture
+ * with no step at the first swap. */
 #define FR_WAKING_DY 15
 
 /* Visuals the resolver can ask for. */
@@ -448,9 +452,15 @@ static bool build_kit(const char *name, uint16_t *out)
 
 /* ---- display (always under the board's display lock) ---- */
 
-/* The visual the next swap_buffers() puts up; only waking is shown
- * shifted down (see FR_WAKING_DY). Set by every path that swaps. */
+/* The visual the next swap_buffers() puts up; waking — and the boot
+ * still, which is waking's first frame — are shown shifted down
+ * (see FR_WAKING_DY). Set by every path that swaps. */
 static visual_t s_swap_vis = V_NONE;
+
+/* Mid-dip: waking has faded to black and the next visual swapped in
+ * must start at opa 0 so the player can fade it in (dip_fade_in()).
+ * Set by dip_fade_out(), consumed by the player's enter path. */
+static bool s_dip;
 
 /* Display lock held by the caller (the show_* paths take it). */
 static void apply_framing(visual_t v)
@@ -458,7 +468,7 @@ static void apply_framing(visual_t v)
     lv_image_set_scale(s_img, 256);
     lv_obj_align(s_img, LV_ALIGN_CENTER, 0,
                  (muse_board->minimal_face ? FR_FACE_DY : 0) +
-                 (v == V_WAKING ? FR_WAKING_DY : 0));
+                 ((v == V_WAKING || v == V_STILL) ? FR_WAKING_DY : 0));
 }
 
 static void show_front(void)
@@ -467,7 +477,9 @@ static void show_front(void)
     s_dsc.data = (const uint8_t *)s_buf[s_front];
     lv_image_set_src(s_img, &s_dsc);
     apply_framing(s_swap_vis);
-    lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
+    /* Mid-dip the incoming visual starts black; the player fades it
+     * in right after the swap (see dip_fade_out()). */
+    lv_obj_set_style_opa(s_img, s_dip ? 0 : LV_OPA_COVER, 0);
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(s_img);
     muse_board->display_unlock();
@@ -533,6 +545,43 @@ static void fade_out(void)
         vTaskDelay(pdMS_TO_TICKS(45));
     }
     hide_face();
+}
+
+/* Waking's exit dips through black, like fade_out() above but
+ * shorter (~150 ms each way) and leaving the widget up at opa 0:
+ * the waking and idle artwork was shot at different distances —
+ * the face grows ~19% at the cut — and the dip turns that size
+ * step into a blink. Only the waking handoff uses this. The
+ * fade-out runs in the player task when the one-shot plays out;
+ * s_dip then makes the next swap start black (show_front), and
+ * the player fades the new visual in right after entering it.
+ * The display lock is taken per step, as in fade_out(), so the
+ * UI task is never blocked by the delays. */
+static void dip_fade_out(void)
+{
+    s_dip = true;
+    for (int opa = 128; opa >= 0; opa -= 64) {
+        muse_board->display_lock(-1);
+        lv_obj_set_style_opa(s_img, (lv_opa_t)opa, 0);
+        lv_obj_invalidate(s_img);
+        muse_board->display_unlock();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void dip_fade_in(void)
+{
+    for (int opa = 64; opa < 255; opa += 64) {
+        muse_board->display_lock(-1);
+        lv_obj_set_style_opa(s_img, (lv_opa_t)opa, 0);
+        lv_obj_invalidate(s_img);
+        muse_board->display_unlock();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    muse_board->display_lock(-1);
+    lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
+    lv_obj_invalidate(s_img);
+    muse_board->display_unlock();
 }
 
 /* ---- which visual should be up ---- */
@@ -780,6 +829,7 @@ static void player_task(void *arg)
         }
         if (want == V_NONE) {
             if (cur != V_NONE) {
+                s_dip = false;
                 hide_face();
                 cur = V_NONE;
             }
@@ -787,6 +837,7 @@ static void player_task(void *arg)
             continue;
         }
         if (s_broken[want]) {
+            s_dip = false;   /* the fallback face comes up as-is */
             if (want == V_WAKING) {
                 s_waking_done = true;   /* no waking asset: don't wedge on it */
             }
@@ -825,6 +876,7 @@ static void player_task(void *arg)
                 ok = enter_still(want);
             }
             if (!ok) {
+                s_dip = false;   /* the fallback face comes up as-is */
                 if (want == V_WAKING) {
                     s_waking_done = true;
                 }
@@ -836,6 +888,10 @@ static void player_task(void *arg)
                 continue;
             }
             ESP_LOGI(TAG, "show %s", VIS_NAMES[want]);
+            if (s_dip) {
+                s_dip = false;
+                dip_fade_in();
+            }
             cur = want;
             continue;
         }
@@ -851,6 +907,7 @@ static void player_task(void *arg)
                 /* A one-shot played out (its last frame had its dwell). */
                 if (cur == V_WAKING) {
                     s_waking_done = true;
+                    dip_fade_out();   /* dip through black into idle */
                 }
                 if (cur == V_LEVELUP) {
                     s_levelup_pending = false;
@@ -978,6 +1035,7 @@ void muse_frames_attach(lv_obj_t *face)
             s_still_dsc.data = (const uint8_t *)s_still;
             s_still_up = true;
             lv_image_set_src(s_img, &s_still_dsc);
+            apply_framing(V_STILL);   /* same placement waking gets */
             lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
             lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
             lv_obj_invalidate(s_img);

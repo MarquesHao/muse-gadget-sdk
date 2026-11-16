@@ -17,8 +17,9 @@
 
 Usage: gen_boot_still.py INPUT.jpg OUTPUT.c
 
-Reads a 466x466 JPEG (the frame library's idle first frame is the
-natural source) and writes a C file defining muse_boot_still_jpg()
+Reads a 466x466 JPEG (the frame library's waking first frame is the
+natural source: the still then continues into the waking sequence
+with no visible step) and writes a C file defining muse_boot_still_jpg()
 over the embedded bytes. The output belongs in the gitignored
 components/muse/avatar/ directory: the artwork it embeds is the
 board owner's own and is not part of the repository. CMake prefers
