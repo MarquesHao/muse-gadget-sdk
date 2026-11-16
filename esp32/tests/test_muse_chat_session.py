@@ -341,8 +341,9 @@ static void typed_reply_at_cap(bool finished, bool busy) {
     assert(!strcmp(console_fields, finished && !busy ? "\"messages\":1,\"complete\":true"
                                                      : "\"messages\":1,\"complete\":false"));
 }
-/* A dictated turn names the device, so Muse keeps its reply short and plain;
- * a typed one doesn't. Both still ask for text. */
+/* A dictated turn names the device, so Muse keeps its reply short and plain,
+ * and asks for a voice-modality reply so the reply can be spoken; a typed one
+ * names nothing and still asks for text. */
 static void chat_request(bool spoken) {
     chat_body[0] = '\0';
     if (spoken) {
@@ -352,7 +353,7 @@ static void chat_request(bool spoken) {
         text_begin("Hi");
     }
     assert(s_turn.phase == P_WAIT_REPLY && s_turn.text == !spoken);
-    assert(!strcmp(chat_body, spoken ? "{\"message\":\"Hi\",\"output_modality\":\"text\",\"device\":\"mcu-wearable\"}"
+    assert(!strcmp(chat_body, spoken ? "{\"message\":\"Hi\",\"output_modality\":\"voice\",\"device\":\"mcu-wearable\"}"
                                      : "{\"message\":\"Hi\",\"output_modality\":\"text\"}"));
 }
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER

@@ -112,7 +112,7 @@ static bool muse_link_req_send(int64_t id,const void *data,size_t len,bool end,i
         assert(id==requests[0].id);
         if(end) operation(5);
         else if(len>20 && ((const char*)data)[0]=='{') {
-            assert(strstr(data,"\"output_modality\":\"text\"")); operation(2);
+            assert(strstr(data,"\"output_modality\":\"voice\"")); operation(2);
         }
     }
     return true;
@@ -328,10 +328,10 @@ static void transcript_and_lines(void) {
     assert(muse_hatch_turn_event(text,sizeof(text))==MUSE_HATCH_EV_HEARD && !strcmp(text,"Hello"));
     assert(muse_hatch_turn_event(text,sizeof(text))==MUSE_HATCH_EV_REPLY);
 }
-static void text_modality(void) {
+static void note_modality(void) {
     cJSON *text=cJSON_Parse(MUSE_HATCH_NOTE_HEAD MUSE_HATCH_NOTE_TAIL);
     assert(text);
-    assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(text,"output_modality")),"text"));
+    assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(text,"output_modality")),"voice"));
     const char *device=cJSON_GetStringValue(cJSON_GetObjectItem(text,"device"));
     assert(device && !strcmp(device,"mcu-wearable"));
     cJSON_Delete(text);
@@ -345,7 +345,7 @@ int main(int argc,char **argv) {
     case 3: unicode_and_fields(); break;
     case 4: retry_and_stale(); break;
     case 5: denied_and_ack(); break;
-    case 6: text_modality(); break;
+    case 6: note_modality(); break;
     case 7: transcript_and_lines(); break;
     case 8: rejected_deltas(); break;
     case 9: rejected_before_ack(); break;

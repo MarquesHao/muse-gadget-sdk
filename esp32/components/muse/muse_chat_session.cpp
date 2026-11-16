@@ -1341,7 +1341,9 @@ static void post_chat(const char *text)
     }
     ESP_LOGI(TAG, "heard: \"%s\"", text);
     emit(MUSE_HATCH_EV_HEARD, text);
-    send_chat(text, "text", true);
+    /* A spoken turn asks for a voice-modality reply, so the VM's TTS stream
+     * will speak it (it refuses text-modality replies with an HTTP 400). */
+    send_chat(text, "voice", true);
 }
 
 /* A typed turn: the text goes straight to the chat. */
