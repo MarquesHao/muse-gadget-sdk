@@ -735,10 +735,15 @@ static void on_quickset_volume_done(lv_event_t *e)
 static void on_canvas_clicked(lv_event_t *e)
 {
     (void)e;
-    /* A tap on Muse is only a pat now: the happy face. The mode/volume
-     * card that used to pop up here moved to the quick settings tile
-     * (swipe right) — Hugh found the popup in the way. */
-    muse_state_make_happy();
+    /* A tap on Muse is a pat, not a menu (the card that used to pop
+     * up here moved to the quick settings tile — Hugh found the popup
+     * in the way). In IDLE the pat asks the frame player for a
+     * one-shot reaction — the celebration sequence and the happy
+     * still in turn. Taps in any other state are ignored, so a pat
+     * never interrupts a turn, a call or a recording. */
+    if (muse_state_mode(NULL) == MUSE_MODE_IDLE && !muse_state_recording()) {
+        muse_frames_pet_tap();
+    }
 }
 
 static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compact)
@@ -1519,6 +1524,10 @@ static void build_quick_tile(lv_obj_t *tile)
     s_qset_vol_sl = lv_slider_create(vol_row);
     lv_slider_set_range(s_qset_vol_sl, 0, 100);
     lv_slider_set_value(s_qset_vol_sl, muse_settings_volume(), LV_ANIM_OFF);
+    /* Forgiving fingers: the track is a thin line on a 466 px round
+     * screen, so widen the hit area well past the drawn slider (the
+     * settings page's sliders already take 16). Looks unchanged. */
+    lv_obj_set_ext_click_area(s_qset_vol_sl, 16);
     lv_obj_set_flex_grow(s_qset_vol_sl, 1);
     lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_RELEASED, NULL);

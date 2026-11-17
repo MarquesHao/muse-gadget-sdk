@@ -150,6 +150,26 @@ class MuseAudioCodeclessMicTest(unittest.TestCase):
             result = subprocess.run([str(path.with_suffix(""))], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_speaker_write_has_board_gated_makeup_gain(self) -> None:
+        # Night round (2026-11-16): replies sounded quiet with the DAC
+        # already at the top of the codec curve, so the write path adds
+        # a soft-limited +6 dB — gated to the 1.75C board, with the
+        # plain passthrough kept for every other board.
+        source = (MUSE / "muse_audio.c").read_text()
+        write = _function(source, "muse_audio_write")
+        self.assertIn("CONFIG_MUSE_BOARD_WAVESHARE_S3_175C", write)
+        self.assertIn("mic_dsp_limit((float)mono[i] * 2.0f)", write)
+        self.assertIn("mute ? 0 : mono[i]", write)
+
+    def test_this_board_records_from_the_left_mic_only(self) -> None:
+        # The 0.5*(L+R) mix cancels 4-5 kHz between the two capsules
+        # (loopback, night round 2026-11-16: mix 8-9 dB down at 4 kHz,
+        # ~19 dB at 5 kHz against both singles), so the board declares
+        # the left slot instead of the -1 mix.
+        board = (MUSE / "boards" / "board_waveshare_s3_175c.c").read_text()
+        self.assertIn(".mic_slot = 0,", board)
+        self.assertNotIn(".mic_slot = -1,", board)
+
     def test_board_contract_has_one_codecless_mic_hook(self) -> None:
         header = (MUSE / "muse_board.h").read_text()
         self.assertIn("esp_err_t (*mic_read)(int16_t *mono, size_t frames);", header)

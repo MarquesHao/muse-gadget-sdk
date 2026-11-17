@@ -58,8 +58,15 @@ class QuickSettingsTileTest(unittest.TestCase):
         cls.src = UI.read_text(encoding="utf-8")
 
     def test_tap_face_only_makes_happy(self) -> None:
+        # Night round (2026-11-16): the tap now asks the frame player
+        # for a one-shot pet reaction (celebration / happy, alternating)
+        # instead of raising happiness directly — and only from IDLE,
+        # so a pat never interrupts a turn or a recording.
         body = body_of(self.src, "static void on_canvas_clicked")
-        self.assertIn("muse_state_make_happy()", body)
+        self.assertIn("muse_frames_pet_tap()", body)
+        self.assertIn("MUSE_MODE_IDLE", body)
+        self.assertIn("muse_state_recording()", body)
+        self.assertNotIn("muse_state_make_happy()", body)
         self.assertNotIn("quick_", body)   # no panel call left in the tap path
         self.assertNotIn("lv_", body)      # and no UI object is touched at all
 

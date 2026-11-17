@@ -293,7 +293,14 @@ static const muse_board_t s_board = {
     .display_pause = display_pause,
     .draw_frame = muse_lcd_bands_frame,
     .audio_init = audio_init,
-    .mic_slot = -1,
+    /* Left mic only, not the -1 mix. The gadget loopback (night round,
+     * 2026-11-16) measured the 0.5*(L+R) mix 8-9 dB down at 4 kHz and
+     * ~19 dB down at 5 kHz against BOTH single capsules: the two mics
+     * sit ~4 cm apart, so direct sound lands half a period apart in
+     * that band and cancels in the mix — right where consonant clarity
+     * lives. The left capsule was also the hotter of the two across
+     * 200 Hz-2 kHz in the same sweep. */
+    .mic_slot = 0,
     .set_mic_gain = set_mic_gain,
     .poll_buttons = poll_buttons,
 #if !CONFIG_MUSE_BOARD_WAVESHARE_S3_175

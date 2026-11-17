@@ -621,6 +621,18 @@ static bool s_levelup_pending;
 static float s_prev_happy;
 static bool s_waking_done;
 
+/* Pet taps (muse_frames_pet_tap): a pending request plus which of the
+ * two reactions is next. Written by the UI task, consumed only by the
+ * player's resolver in IDLE, so a tap lands between turns, never in
+ * the middle of one. */
+static volatile bool s_pet_pending;
+static bool s_pet_levelup_turn = true;
+
+void muse_frames_pet_tap(void)
+{
+    s_pet_pending = true;
+}
+
 static visual_t resolve_target(void)
 {
     if (muse_state_asleep() || !muse_ui_face_active()) {
@@ -650,6 +662,21 @@ static visual_t resolve_target(void)
     case MUSE_MODE_BOOT:
         return s_waking_done ? V_IDLE : V_WAKING;
     case MUSE_MODE_IDLE:
+        if (s_pet_pending) {
+            /* A pat on the face: alternate the two one-shot reactions
+             * the library already has. The celebration half queues the
+             * same pending flag the happiness edge uses; the happy half
+             * raises happiness through muse_state, exactly like a
+             * turn's own pat, and the branch below picks it up on the
+             * next pass. */
+            s_pet_pending = false;
+            if (s_pet_levelup_turn && !s_broken[V_LEVELUP]) {
+                s_levelup_pending = true;
+            } else {
+                muse_state_make_happy();
+            }
+            s_pet_levelup_turn = !s_pet_levelup_turn;
+        }
         if (s_levelup_pending) {
             if (!s_broken[V_LEVELUP]) {
                 return V_LEVELUP;

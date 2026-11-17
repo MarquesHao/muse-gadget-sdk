@@ -571,8 +571,27 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
     while (frames) {
         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
         for (size_t i = 0; i < n; i++) {
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
+            /* Playback makeup gain, this board only. The codec volume
+             * curve already runs the ES8311 DAC at its top (vol 100 =
+             * 0 dB on the curve, and the BSP's hw_gain correction puts
+             * full scale ~+3.6 dB into the DAC), so there is no clean
+             * headroom left in the analog chain — but TTS speech sits
+             * far below full scale (peaks around -6 dBFS), which is
+             * why replies sounded quiet. A fixed +6 dB here, through
+             * the mic chain's tanh soft limiter so loud passages bend
+             * instead of clipping, lifts speech into the range the DAC
+             * can actually deliver. The settings slider stays the
+             * master gate: this multiplies whatever it lets through,
+             * it does not bypass it. The before/after delta is measured
+             * on the gadget loopback (night round, 2026-11-16). */
+            int16_t v = mute ? 0 : (int16_t)mic_dsp_limit((float)mono[i] * 2.0f);
+            s_out_stereo[2 * i] = v;
+            s_out_stereo[2 * i + 1] = v;
+#else
             s_out_stereo[2 * i] = mute ? 0 : mono[i];
             s_out_stereo[2 * i + 1] = mute ? 0 : mono[i];
+#endif
         }
         if (esp_codec_dev_write(s_spk, s_out_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
             return ESP_FAIL;

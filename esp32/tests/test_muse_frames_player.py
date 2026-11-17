@@ -37,6 +37,21 @@ class FramesPlayerPlacementTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.src = FRAMES.read_text(encoding="utf-8")
 
+    def test_pet_tap_is_a_flag_the_resolver_consumes_in_idle(self) -> None:
+        # Night round (2026-11-16): a face tap must never reach into
+        # the player mid-turn. It raises a flag here; only the IDLE
+        # branch of resolve_target consumes it, alternating between
+        # the level-up celebration and the happy still.
+        self.assertIn("void muse_frames_pet_tap(void)", self.src)
+        self.assertIn("s_pet_pending = true", self.src)
+        idle = self.src.index("case MUSE_MODE_IDLE:")
+        pet = self.src.index("if (s_pet_pending)", idle)
+        levelup = self.src.index("if (s_levelup_pending)", idle)
+        self.assertLess(pet, levelup)
+        body = self.src[pet:levelup]
+        self.assertIn("s_levelup_pending = true", body)
+        self.assertIn("muse_state_make_happy()", body)
+
     def test_player_core_is_the_network_core(self) -> None:
         self.assertIn("#define FR_PLAYER_CORE 0", self.src)
 
