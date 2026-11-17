@@ -28,6 +28,7 @@ and the box stays up for whichever text is showing.
 from __future__ import annotations
 
 import re
+import math
 import unittest
 from pathlib import Path
 
@@ -143,12 +144,12 @@ class CaptionDialogTest(unittest.TestCase):
         at = build.index("s_dialog = lv_obj_create(face)")
         self.assertIn("if (muse_board->minimal_face)", build[max(0, at - 1600):at])
         self.assertIn("lv_obj_add_flag(s_dialog, LV_OBJ_FLAG_HIDDEN)", build)
-        # Bottom quarter of the screen, and it must not eat touches.
-        self.assertIn("lv_obj_align(s_dialog, LV_ALIGN_BOTTOM_MID, 0, -8)", build)
+        # Below the mouth, and it must not eat touches.
+        self.assertIn("lv_obj_align(s_dialog, LV_ALIGN_TOP_MID, 0, DIALOG_TOP)", build)
         self.assertIn("lv_obj_remove_flag(s_dialog, LV_OBJ_FLAG_CLICKABLE)", build)
 
     def test_caption_moves_into_the_box(self) -> None:
-        self.assertIn("lv_obj_set_parent(s_caption_lbl, s_dialog)", self.src)
+        self.assertIn("lv_obj_set_parent(s_caption_lbl, s_dialog_text)", self.src)
 
     def test_box_lives_and_dies_with_the_showing_text(self) -> None:
         # The box frames the caption while listening and the reply body
@@ -158,6 +159,64 @@ class CaptionDialogTest(unittest.TestCase):
             "lv_obj_set_flag(s_dialog, LV_OBJ_FLAG_HIDDEN, !shown[0])",
             self.src)
         self.assertNotIn("answer >= 0 || !shown[0]", self.src)
+
+    def test_frame_fits_every_occupied_row(self) -> None:
+        constants = dict(re.findall(r"#define (DIALOG_\w+) (\d+)", self.src))
+        width, top = int(constants["DIALOG_W"]), int(constants["DIALOG_TOP"])
+        radius = 466 // 2 - 10 - 6
+        bottom = int(math.sqrt(radius ** 2 - (width + 8) ** 2 / 4)) + 233 - 4
+        self.assertEqual((width, top, bottom), (208, 329, 417))
+        build = body_of(self.src, "static void build_screen")
+        self.assertIn("reply_bottom(DIALOG_W + 8, ring_in) + s_h / 2 - 4", build)
+        refs = [(350, 403), (400, 343), (430, 278), (458, 121)]
+        for y in range(top - 4, bottom + 5):
+            chord = 2 * math.sqrt(233 ** 2 - (y - 233) ** 2)
+            # Extend the first reference conservatively to the upper rows.
+            reference = refs[0][1]
+            for (y0, w0), (y1, w1) in zip(refs, refs[1:]):
+                if y0 <= y <= y1:
+                    reference = w0 + (w1 - w0) * (y - y0) / (y1 - y0)
+            self.assertLess(width + 8, min(chord, reference))
+            self.assertLessEqual((width + 8) ** 2 / 4 + (y - 233) ** 2,
+                                 radius ** 2)
+
+    def test_two_line_cjk_page_fits_without_scrolling(self) -> None:
+        constants = dict(re.findall(r"#define (DIALOG_\w+) (\d+)", self.src))
+        width, top, inset = (int(constants[name]) for name in
+                             ("DIALOG_W", "DIALOG_TOP", "DIALOG_INSET"))
+        radius = 217
+        bottom = math.isqrt(radius ** 2 - (width + 8) ** 2 // 4) + 233 - 4
+        viewport_height = bottom - top - 2 * inset
+        self.assertEqual((width - 2 * inset, viewport_height), (184, 64))
+        cjk_pitch = 31 + 2
+        page_height = 2 * cjk_pitch - 2
+        self.assertGreaterEqual(viewport_height, page_height)
+        self.assertEqual(max(0, page_height - viewport_height), 0)
+        # The outline touches the approximate mouth endpoint, without intrusion.
+        self.assertEqual(top - 4, 325)
+        # A wider centred box would lose the height needed for two CJK lines.
+        wider_bottom = math.isqrt(radius ** 2 - (width + 2 + 8) ** 2 // 4) + 233 - 4
+        self.assertLess(wider_bottom - top - 2 * inset, page_height)
+        build = body_of(self.src, "static void build_screen")
+        self.assertIn("bottom - DIALOG_TOP - 2 * DIALOG_INSET", build)
+        tick = body_of(self.src, "static void update_status")
+        self.assertIn("if (overflow < 0) overflow = 0;", tick)
+
+    def test_hold_then_scroll_is_tick_driven_and_clipped(self) -> None:
+        tick = body_of(self.src, "static void update_status")
+        self.assertIn("#define DIALOG_HOLD_MS 2000", self.src)
+        self.assertIn("#define DIALOG_STEP_MS 100", self.src)
+        self.assertIn("s_dialog_since = lv_tick_get();", tick)
+        self.assertIn("elapsed > DIALOG_HOLD_MS", tick)
+        self.assertIn("(elapsed - DIALOG_HOLD_MS) / DIALOG_STEP_MS", tick)
+        self.assertIn("if (offset > (uint32_t)overflow) offset = overflow;", tick)
+        self.assertLess(tick.index("s_dialog_since = lv_tick_get();"),
+                        tick.index("uint32_t elapsed = lv_tick_get() - s_dialog_since;"))
+        self.assertIn("lv_obj_set_y(lbl, -(int)offset)", tick)
+        self.assertIn("lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_WRAP)", tick)
+        self.assertIn("lv_obj_set_parent(s_reply_lbl, s_dialog_text)", self.src)
+        self.assertIn("lv_obj_remove_flag(s_dialog_text, LV_OBJ_FLAG_SCROLLABLE)", self.src)
+        self.assertIn("!s_dialog && answer == ANSWER_READ && muse_voice_in_call()", tick)
 
 
 class ReplyInDialogTest(unittest.TestCase):
@@ -174,15 +233,14 @@ class ReplyInDialogTest(unittest.TestCase):
         self.assertIn("for (int i = 0; i < 2; i++)", build)
         self.assertIn("answer_layout_t *a = &s_answers[i];", build)
         self.assertIn("a->scale = 1;", build)
-        self.assertIn("a->w = 360;", build)   # the 384 box less its insets
+        self.assertIn("a->w = DIALOG_W - 2 * DIALOG_INSET;", build)   # the narrower box less its insets
         self.assertIn("a->h = 2 * box_pitch - CAPTION_LINE_SPACE;", build)
 
     def test_box_page_rides_where_the_caption_rides(self) -> None:
         build = body_of(self.src, "static void build_answer")
-        # The box's top (108 tall, bottom-aligned, lifted 8) plus the
-        # caption's 12 px inset, from the centre: the same band the
-        # caption label occupies inside the box.
-        self.assertIn("a->top = s_h - 8 - 108 + 12 - s_h / 2;", build)
+        # Both layouts share the caption viewport's twelve-pixel inset,
+        # measured from the centre for the answer-layout contract.
+        self.assertIn("a->top = DIALOG_TOP + DIALOG_INSET - s_h / 2;", build)
 
     def test_pager_still_follows_the_layout(self) -> None:
         # No second page size anywhere: the UI tick keeps sizing the

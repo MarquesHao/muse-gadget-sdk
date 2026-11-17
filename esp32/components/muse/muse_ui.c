@@ -278,6 +278,14 @@ static int s_boot_hint_stage;
 static float s_boot_hint_until;
 static lv_obj_t *s_caption_lbl;
 static lv_obj_t *s_dialog;   /* minimal face only: the game-style box the caption sits in */
+static lv_obj_t *s_dialog_text;   /* clips both labels clear of the frame */
+static uint32_t s_dialog_since;  /* tick when the current text first appeared */
+
+#define DIALOG_W 208
+#define DIALOG_TOP 329
+#define DIALOG_INSET 12
+#define DIALOG_HOLD_MS 2000
+#define DIALOG_STEP_MS 100       /* one pixel per step, ten pixels per second */
 
 bool muse_ui_dialog_up(void)
 {
@@ -1273,13 +1281,11 @@ static void build_answer(lv_obj_t *face, int ring_in)
         for (int i = 0; i < 2; i++) {
             answer_layout_t *a = &s_answers[i];
             a->scale = 1;
-            a->w = 360;   /* the box is 384 wide, less 12 px insets */
+            a->w = DIALOG_W - 2 * DIALOG_INSET;
             a->cols = a->w / box_cw;
             a->lines = 2;
             a->h = 2 * box_pitch - CAPTION_LINE_SPACE;
-            /* The box's top (108 tall, bottom-aligned, lifted 8) plus
-             * the caption's 12 px inset, measured from the centre. */
-            a->top = s_h - 8 - 108 + 12 - s_h / 2;
+            a->top = DIALOG_TOP + DIALOG_INSET - s_h / 2;
         }
     }
     ESP_LOGI(TAG, "reply pages: %d x %d heard, %d x %d read", s_answers[ANSWER_HEARD].cols,
@@ -1291,6 +1297,7 @@ static void build_answer(lv_obj_t *face, int ring_in)
     lv_label_set_long_mode(s_reply_lbl, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_remove_flag(s_reply_lbl, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
+    if (s_dialog_text) lv_obj_set_parent(s_reply_lbl, s_dialog_text);
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
     s_review_position = make_label(face, &lv_font_unscii_8, COLOR_DIM);
     lv_obj_align(s_review_position, LV_ALIGN_BOTTOM_MID, 0, -30);
@@ -1874,29 +1881,14 @@ static void build_screen(void)
         return;
     }
     if (muse_board->minimal_face) {
-        /* Game-style dialog box (Hugh's ask, 2026-11-16): the caption
-         * gets a dark translucent box with a light frame in the bottom
-         * quarter of the screen, RPG-dialog style, instead of floating
-         * over the face where it was hard to read. The caption label
-         * moves inside it below; its text, font and paging are
-         * untouched — only the container changes. The reply body
-         * joins it there: build_answer gives the answer layouts the
-         * box's page geometry on this board, so the reply label rides
-         * in the same band while a reply is read out. The box follows
-         * the text's lifecycle in the UI tick: up while the caption
-         * or the reply shows, gone with it, so the face is clear the
-         * rest of the time (to
-         * make it permanent instead, drop the tick's hide below). The
-         * speaking mouth frames end around y 325 on screen (measured on
-         * the kit's talk frames), so a top edge at 350 leaves the mouth
-         * uncovered; the caption rides at the box's top, clear of the
-         * round glass's narrowing bottom. Created here, after the
-         * caption label, so it stacks over the face art and under the
-         * meter and answer label built later. */
+        /* Fit two 33-pixel CJK lines without scrolling normal pages.
+         * The outline touches the mouth endpoint at y=325; include its
+         * four pixels when finding the bottom chord inside the ring. */
         s_dialog = lv_obj_create(face);
         lv_obj_remove_style_all(s_dialog);
-        lv_obj_set_size(s_dialog, 384, 108);
-        lv_obj_align(s_dialog, LV_ALIGN_BOTTOM_MID, 0, -8);
+        int bottom = reply_bottom(DIALOG_W + 8, ring_in) + s_h / 2 - 4;
+        lv_obj_set_size(s_dialog, DIALOG_W, bottom - DIALOG_TOP);
+        lv_obj_align(s_dialog, LV_ALIGN_TOP_MID, 0, DIALOG_TOP);
         lv_obj_set_style_bg_color(s_dialog, lv_color_hex(0x0d0d17), 0);
         lv_obj_set_style_bg_opa(s_dialog, LV_OPA_80, 0);
         lv_obj_set_style_border_color(s_dialog, lv_color_hex(0xe8e4ff), 0);
@@ -1909,6 +1901,13 @@ static void build_screen(void)
         lv_obj_remove_flag(s_dialog, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(s_dialog, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(s_dialog, LV_OBJ_FLAG_HIDDEN);
+        s_dialog_text = lv_obj_create(s_dialog);
+        lv_obj_remove_style_all(s_dialog_text);
+        lv_obj_set_size(s_dialog_text, DIALOG_W - 2 * DIALOG_INSET,
+                        bottom - DIALOG_TOP - 2 * DIALOG_INSET);
+        lv_obj_align(s_dialog_text, LV_ALIGN_TOP_MID, 0, DIALOG_INSET - 2);   /* parent border is two pixels */
+        lv_obj_remove_flag(s_dialog_text, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(s_dialog_text, LV_OBJ_FLAG_CLICKABLE);
     }
     /* Fixed height: a longer caption ends in dots rather than growing into the ring. */
     lv_obj_set_size(s_caption_lbl, CAPTION_W, cap_h);
@@ -1916,9 +1915,9 @@ static void build_screen(void)
     lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_align(s_caption_lbl, LV_ALIGN_CENTER, 0, cap_top + cap_h / 2);
     if (s_dialog) {
-        /* Into the box: same size, riding at its top. */
-        lv_obj_set_parent(s_caption_lbl, s_dialog);
-        lv_obj_align(s_caption_lbl, LV_ALIGN_TOP_MID, 0, 12);
+        /* Both labels use the same clipped reading area. */
+        lv_obj_set_parent(s_caption_lbl, s_dialog_text);
+        lv_obj_align(s_caption_lbl, LV_ALIGN_TOP_MID, 0, 0);
     }
 
     /* Chunky level meter. */
@@ -2648,11 +2647,11 @@ static void update_status(muse_mode_t mode, float now)
             lv_obj_set_style_text_font(lbl, caption_font_for(shown), 0);
         }
 #endif
-        if (answer == ANSWER_READ && muse_voice_in_call()) {
+        if (!s_dialog && answer == ANSWER_READ && muse_voice_in_call()) {
             shown = live_caption_tail(shown, &s_answers[answer]);
         }
         lv_label_set_text(lbl, shown);
-        if (answer == ANSWER_READ) {
+        if (!s_dialog && answer == ANSWER_READ) {
             const answer_layout_t *l = &s_answers[answer];
             lv_point_t size;
             const lv_font_t *font = lv_obj_get_style_text_font(lbl, 0);
@@ -2684,6 +2683,17 @@ static void update_status(muse_mode_t mode, float now)
              * are the box's own page — see build_answer). Visible
              * while the showing label has text, gone with it. */
             lv_obj_set_flag(s_dialog, LV_OBJ_FLAG_HIDDEN, !shown[0]);
+            /* A page change belongs to the speaker. Restart here rather than
+             * advancing pages ourselves; live caption edits restart too. */
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_WRAP);
+            lv_obj_set_width(lbl, DIALOG_W - 2 * DIALOG_INSET);
+            lv_point_t size;
+            lv_text_get_size(&size, shown, lv_obj_get_style_text_font(lbl, 0),
+                             0, CAPTION_LINE_SPACE, DIALOG_W - 2 * DIALOG_INSET,
+                             LV_TEXT_FLAG_NONE);
+            lv_obj_set_height(lbl, size.y > 0 ? size.y : 1);
+            lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 0);
+            s_dialog_since = lv_tick_get();
         }
 #if CONFIG_MUSE_SMALL_FULL_REPLY
         s_caption_shown = shown[0] != '\0';
@@ -2695,6 +2705,16 @@ static void update_status(muse_mode_t mode, float now)
         set_full_reply(s_caption_shown && (mode == MUSE_MODE_THINKING || mode == MUSE_MODE_SPEAKING));
     }
 #endif
+    if (s_dialog && !lv_obj_has_flag(s_dialog, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_t *lbl = answer >= 0 ? s_reply_lbl : s_caption_lbl;
+        uint32_t elapsed = lv_tick_get() - s_dialog_since;
+        int overflow = lv_obj_get_height(lbl) - lv_obj_get_height(s_dialog_text);
+        uint32_t offset = elapsed > DIALOG_HOLD_MS
+                        ? (elapsed - DIALOG_HOLD_MS) / DIALOG_STEP_MS : 0;
+        if (overflow < 0) overflow = 0;
+        if (offset > (uint32_t)overflow) offset = overflow;
+        lv_obj_set_y(lbl, -(int)offset);   /* stop at the last view until text changes */
+    }
     update_power(now);
 }
 
