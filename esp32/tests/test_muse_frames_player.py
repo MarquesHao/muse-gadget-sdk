@@ -254,15 +254,31 @@ class FramesIdleExpansionRoundTest(unittest.TestCase):
 
     def test_pool_covers_all_idle_variants_and_dances(self) -> None:
         for name in (
-            "V_IDLE2", "V_IDLE3", "V_IDLE4", "V_IDLE5", "V_STRETCH",
+            "V_IDLE", "V_IDLE4", "V_IDLE5",
             "V_DANCE1", "V_DANCE2", "V_DANCE3", "V_DANCE4", "V_DANCE5",
-            "V_DANCE6", "V_FLIP",
         ):
             self.assertIn(f"[{name}] = ", self.src)      # SEQS entry
             self.assertIn(f"{{ {name},", self.src)      # ROT_POOL entry
-        # Ping-pong variants store one direction only.
-        self.assertIn('[V_IDLE2] = { "idle2", 8, false, true }', self.src)
-        self.assertIn('[V_IDLE3] = { "idle3", 9, false, true }', self.src)
+        # Exact pool membership and weights: three idle variants at
+        # normal weight, five dances low — nothing else rotates.
+        pool = self.src.index("ROT_POOL[]")
+        body = self.src[pool:self.src.index("};", pool)]
+        import re
+        self.assertEqual(
+            sorted(re.findall(r"\{\s*(V_\w+),", body)),
+            ["V_DANCE1", "V_DANCE2", "V_DANCE3", "V_DANCE4", "V_DANCE5",
+             "V_IDLE", "V_IDLE4", "V_IDLE5"],
+        )
+        self.assertEqual(body.count("false }"), 3)   # normal weight
+        self.assertEqual(body.count("true }"), 5)    # dances are low
+        # The waking boot visual survives the slimming untouched.
+        self.assertIn('[V_WAKING] = { "waking", 56, true }', self.src)
+        # Slimmed on Hugh's call (2026-11-17 evening): the ping-pong
+        # close-ups, the flip gag, the Halloween dance and the
+        # waking-as-idle stretch are gone from the player entirely.
+        for name in ("V_IDLE2", "V_IDLE3", "V_STRETCH", "V_DANCE6", "V_FLIP"):
+            self.assertNotIn(name, self.src)
+        # The ping-pong cycle machinery stays (generic seq support).
         self.assertIn("2 * SEQS[v].frames - 2", self.src)   # the cycle
         self.assertIn("seq_file_idx(v, pos)", self.src)
 

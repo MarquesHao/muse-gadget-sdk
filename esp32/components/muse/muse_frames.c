@@ -209,18 +209,13 @@ typedef enum {
     V_PAUSED,     /* keep whatever is up, decode nothing */
     V_WAKING,
     V_IDLE,
-    V_IDLE2,     /* idle rotation pool (see ROT_POOL) */
-    V_IDLE3,
-    V_IDLE4,
+    V_IDLE4,     /* idle rotation pool (see ROT_POOL) */
     V_IDLE5,
-    V_STRETCH,   /* the waking artwork again, as an idle stretch */
     V_DANCE1,
     V_DANCE2,
     V_DANCE3,
     V_DANCE4,
     V_DANCE5,
-    V_DANCE6,
-    V_FLIP,      /* one-shot somersault gag, low rotation weight */
     V_WORKING,
     V_MAKING,
     V_LEVELUP,
@@ -246,18 +241,13 @@ typedef struct {
 static const seq_def_t SEQS[V_COUNT] = {
     [V_WAKING] = { "waking", 56, true },
     [V_IDLE] = { "idle", 40, false },
-    [V_IDLE2] = { "idle2", 8, false, true },
-    [V_IDLE3] = { "idle3", 9, false, true },
     [V_IDLE4] = { "idle4", 42, false },
     [V_IDLE5] = { "idle5", 83, false },
-    [V_STRETCH] = { "waking", 56, false },
     [V_DANCE1] = { "dance1", 35, false },
     [V_DANCE2] = { "dance2", 29, false },
     [V_DANCE3] = { "dance3", 39, false },
     [V_DANCE4] = { "dance4", 34, false },
     [V_DANCE5] = { "dance5", 36, false },
-    [V_DANCE6] = { "dance6", 25, false },
-    [V_FLIP] = { "flip", 33, true },
     [V_WORKING] = { "working", 40, false },
     [V_MAKING] = { "making", 40, false },
     [V_LEVELUP] = { "levelup", 40, true },
@@ -270,11 +260,9 @@ static const char *const VIS_NAMES[V_COUNT] = {
     [V_LISTENING] = "listening", [V_THINKING] = "thinking",
     [V_SLEEPY] = "sleepy",   [V_DIZZY] = "dizzy",     [V_REST] = "rest",
     [V_HAPPY] = "happy",     [V_MUSIC] = "music",     [V_STILL] = "still",
-    [V_IDLE2] = "idle2",     [V_IDLE3] = "idle3",     [V_IDLE4] = "idle4",
-    [V_IDLE5] = "idle5",     [V_STRETCH] = "stretch",
+    [V_IDLE4] = "idle4",     [V_IDLE5] = "idle5",
     [V_DANCE1] = "dance1",   [V_DANCE2] = "dance2",   [V_DANCE3] = "dance3",
-    [V_DANCE4] = "dance4",   [V_DANCE5] = "dance5",   [V_DANCE6] = "dance6",
-    [V_FLIP] = "flip",
+    [V_DANCE4] = "dance4",   [V_DANCE5] = "dance5",
 };
 
 /* Sequence positions are cycle positions: for a ping-pong sequence
@@ -968,17 +956,21 @@ static void dip_fade_in(void)
  * (Hugh, 2026-11-17: every animation that can pass as idle joins;
  * framing differences between variants are absorbed by the
  * crossfade, see crossfade_swap()). A shuffle bag deals the visits:
- * normal variants hold three slots each, low-weight ones (the six
- * official dances and the flip gag) one — so a low variant surfaces
- * occasionally, never twice in a row, and no variant repeats
- * back-to-back. Each visit plays its loops (ping-pong variants
- * count a forward-and-back as one loop; their per-loop time is
- * ~2 s against the full sequences' 4-10 s, so they get more loops
- * for a comparable dwell), then the player rotates: the next
+ * normal variants hold three slots each, low-weight ones (the five
+ * official dances) one — so a low variant surfaces occasionally,
+ * never twice in a row, and no variant repeats back-to-back. Each
+ * visit plays its loops, then the player rotates: the next
  * variant is picked here, and its enter crossfades. State faces
  * (working/making/taking-notes semantics, the headphones rule) are
  * NOT pool members: idle showing them would fake the status the
- * face exists to report. */
+ * face exists to report.
+ *
+ * Slimmed the same evening on Hugh's call after he reviewed every
+ * segment: the two ping-pong close-ups (idle2/idle3), the flip gag,
+ * the Halloween dance and the waking-as-idle stretch are out — the
+ * stretch duplicated the boot animation, which idle must not
+ * replay. The waking artwork itself is untouched (it is the boot
+ * sequence); it simply no longer joins the rotation. */
 typedef struct {
     visual_t v;
     int loops_min, loops_max;
@@ -987,18 +979,13 @@ typedef struct {
 
 static const rot_ent_t ROT_POOL[] = {
     { V_IDLE,    2, 3, false },
-    { V_IDLE2,   6, 8, false },
-    { V_IDLE3,   6, 8, false },
     { V_IDLE4,   2, 3, false },
     { V_IDLE5,   2, 3, false },
-    { V_STRETCH, 1, 1, false },
     { V_DANCE1,  2, 2, true },
     { V_DANCE2,  2, 2, true },
     { V_DANCE3,  2, 2, true },
     { V_DANCE4,  2, 2, true },
     { V_DANCE5,  2, 2, true },
-    { V_DANCE6,  2, 2, true },
-    { V_FLIP,    1, 1, true },
 };
 #define ROT_N (sizeof(ROT_POOL) / sizeof(ROT_POOL[0]))
 #define ROT_BAG_MAX 32
