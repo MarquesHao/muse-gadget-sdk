@@ -72,12 +72,17 @@ bool muse_frames_boot_still_up(void);
 bool muse_frames_hold(bool on);
 
 /*
- * A pat on the face: ask the player for a one-shot reaction the next
- * time it is sitting in IDLE. Reactions alternate between the level-up
- * celebration sequence and the happy still — both assets the library
- * already carries. The request is a flag, consumed by the player's
- * own resolver, so a tap can never interrupt a turn, a call or a
- * recording; the UI only raises it from IDLE taps in the first place.
+ * A pat on the face. When the build carries the embedded headphones
+ * sprite (muse_phones_sprite.h), the pat toggles the accessory over
+ * the idle face — it rises onto the ears, stays a moment, slides
+ * back down — answered in LVGL context, with the face itself never
+ * changing. Without the sprite, the pat asks the player for a
+ * one-shot reaction the next time it is sitting in IDLE: reactions
+ * alternate between the level-up celebration sequence and the happy
+ * still, both assets the library already carries, through a flag the
+ * player's own resolver consumes. Either way a tap can never
+ * interrupt a turn, a call or a recording; the UI only raises it
+ * from IDLE taps in the first place.
  */
 void muse_frames_pet_tap(void);
 

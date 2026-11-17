@@ -58,6 +58,16 @@ if(CONFIG_MUSE_ENABLED)
         else()
             list(APPEND srcs "muse_boot_still.c")
         endif()
+        # Same arrangement for the frame face's headphones sprite
+        # (tools/gen_phones_sprite.py): the board-local generated file
+        # stands in for the committed no-sprite stub when one exists.
+        file(GLOB phones_sprite CONFIGURE_DEPENDS "${COMPONENT_DIR}/avatar/muse_phones_sprite.c")
+        if(phones_sprite)
+            message(STATUS "Phones sprite: components/muse/avatar/muse_phones_sprite.c")
+            list(APPEND srcs "avatar/muse_phones_sprite.c")
+        else()
+            list(APPEND srcs "muse_phones_sprite.c")
+        endif()
     endif()
     if(CONFIG_MUSE_HATCH)
         list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")

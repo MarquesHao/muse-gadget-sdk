@@ -32,6 +32,7 @@
 #include "muse_board.h"
 #include "muse_boot_still.h"
 #include "muse_meeting.h"
+#include "muse_phones_sprite.h"
 #include "muse_mem.h"
 #include "muse_state.h"
 #include "muse_ui.h"
@@ -120,25 +121,19 @@ static const char *TAG = "muse_frames";
 #define FR_PLAYER_CORE 0
 
 /* Interactive state switches (idle <-> listening/thinking, a turn's
- * edges, pet reactions) used to hard-cut: the old frame froze for
- * the ~0.2 s the new one took to build, then snapped. A true
- * crossfade needs old and new frames on screen at once — a third
- * 434 KB frame buffer — and the library leaves only ~250-435 KB of
- * PSRAM free, so that does not fit. What fits is a shallow dip: fade
- * the old frame down to FR_SOFT_DIP_BOTTOM while the new one builds,
- * swap at the bottom, fade back up. ~40 ms each way, ~120 ms around
- * the swap. It is a dip, not a crossfade — the record says so too.
- * The waking handoff keeps its own full dip-to-black (Hugh-approved,
- * FR dip above); this one never applies to it. */
-#define FR_SOFT_DIP_BOTTOM 160   /* of 255: ~63% */
-#define FR_SOFT_DIP_STEP 95      /* one step each way: 255 <-> 160.
-                                  * A finer staircase was measured on
-                                  * device at ~270 ms of transition
-                                  * overhead — every step takes the
-                                  * display lock and waits out a full
-                                  * QSPI flush — so the dip is a single
-                                  * step down, swap, single step up. */
-#define FR_SOFT_DIP_MS 20
+ * edges, pet reactions) hard-cut on purpose: the old frame stays at
+ * full brightness for the ~0.2 s the new one takes to build, then a
+ * single opa-255 direct present replaces it whole. A shallow dip
+ * (old frame sunk to opa 160 during the build, swap at the bottom,
+ * fade back up) was tried and removed the same day the direct
+ * present landed: on device it read as "darkens, then comes back" —
+ * 160/255 is ~63% of code value but only ~36% of perceived
+ * brightness, and the undimmed border made the centre look darker
+ * still (Codex consultation, dev/咨询记录-切换呈现-codex.md).
+ * A true crossfade would need a third 434 KB frame buffer, which
+ * the PSRAM budget does not have. The waking handoff keeps its own
+ * full dip-to-black (Hugh-approved, dip_fade_out() below); nothing
+ * here applies to it. */
 
 /* The squash's low point (image scale, 256 = 1.0x). */
 #define FR_SQUASH_MIN 246        /* ~96% */
@@ -614,13 +609,6 @@ static bool s_enter_swap;
  * Set by dip_fade_out(), consumed by the player's enter path. */
 static bool s_dip;
 
-/* Mid-soft-dip (interactive switches, see FR_SOFT_DIP_BOTTOM): the
- * incoming visual must start at the dip's bottom opa, not at full,
- * so the player can fade it back up. Set by the enter path just
- * before its swap; consumed — read and cleared — by show_front(),
- * so no later frame swap can inherit it. */
-static bool s_soft_hold;
-
 /* Display lock held by the caller (the show_* paths take it). */
 /* The live squash factor (256 = 1.0x), written by the squash
  * animation in LVGL context and read here so a frame swap mid-squash
@@ -779,7 +767,7 @@ static void present_border(int y1)
 
 static void show_front(void)
 {
-    int opa = s_dip ? 0 : (s_soft_hold ? FR_SOFT_DIP_BOTTOM : LV_OPA_COVER);
+    int opa = s_dip ? 0 : LV_OPA_COVER;
     muse_board->display_lock(-1);
     /* Eligibility is decided under the lock: the face tile can be
      * swiped away while this swap was building, and a direct write
@@ -794,11 +782,10 @@ static void show_front(void)
     s_dsc.data = (const uint8_t *)s_buf[s_front];
     lv_image_set_src(s_img, &s_dsc);
     apply_framing(s_swap_vis);
-    /* Mid-dip the incoming visual starts black; the player fades it
-     * in right after the swap (see dip_fade_out()). Mid-soft-dip it
-     * starts at the dip's bottom instead (see s_soft_hold). */
+    /* Mid-waking-dip the incoming visual starts black; the player
+     * fades it in right after the swap (see dip_fade_out()). Every
+     * other swap starts at full opa. */
     lv_obj_set_style_opa(s_img, (lv_opa_t)opa, 0);
-    s_soft_hold = false;
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
     if (!direct) {
         lv_obj_invalidate(s_img);
@@ -860,34 +847,26 @@ static uint16_t *back_buffer(void)
     return s_buf[s_front ^ 1];
 }
 
-/* levelup's exit: fade the last frame out (whatever is under the
- * widget shows through — the blanked canvas on still builds), then
- * the caller moves on to idle. */
-static void fade_out(void)
-{
-    for (int opa = 200; opa >= 0; opa -= 55) {
-        muse_board->display_lock(-1);
-        lv_obj_set_style_opa(s_img, (lv_opa_t)opa, 0);
-        lv_obj_invalidate(s_img);
-        muse_board->display_unlock();
-        vTaskDelay(pdMS_TO_TICKS(45));
-    }
-    hide_face();
-}
+/* levelup's exit used to fade the last frame out here (LVGL opa
+ * steps 200 -> 0, ~45 ms apart) and hide the widget, leaving a
+ * dark gap while idle built. It was the same brightness excursion
+ * as the interactive soft dip and went with it: the caller now
+ * leaves the last celebration frame up, and the next visual's own
+ * swap replaces it whole at full opa — a hard cut, no dark phase. */
 
-/* Waking's exit dips through black, like fade_out() above but in
- * finer steps (~240 ms each way) and leaving the widget up at
- * opa 0: the waking and idle artwork was shot at different
- * distances — the face grows ~19% at the cut — and the dip turns
- * that size step into a blink. The ramp runs the full range from
- * LV_OPA_COVER in 32-opa steps: starting mid-way (or stepping
- * coarsely) is itself a visible jump at the cut. Only the waking
- * handoff uses this. The fade-out runs in the player task when
- * the one-shot plays out; s_dip then makes the next swap start
- * black (show_front), and the player fades the new visual in
- * right after entering it. The display lock is taken per step,
- * as in fade_out(), so the UI task is never blocked by the
- * delays. */
+/* Waking's exit dips through black in fine steps (~240 ms each
+ * way), leaving the widget up at opa 0: the waking and idle
+ * artwork was shot at different distances — the face grows ~19%
+ * at the cut — and the dip turns that size step into a blink. The
+ * ramp runs the full range from LV_OPA_COVER in 32-opa steps:
+ * starting mid-way (or stepping coarsely) is itself a visible
+ * jump at the cut. Only the waking handoff uses this (Hugh
+ * approved it as-is; the interactive soft dip that used to sit
+ * beside it is gone, this one stays). The fade-out runs in the
+ * player task when the one-shot plays out; s_dip then makes the
+ * next swap start black (show_front), and the player fades the
+ * new visual in right after entering it. The display lock is
+ * taken per step, so the UI task is never blocked by the delays. */
 static void dip_fade_out(void)
 {
     s_dip = true;
@@ -919,94 +898,299 @@ static void dip_fade_in(void)
     muse_board->display_unlock();
 }
 
-/* The soft dip for interactive switches (see FR_SOFT_DIP_BOTTOM):
- * the outgoing face sinks to ~63% while the incoming one builds,
- * the swap lands at the bottom (show_front honours s_soft_hold),
- * and soft_dip_fade_in() brings it back up. Same per-step lock
- * discipline as the waking dip. Not a crossfade: the two faces are
- * never on screen together. */
-static void soft_dip_fade_out(void)
+/* ---- the headphones: a pat reaction that moves, not a cut ----
+ *
+ * A pat used to cut the whole picture to the happy still — a
+ * different composition, so however it was faded it read as a jump.
+ * When the build carries the embedded sprite (muse_phones_sprite.h),
+ * a pat instead raises the headphones onto the idle face that is
+ * already up: the accessory is three small LVGL images (band, two
+ * cups) over the frame widget, animated on the LVGL tick, so the
+ * face itself never changes and the motion is continuous. The
+ * sprite data is embedded LVGL I8 (palette + index plane, see
+ * muse_phones_sprite.h for why not RGB565A8); the widgets point
+ * straight at it — no decode, no extra buffers.
+ *
+ * The idle head is not still either: the sequence sways (measured
+ * from the shipped frames by eye-patch tracking: a slow lean that
+ * reaches ~+27 px, a look-away around frames 9-21 whose translation
+ * is interpolated, blinks read as noise and were smoothed out). The
+ * overlay follows the frame on screen through FR_SWAY — translation
+ * only; the look-away's tilt is not corrected, which is part of why
+ * the wear is kept short. The table is indexed by the idle frame
+ * the player has just swapped in.
+ *
+ * Cycle: rise ~0.55 s ease-out with a small overshoot past the seat,
+ * a ~0.16 s settle back onto it, a 2 s hold, then a ~0.38 s fall
+ * back below the frame. A pat mid-flight reverses from wherever the
+ * accessory currently is. Leaving IDLE (a turn, a recording, sleep)
+ * takes the phones off at once — the player calls
+ * phones_force_off() before it paints anything else. Without the
+ * sprite, pats keep the original alternating reactions (the resolver
+ * branch below), so other boards are unchanged. */
+#define FR_PHONES_TRAVEL 300     /* px below the seat: out of frame */
+#define FR_PHONES_OVERSHOOT 7    /* px past the seat at the rise's end */
+#define FR_PHONES_HOLD_MS 2000
+#define FR_PHONES_MAX_PIECES 8
+
+static const int8_t FR_SWAY_X[40] = {
+    0, 0, 0, 1, 1, 0, 0, -1, -4, -6, -8, -10, -12, -14, -15, -17,
+    -18, -20, -21, -23, -24, -24, -8, 4, 12, 17, 21, 24, 25, 26,
+    26, 27, 27, 26, 25, 20, 13, 6, 3, 1,
+};
+static const int8_t FR_SWAY_Y[40] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 1, 1, 1, 1, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -2, -2, -3, -4,
+    -5, -6, -6, -6, -4, -3, -1, -1, 0, 0,
+};
+
+typedef enum {
+    PH_OFF = 0,   /* hidden, parked below the frame */
+    PH_RISING,
+    PH_SEATED,    /* on the ears; the fall is pending on a delay */
+    PH_FALLING,
+} phones_state_t;
+
+static const muse_phones_piece_t *s_phones_piece;
+static int s_phones_count;
+/* The widget/descriptor tables are metadata for flash payloads:
+ * PSRAM, like the preload table — internal RAM is the scarce one. */
+EXT_RAM_BSS_ATTR static lv_obj_t *s_phones_obj[FR_PHONES_MAX_PIECES];
+EXT_RAM_BSS_ATTR static lv_image_dsc_t s_phones_dsc[FR_PHONES_MAX_PIECES];
+static bool s_phones_ready;          /* sprite linked and widgets up */
+static volatile phones_state_t s_phones_state;
+static int32_t s_phones_dy = FR_PHONES_TRAVEL;   /* current travel offset */
+static int s_phones_anchor;          /* anim identity (the var pointer) */
+static bool s_phones_track;          /* the idle sequence is on screen */
+static int s_sway_idx;               /* idle frame on screen */
+/* Step cadence of the current run, for the acceptance log line. */
+static int s_ph_steps;
+static int64_t s_ph_t0, s_ph_last, s_ph_maxgap;
+
+static void phones_apply(void)
 {
-    muse_board->display_lock(-1);
-    if (present_ok()) {   /* decided under the lock: see show_front */
-        /* The same single step, presented whole (present_now): the
-         * dimming used to be a four-band LVGL sweep of its own. The
-         * border is NOT repaired here: it keeps the old face at full
-         * brightness while the new one builds (the chrome over it
-         * never dims either), and the swap's present_border() brings
-         * it to the new face at the dip's bottom in one go — an LVGL
-         * redraw here would only fight the build for PSRAM bandwidth
-         * (measured: ~100 ms on a kit build). */
-        present_squash_cancel();
-        int y1 = present_bottom();
-        lv_obj_set_style_opa(s_img, FR_SOFT_DIP_BOTTOM, 0);
-        present_now(FR_SOFT_DIP_BOTTOM, y1);
-        muse_board->display_unlock();
+    if (!s_phones_ready || s_phones_state == PH_OFF) {
         return;
     }
-    muse_board->display_unlock();
-    for (int opa = LV_OPA_COVER; opa > FR_SOFT_DIP_BOTTOM; opa -= FR_SOFT_DIP_STEP) {
-        muse_board->display_lock(-1);
-        lv_obj_set_style_opa(s_img, (lv_opa_t)(opa - FR_SOFT_DIP_STEP < FR_SOFT_DIP_BOTTOM
-                                                  ? FR_SOFT_DIP_BOTTOM
-                                                  : opa - FR_SOFT_DIP_STEP),
-                             0);
-        lv_obj_invalidate(s_img);
-        muse_board->display_unlock();
-        vTaskDelay(pdMS_TO_TICKS(FR_SOFT_DIP_MS));
+    int sx = 0, sy = 0;
+    if (s_phones_track && s_sway_idx >= 0 && s_sway_idx < 40) {
+        sx = FR_SWAY_X[s_sway_idx];
+        sy = FR_SWAY_Y[s_sway_idx];
+    }
+    int dy = muse_board->minimal_face ? FR_FACE_DY : 0;
+    for (int i = 0; i < s_phones_count; i++) {
+        lv_obj_set_pos(s_phones_obj[i], s_phones_piece[i].x + sx,
+                       s_phones_piece[i].y + dy + s_phones_dy + sy);
     }
 }
 
-static void soft_dip_fade_in(void)
+/* The player's frame swaps run under the display lock discipline of
+ * the show_* paths; the UI's own calls (attach, pats) are already in
+ * LVGL context. The sway index is written inside the lock: the LVGL
+ * side reads it in phones_apply(), so the hand-off stays under the
+ * one lock both sides already share (Codex review, 2026-11-17). */
+static void phones_apply_locked(int sway_idx)
 {
     muse_board->display_lock(-1);
-    if (present_ok()) {   /* decided under the lock: see show_front */
-        present_squash_cancel();
-        int y1 = present_bottom();
-        lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
-        present_now(LV_OPA_COVER, y1);
-        muse_board->display_unlock();
-        present_border(y1);
-        return;
-    }
+    s_sway_idx = sway_idx;
+    phones_apply();
     muse_board->display_unlock();
-    for (int opa = FR_SOFT_DIP_BOTTOM; opa < LV_OPA_COVER; opa += FR_SOFT_DIP_STEP) {
-        muse_board->display_lock(-1);
-        lv_obj_set_style_opa(s_img, (lv_opa_t)(opa + FR_SOFT_DIP_STEP > LV_OPA_COVER
-                                                  ? LV_OPA_COVER
-                                                  : opa + FR_SOFT_DIP_STEP),
-                             0);
-        lv_obj_invalidate(s_img);
-        muse_board->display_unlock();
-        vTaskDelay(pdMS_TO_TICKS(FR_SOFT_DIP_MS));
+}
+
+static void phones_set_hidden(bool hidden)
+{
+    for (int i = 0; i < s_phones_count; i++) {
+        if (hidden) {
+            lv_obj_add_flag(s_phones_obj[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(s_phones_obj[i], LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
-/* Whether the cur -> want switch gets the soft dip: only between
- * two interactive faces. Boot (STILL/NONE), the waking handoff (its
- * own defined dip, and want==V_WAKING never), sleep (PAUSED) and
- * fallback entries stay exactly as they were. */
-static bool soft_dip_pair(visual_t cur, visual_t want)
+static void phones_run_reset(void)
 {
-    if (want == V_WAKING || want == V_NONE || want == V_PAUSED) {
+    s_ph_steps = 0;
+    s_ph_t0 = esp_timer_get_time();
+    s_ph_last = s_ph_t0;
+    s_ph_maxgap = 0;
+}
+
+static void phones_exec(void *var, int32_t v)
+{
+    (void)var;
+    int64_t now = esp_timer_get_time();
+    if (s_ph_last) {
+        int64_t gap = now - s_ph_last;
+        if (gap > s_ph_maxgap) {
+            s_ph_maxgap = gap;
+        }
+    }
+    s_ph_last = now;
+    s_ph_steps++;
+    s_phones_dy = v;
+    phones_apply();
+}
+
+static void phones_log_run(const char *what)
+{
+    int64_t ms = (esp_timer_get_time() - s_ph_t0) / 1000;
+    ESP_LOGI(TAG, "phones %s: %d steps in %lld ms (max gap %lld ms)", what,
+             s_ph_steps, (long long)ms, (long long)(s_ph_maxgap / 1000));
+}
+
+static void phones_fall_start(int32_t delay_ms);   /* below */
+
+/* The fall's exec: the state only becomes PH_FALLING when the fall
+ * actually starts moving. With the post-settle hold the fall anim
+ * sits delayed for FR_PHONES_HOLD_MS while the state must still
+ * read PH_SEATED — a pat in that window means "take them off now"
+ * (phones_tap's SEATED case), not "rise again" (its FALLING case).
+ * Codex review, 2026-11-17. */
+static void phones_fall_exec(void *var, int32_t v)
+{
+    if (s_phones_state == PH_SEATED) {
+        s_phones_state = PH_FALLING;
+    }
+    phones_exec(var, v);
+}
+
+/* Anims on the anchor come in two exec flavours; a fresh start has
+ * to delete both or a delayed fall survives a re-rise. */
+static void phones_anim_delete_all(void)
+{
+    lv_anim_delete(&s_phones_anchor, phones_exec);
+    lv_anim_delete(&s_phones_anchor, phones_fall_exec);
+}
+
+static void phones_settled(lv_anim_t *a)
+{
+    (void)a;
+    phones_log_run("seated");
+    s_phones_state = PH_SEATED;
+    s_phones_dy = 0;
+    phones_apply();
+    /* The hold, then the fall — one delayed anim, so a pat during
+     * the hold only has to delete it and start the fall now. */
+    phones_fall_start(FR_PHONES_HOLD_MS);
+}
+
+static void phones_rise_overshot(lv_anim_t *a)
+{
+    (void)a;
+    lv_anim_t b;
+    lv_anim_init(&b);
+    lv_anim_set_var(&b, &s_phones_anchor);
+    lv_anim_set_exec_cb(&b, phones_exec);
+    lv_anim_set_values(&b, s_phones_dy, 0);
+    lv_anim_set_duration(&b, 160);
+    lv_anim_set_path_cb(&b, lv_anim_path_ease_in_out);
+    lv_anim_set_ready_cb(&b, phones_settled);
+    lv_anim_start(&b);
+}
+
+static void phones_rise_start(void)
+{
+    phones_anim_delete_all();
+    if (s_phones_state == PH_OFF) {
+        s_phones_dy = FR_PHONES_TRAVEL;
+        phones_set_hidden(false);
+    }
+    s_phones_state = PH_RISING;
+    phones_run_reset();
+    phones_apply();
+    int32_t dist = s_phones_dy + FR_PHONES_OVERSHOOT;
+    if (dist < 0) {
+        dist = -dist;
+    }
+    int dur = 90 + 450 * (int)dist / (FR_PHONES_TRAVEL + FR_PHONES_OVERSHOOT);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_phones_anchor);
+    lv_anim_set_exec_cb(&a, phones_exec);
+    lv_anim_set_values(&a, s_phones_dy, -FR_PHONES_OVERSHOOT);
+    lv_anim_set_duration(&a, dur);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_ready_cb(&a, phones_rise_overshot);
+    lv_anim_start(&a);
+}
+
+static void phones_fell(lv_anim_t *a)
+{
+    (void)a;
+    phones_log_run("off");
+    s_phones_state = PH_OFF;
+    s_phones_dy = FR_PHONES_TRAVEL;
+    phones_set_hidden(true);
+}
+
+static void phones_fall_start(int32_t delay_ms)
+{
+    phones_anim_delete_all();
+    if (delay_ms == 0) {
+        s_phones_state = PH_FALLING;
+    }   /* a delayed fall keeps PH_SEATED until phones_fall_exec */
+    phones_run_reset();
+    int32_t dist = FR_PHONES_TRAVEL - s_phones_dy;
+    if (dist < 0) {
+        dist = -dist;
+    }
+    int dur = 90 + 290 * (int)dist / FR_PHONES_TRAVEL;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_phones_anchor);
+    lv_anim_set_exec_cb(&a, phones_fall_exec);
+    lv_anim_set_values(&a, s_phones_dy, FR_PHONES_TRAVEL);
+    lv_anim_set_duration(&a, dur);
+    lv_anim_set_delay(&a, delay_ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+    lv_anim_set_ready_cb(&a, phones_fell);
+    lv_anim_start(&a);
+}
+
+/* A pat, in LVGL context: toggle the accessory. False when this
+ * build has no sprite — the caller then takes the original path. */
+static bool phones_tap(void)
+{
+    if (!s_phones_ready) {
         return false;
     }
-    switch (cur) {
-    case V_IDLE:
-    case V_LISTENING:
-    case V_THINKING:
-    case V_SPEAKING:
-    case V_WORKING:
-    case V_MAKING:
-    case V_LEVELUP:
-    case V_HAPPY:
-    case V_SLEEPY:
-    case V_DIZZY:
-    case V_REST:
-        return true;
-    default:
-        return false;
+    switch (s_phones_state) {
+    case PH_OFF:
+    case PH_FALLING:
+        phones_rise_start();
+        break;
+    case PH_RISING:
+    case PH_SEATED:
+        phones_fall_start(0);
+        break;
     }
+    return true;
+}
+
+/* The player is leaving the idle face (or the face is going away):
+ * the accessory comes off at once, whatever it was doing. Runs in
+ * the player's context, under the display lock like the show_*
+ * paths it precedes. */
+static void phones_force_off(void)
+{
+    if (!s_phones_ready) {
+        return;
+    }
+    muse_board->display_lock(-1);
+    if (s_phones_state == PH_OFF) {
+        /* Checked under the lock: a pat landing between an unlocked
+         * check and the lock could otherwise start a rise that this
+         * force-off then misses (Codex review, 2026-11-17). */
+        muse_board->display_unlock();
+        return;
+    }
+    phones_anim_delete_all();
+    s_phones_state = PH_OFF;
+    s_phones_dy = FR_PHONES_TRAVEL;
+    phones_set_hidden(true);
+    muse_board->display_unlock();
+    ESP_LOGI(TAG, "phones off (state change)");
 }
 
 /* ---- which visual should be up ---- */
@@ -1017,15 +1201,19 @@ static bool s_levelup_pending;
 static float s_prev_happy;
 static bool s_waking_done;
 
-/* Pet taps (muse_frames_pet_tap): a pending request plus which of the
- * two reactions is next. Written by the UI task, consumed only by the
- * player's resolver in IDLE, so a tap lands between turns, never in
- * the middle of one. */
+/* Pet taps (muse_frames_pet_tap): with the headphones sprite the
+ * tap is answered in LVGL context by the overlay above; without it,
+ * a pending request plus which of the two reactions is next.
+ * Written by the UI task, consumed only by the player's resolver in
+ * IDLE, so a tap lands between turns, never in the middle of one. */
 static volatile bool s_pet_pending;
 static bool s_pet_levelup_turn = true;
 
 void muse_frames_pet_tap(void)
 {
+    if (phones_tap()) {
+        return;
+    }
     s_pet_pending = true;
 }
 
@@ -1345,6 +1533,7 @@ static void player_task(void *arg)
         if (want == V_NONE) {
             if (cur != V_NONE) {
                 s_dip = false;
+                phones_force_off();
                 hide_face();
                 cur = V_NONE;
             }
@@ -1352,6 +1541,9 @@ static void player_task(void *arg)
             continue;
         }
         if (s_broken[want]) {
+            if (want != V_IDLE) {
+                phones_force_off();
+            }
             s_dip = false;   /* the fallback face comes up as-is */
             if (want == V_WAKING) {
                 s_waking_done = true;   /* no waking asset: don't wedge on it */
@@ -1370,11 +1562,12 @@ static void player_task(void *arg)
              * request waits for a new face, build is the part the
              * preload can shrink (asset reads + decode/composite). */
             int64_t t_req = esp_timer_get_time();
-            s_enter_swap = true;   /* an enter, not a frame advance */
-            bool soft = !s_dip && soft_dip_pair(cur, want);
-            if (soft) {
-                soft_dip_fade_out();   /* the build below runs dimmed */
+            if (want != V_IDLE) {
+                /* Off before the present paints anything: the
+                 * overlay is an LVGL guest over the idle face only. */
+                phones_force_off();
             }
+            s_enter_swap = true;   /* an enter, not a frame advance */
             int64_t t_build = esp_timer_get_time();
             bool ok = true;
             if (SEQS[want].dir) {
@@ -1383,7 +1576,6 @@ static void player_task(void *arg)
                 ok = enter_seq_frame(want, 0, back_buffer());
                 if (ok) {
                     s_swap_vis = want;
-                    s_soft_hold = soft;
                     swap_buffers();
                     deadline = esp_timer_get_time() + FR_PERIOD_US;
                 }
@@ -1395,17 +1587,14 @@ static void player_task(void *arg)
                     s_broken[want] = true;
                 } else {
                     s_swap_vis = want;
-                    s_soft_hold = soft;
                     swap_buffers();
                     mouth_since = esp_timer_get_time();
                 }
             } else {
-                s_soft_hold = soft;
                 ok = enter_still(want);
             }
             if (!ok) {
                 s_dip = false;   /* the fallback face comes up as-is */
-                s_soft_hold = false;
                 s_enter_swap = false;   /* no swap happened */
                 if (want == V_WAKING) {
                     s_waking_done = true;
@@ -1424,10 +1613,12 @@ static void player_task(void *arg)
             if (s_dip) {
                 s_dip = false;
                 dip_fade_in();
-            } else if (soft) {
-                soft_dip_fade_in();
             }
             cur = want;
+            s_phones_track = (want == V_IDLE);
+            if (want == V_IDLE) {
+                phones_apply_locked(0);
+            }
             continue;
         }
 
@@ -1446,7 +1637,9 @@ static void player_task(void *arg)
                 }
                 if (cur == V_LEVELUP) {
                     s_levelup_pending = false;
-                    fade_out();
+                    /* No fade-out (see the note at the old fade_out
+                     * site): the last frame stays up and the next
+                     * visual's swap replaces it whole. */
                 }
                 cur = V_NONE;   /* the resolver picks the next visual */
                 continue;
@@ -1469,6 +1662,11 @@ static void player_task(void *arg)
                         seq_idx = SEQS[cur].oneshot ? SEQS[cur].frames - 1
                                                      : seq_idx % SEQS[cur].frames;
                     }
+                }
+                if (cur == V_IDLE && s_phones_state != PH_OFF) {
+                    /* The headphones ride the sway of the frame that
+                     * just went up (see FR_SWAY). */
+                    phones_apply_locked(seq_idx);
                 }
                 now = esp_timer_get_time();
             }
@@ -1589,6 +1787,65 @@ void muse_frames_attach(lv_obj_t *face)
             ESP_LOGW(TAG, "boot still unusable: library/pixel fallback only");
             heap_caps_free(s_still);
             s_still = NULL;
+        }
+    }
+
+    /* The headphones overlay (see the phones section above): one
+     * image widget per sprite piece, created right after the face
+     * image so the pieces draw over it — and before the dialog
+     * muse_ui.c adds to the same tile later, so captions stay on
+     * top. The descriptors point straight at the embedded I8 blobs:
+     * no decode, no extra buffers. A build without the
+     * generated sprite gets the stub's empty table, no widgets, and
+     * pats keep the alternating reactions. Like the widget creation
+     * above, this runs in the UI's own context during build_screen(),
+     * so no lock is taken. */
+    size_t npieces = 0;
+    const muse_phones_piece_t *pieces = muse_phones_pieces(&npieces);
+    if (pieces && npieces > 0) {
+        if (npieces > FR_PHONES_MAX_PIECES) {
+            npieces = FR_PHONES_MAX_PIECES;
+        }
+        s_phones_piece = pieces;
+        s_phones_count = (int)npieces;
+        size_t total = 0;
+        bool ok = true;
+        for (int i = 0; i < s_phones_count && ok; i++) {
+            const muse_phones_piece_t *p = &pieces[i];
+            lv_image_dsc_t *d = &s_phones_dsc[i];
+            d->header.magic = LV_IMAGE_HEADER_MAGIC;
+            d->header.cf = LV_COLOR_FORMAT_I8;
+            d->header.w = p->w;
+            d->header.h = p->h;
+            d->header.stride = (uint32_t)p->w;
+            d->data_size = p->data_size;
+            d->data = p->data;
+            total += p->data_size;
+            s_phones_obj[i] = lv_image_create(face);
+            if (!s_phones_obj[i]) {
+                ok = false;
+                break;
+            }
+            lv_image_set_src(s_phones_obj[i], d);
+            lv_obj_remove_flag(s_phones_obj[i], LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_remove_flag(s_phones_obj[i], LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(s_phones_obj[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ok) {
+            s_phones_state = PH_OFF;
+            s_phones_dy = FR_PHONES_TRAVEL;
+            s_phones_ready = true;
+            ESP_LOGI(TAG, "phones sprite: %d pieces, %u bytes embedded",
+                     s_phones_count, (unsigned)total);
+        } else {
+            for (int i = 0; i < s_phones_count; i++) {
+                if (s_phones_obj[i]) {
+                    lv_obj_delete(s_phones_obj[i]);
+                    s_phones_obj[i] = NULL;
+                }
+            }
+            s_phones_count = 0;
+            ESP_LOGW(TAG, "phones sprite: widget creation failed, pats unchanged");
         }
     }
 

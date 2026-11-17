@@ -85,9 +85,11 @@ class FramesPlayerPlacementTest(unittest.TestCase):
 
 
 class FramesFeelRoundTest(unittest.TestCase):
-    """The B-route "feel" round (2026-11-17): instant squash feedback,
-    a shallow dip (not a crossfade) on interactive switches, and a
-    compressed first-frame preload for the hottest states."""
+    """The B-route "feel" round (2026-11-17): instant squash feedback
+    on presses and a compressed first-frame preload for the hottest
+    states. (The round's shallow dip on interactive switches was
+    removed again by the headphones round later the same day — see
+    FramesHeadphonesRoundTest.)"""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -113,26 +115,6 @@ class FramesFeelRoundTest(unittest.TestCase):
         body = self.src[squash:squash + 1600]
         self.assertIn("lv_anim_delete(s_img, squash_exec)", body)
         self.assertIn("LV_OBJ_FLAG_HIDDEN", body)
-
-    def test_soft_dip_is_shallow_and_never_for_waking(self) -> None:
-        self.assertIn("#define FR_SOFT_DIP_BOTTOM 160", self.src)
-        # Single-step staircase (see the define's comment: finer
-        # steps pay a full display flush each on this board).
-        self.assertIn("#define FR_SOFT_DIP_STEP 95", self.src)
-        pair = self.src.index("static bool soft_dip_pair")
-        body = self.src[pair:pair + 900]
-        # want==V_WAKING is refused outright, and the waking visual
-        # is not among the outgoing faces that qualify either.
-        self.assertIn("want == V_WAKING", body)
-        self.assertNotIn("case V_WAKING:", body)
-        self.assertIn("case V_IDLE:", body)
-        self.assertIn("case V_LISTENING:", body)
-
-    def test_soft_hold_is_consumed_by_show_front(self) -> None:
-        show = self.src.index("static void show_front(void)")
-        body = self.src[show:show + 1200]
-        self.assertIn("s_soft_hold ? FR_SOFT_DIP_BOTTOM : LV_OPA_COVER", body)
-        self.assertIn("s_soft_hold = false;", body)
 
     def test_preload_covers_kits_and_levelup_first_frame(self) -> None:
         # Only the three big first frames are warmed; the kits' small
@@ -166,6 +148,102 @@ class FramesFeelRoundTest(unittest.TestCase):
 
     def test_enter_latency_is_logged(self) -> None:
         self.assertIn('"enter %s: %lld ms (build %lld ms)"', self.src)
+
+
+class FramesHeadphonesRoundTest(unittest.TestCase):
+    """The headphones round (2026-11-17): a pat raises an embedded
+    headphone sprite over the idle face instead of cutting to a
+    different picture, and the interactive soft dip is gone (Hugh's
+    "darkens first" complaint; Codex consultation on file in the
+    project records). The waking dip-to-black is Hugh-approved and
+    stays exactly as it was."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = FRAMES.read_text(encoding="utf-8")
+
+    def test_pet_tap_prefers_the_phones(self) -> None:
+        tap = self.src.index("void muse_frames_pet_tap(void)")
+        body = self.src[tap:tap + 700]
+        # The sprite answers first; only a build without it falls
+        # back to the alternating still reactions.
+        self.assertIn("if (phones_tap())", body)
+        self.assertLess(body.index("phones_tap()"),
+                        body.index("s_pet_pending = true"))
+
+    def test_phones_attach_uses_indexed_sprite(self) -> None:
+        # I8, not RGB565A8: this board copies .rodata into PSRAM at
+        # boot, and the indexed sprite costs ~70 KB there against
+        # ~200 KB. Stride is the index plane's row width.
+        self.assertIn("d->header.cf = LV_COLOR_FORMAT_I8;", self.src)
+        self.assertIn("d->header.stride = (uint32_t)p->w;", self.src)
+        self.assertNotIn("LV_COLOR_FORMAT_RGB565A8", self.src)
+        self.assertIn('"phones sprite: %d pieces, %u bytes embedded"',
+                      self.src)
+
+    def test_phones_animation_shape(self) -> None:
+        self.assertIn("#define FR_PHONES_TRAVEL 300", self.src)
+        self.assertIn("#define FR_PHONES_OVERSHOOT 7", self.src)
+        self.assertIn("#define FR_PHONES_HOLD_MS 2000", self.src)
+        # The sway tables track all 40 idle frames.
+        for name in ("FR_SWAY_X[40]", "FR_SWAY_Y[40]"):
+            self.assertIn(name, self.src)
+
+    def test_phones_leave_with_the_idle_face(self) -> None:
+        enter = self.src.index("if (want != cur) {")
+        body = self.src[enter:enter + 900]
+        self.assertIn("if (want != V_IDLE) {", body)
+        self.assertIn("phones_force_off();", body)
+
+    def test_no_soft_dip_anywhere(self) -> None:
+        self.assertNotIn("FR_SOFT_DIP", self.src)
+        self.assertNotIn("soft_dip", self.src)
+        self.assertNotIn("s_soft_hold", self.src)
+        # show_front's only opa choice left: the waking dip's black,
+        # or full. No intermediate hold.
+        show = self.src.index("static void show_front(void)")
+        body = self.src[show:show + 400]
+        self.assertIn("int opa = s_dip ? 0 : LV_OPA_COVER;", body)
+
+    def test_levelup_exit_no_longer_fades(self) -> None:
+        self.assertNotIn("static void fade_out(void)", self.src)
+        done = self.src.index("if (cur == V_LEVELUP) {")
+        body = self.src[done:done + 400]
+        self.assertNotIn("fade_out();", body)
+        self.assertIn("s_levelup_pending = false;", body)
+
+    def test_waking_dip_untouched(self) -> None:
+        self.assertIn("static void dip_fade_out(void)", self.src)
+        self.assertIn("static void dip_fade_in(void)", self.src)
+        self.assertIn("dip_fade_out();   /* dip through black into idle */",
+                      self.src)
+        # The ramp itself is part of the approved feel: full range,
+        # 32-opa steps, 30 ms a step, and the fade-in is consumed
+        # from the enter path when s_dip is set.
+        self.assertIn("for (int opa = LV_OPA_COVER; opa > 0; opa -= 32)",
+                      self.src)
+        self.assertIn("for (int opa = 0; opa < LV_OPA_COVER; opa += 32)",
+                      self.src)
+        self.assertIn("vTaskDelay(pdMS_TO_TICKS(30))", self.src)
+        self.assertIn("dip_fade_in();", self.src)
+
+    def test_hold_keeps_seated_state_until_the_fall_moves(self) -> None:
+        # Codex review (2026-11-17): the delayed fall after the hold
+        # must not read PH_FALLING during the hold — a pat then means
+        # "off now", not "rise again". The state flips in the fall's
+        # own exec, and starts delete both exec flavours.
+        self.assertIn("static void phones_fall_exec(void *var, int32_t v)",
+                      self.src)
+        self.assertIn("if (s_phones_state == PH_SEATED)", self.src)
+        self.assertIn("lv_anim_set_exec_cb(&a, phones_fall_exec);",
+                      self.src)
+        self.assertIn("phones_anim_delete_all();", self.src)
+
+    def test_force_off_checks_state_under_the_lock(self) -> None:
+        off = self.src.index("static void phones_force_off(void)")
+        body = self.src[off:off + 900]
+        self.assertLess(body.index("display_lock(-1)"),
+                        body.index("s_phones_state == PH_OFF"))
 
 
 if __name__ == "__main__":
