@@ -742,6 +742,9 @@ static void on_canvas_clicked(lv_event_t *e)
      * still in turn. Taps in any other state are ignored, so a pat
      * never interrupts a turn, a call or a recording. */
     if (muse_state_mode(NULL) == MUSE_MODE_IDLE && !muse_state_recording()) {
+        /* The squash answers the finger on the next refresh; the
+         * reaction itself still arrives through the player. */
+        muse_frames_squash();
         muse_frames_pet_tap();
     }
 }
@@ -2798,6 +2801,13 @@ static void frame_tick(lv_timer_t *timer)
         if (mode == MUSE_MODE_LISTENING) {
             image_hide_locked();
             muse_ui_show_face();
+            if (s_last_mode == MUSE_MODE_IDLE) {
+                /* The talk key was just pressed from standby: give
+                 * the same instant squash a face tap gets, so the
+                 * press is answered within a frame tick instead of
+                 * when the listening face has loaded. */
+                muse_frames_squash();
+            }
         }
 #if CONFIG_MUSE_VOICE_NOTE_TOGGLE
         s_note_listening = mode == MUSE_MODE_LISTENING;

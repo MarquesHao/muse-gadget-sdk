@@ -58,6 +58,7 @@ bool muse_state_recording(void) { return false; }
 float muse_state_idle_secs(void) { return 0; }
 bool muse_voice_in_call(void) { return true; }
 muse_voice_view_t muse_voice_call_view(void) { return view; }
+void muse_frames_squash(void) {}   /* feel round: press feedback is a no-op on the host */
 void muse_pixel_render(const muse_pose_t *pose) { rendered=*pose; }
 
 /* The test runner copies the complete production frame_tick function here. */

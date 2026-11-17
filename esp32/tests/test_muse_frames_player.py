@@ -84,5 +84,89 @@ class FramesPlayerPlacementTest(unittest.TestCase):
         self.assertIn("#define FR_PERIOD_US 125000", self.src)
 
 
+class FramesFeelRoundTest(unittest.TestCase):
+    """The B-route "feel" round (2026-11-17): instant squash feedback,
+    a shallow dip (not a crossfade) on interactive switches, and a
+    compressed first-frame preload for the hottest states."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = FRAMES.read_text(encoding="utf-8")
+
+    def test_squash_rides_the_image_scale_not_transform(self) -> None:
+        # The squash must ride the image widget's own scale: a style
+        # transform makes LVGL render into a layer buffer this board
+        # cannot allocate (measured on device, 2026-11-17: dozens of
+        # lv_draw_layer_alloc_buf failures around a press). The live
+        # factor is shared with apply_framing so frame swaps re-apply
+        # it instead of resetting the animation mid-flight.
+        self.assertIn("void muse_frames_squash(void)", self.src)
+        self.assertIn("lv_image_set_scale((lv_obj_t *)obj, v)", self.src)
+        self.assertIn("lv_image_set_pivot(s_img, FR_W / 2, FR_H / 2)",
+                      self.src)
+        self.assertIn("lv_image_set_scale(s_img, s_squash_factor)",
+                      self.src)
+        self.assertNotIn("lv_obj_set_style_transform_scale_x(s_img",
+                         self.src)
+        self.assertIn("#define FR_SQUASH_MIN 246", self.src)
+        squash = self.src.index("void muse_frames_squash(void)")
+        body = self.src[squash:squash + 1600]
+        self.assertIn("lv_anim_delete(s_img, squash_exec)", body)
+        self.assertIn("LV_OBJ_FLAG_HIDDEN", body)
+
+    def test_soft_dip_is_shallow_and_never_for_waking(self) -> None:
+        self.assertIn("#define FR_SOFT_DIP_BOTTOM 160", self.src)
+        # Single-step staircase (see the define's comment: finer
+        # steps pay a full display flush each on this board).
+        self.assertIn("#define FR_SOFT_DIP_STEP 95", self.src)
+        pair = self.src.index("static bool soft_dip_pair")
+        body = self.src[pair:pair + 900]
+        # want==V_WAKING is refused outright, and the waking visual
+        # is not among the outgoing faces that qualify either.
+        self.assertIn("want == V_WAKING", body)
+        self.assertNotIn("case V_WAKING:", body)
+        self.assertIn("case V_IDLE:", body)
+        self.assertIn("case V_LISTENING:", body)
+
+    def test_soft_hold_is_consumed_by_show_front(self) -> None:
+        show = self.src.index("static void show_front(void)")
+        body = self.src[show:show + 1200]
+        self.assertIn("s_soft_hold ? FR_SOFT_DIP_BOTTOM : LV_OPA_COVER", body)
+        self.assertIn("s_soft_hold = false;", body)
+
+    def test_preload_covers_kits_and_levelup_first_frame(self) -> None:
+        # Only the three big first frames are warmed; the kits' small
+        # sprites stay on the file path (PSRAM margin discipline —
+        # see FR_PRELOAD_PATHS comment).
+        for path in (
+            "/meet/sprites/listening/blank.jpg",
+            "/meet/sprites/thinking/blank.jpg",
+            "/meet/frames/levelup/f000.jpg",
+        ):
+            self.assertIn(path, self.src)
+        table = self.src.index("FR_PRELOAD_PATHS[]")
+        body = self.src[table:table + 400]
+        self.assertNotIn("spr_eye_L.png", body)
+        self.assertNotIn("geom.json", body)
+        # Listening is warmed before thinking: it heads the table.
+        self.assertLess(self.src.index("/meet/sprites/listening/blank.jpg"),
+                        self.src.index("/meet/sprites/thinking/blank.jpg"))
+
+    def test_preload_feeds_kit_build_and_seq_enter(self) -> None:
+        kit = self.src.index("static bool build_kit")
+        self.assertIn("preload_get(path, &clen)", self.src[kit:kit + 4200])
+        seq = self.src.index("static bool enter_seq_frame")
+        self.assertIn("preload_get(path, &clen)", self.src[seq:seq + 900])
+        # Warmed only from idle passes with the next frame ready and
+        # a real margin before it is due (Codex review, 2026-11-17:
+        # seq_ready alone does not prove the read fits the slack).
+        self.assertIn("if (cur == V_IDLE && seq_ready && s_waking_done",
+                      self.src)
+        self.assertIn("esp_timer_get_time() + 30000 < deadline", self.src)
+
+    def test_enter_latency_is_logged(self) -> None:
+        self.assertIn('"enter %s: %lld ms (build %lld ms)"', self.src)
+
+
 if __name__ == "__main__":
     unittest.main()

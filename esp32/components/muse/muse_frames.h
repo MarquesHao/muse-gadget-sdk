@@ -81,6 +81,18 @@ bool muse_frames_hold(bool on);
  */
 void muse_frames_pet_tap(void);
 
+/*
+ * Instant touch feedback: squash the face image to ~96% and let it
+ * spring back (~250 ms), so a tap or a talk-key press is answered on
+ * the next refresh instead of when the next animation has loaded.
+ * The squash rides the image widget's own scale, which the player
+ * never touches (it drives the image's own scale and opa), so it
+ * composes with frame swaps, dips and fades instead of fighting
+ * them. LVGL context only — call it from event handlers and timers,
+ * like every other widget call; a no-op when no face widget is up.
+ */
+void muse_frames_squash(void);
+
 #ifdef __cplusplus
 }
 #endif

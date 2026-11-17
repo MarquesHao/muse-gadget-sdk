@@ -70,6 +70,25 @@ class QuickSettingsTileTest(unittest.TestCase):
         self.assertNotIn("quick_", body)   # no panel call left in the tap path
         self.assertNotIn("lv_", body)      # and no UI object is touched at all
 
+    def test_tap_face_squashes_for_instant_feedback(self) -> None:
+        # B-route feel round (2026-11-17): the tap must be answered on
+        # the next refresh, not when the reaction has loaded — the
+        # squash fires first, inside the same IDLE-only guard, and the
+        # pet reaction follows through the player as before.
+        body = body_of(self.src, "static void on_canvas_clicked")
+        self.assertIn("muse_frames_squash()", body)
+        self.assertLess(body.index("muse_frames_squash()"),
+                        body.index("muse_frames_pet_tap()"))
+
+    def test_talk_key_from_idle_squashes(self) -> None:
+        # The talk key's press surfaces in frame_tick as the
+        # IDLE -> LISTENING mode edge; the squash rides that edge so a
+        # key press gets the same instant feedback as a face tap.
+        body = body_of(self.src, "static void frame_tick")
+        edge = body.index("if (mode == MUSE_MODE_LISTENING)")
+        squash = body.index("muse_frames_squash()", edge)
+        self.assertIn("s_last_mode == MUSE_MODE_IDLE", body[edge:squash])
+
     def test_popup_panel_is_gone(self) -> None:
         for gone in ("s_quick_catch", "quick_show(", "quick_hide(",
                      "on_quick_catch", "s_quick_open"):

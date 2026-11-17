@@ -119,6 +119,60 @@ static const char *TAG = "muse_frames";
  * it came from. */
 #define FR_PLAYER_CORE 0
 
+/* Interactive state switches (idle <-> listening/thinking, a turn's
+ * edges, pet reactions) used to hard-cut: the old frame froze for
+ * the ~0.2 s the new one took to build, then snapped. A true
+ * crossfade needs old and new frames on screen at once — a third
+ * 434 KB frame buffer — and the library leaves only ~250-435 KB of
+ * PSRAM free, so that does not fit. What fits is a shallow dip: fade
+ * the old frame down to FR_SOFT_DIP_BOTTOM while the new one builds,
+ * swap at the bottom, fade back up. ~40 ms each way, ~120 ms around
+ * the swap. It is a dip, not a crossfade — the record says so too.
+ * The waking handoff keeps its own full dip-to-black (Hugh-approved,
+ * FR dip above); this one never applies to it. */
+#define FR_SOFT_DIP_BOTTOM 160   /* of 255: ~63% */
+#define FR_SOFT_DIP_STEP 95      /* one step each way: 255 <-> 160.
+                                  * A finer staircase was measured on
+                                  * device at ~270 ms of transition
+                                  * overhead — every step takes the
+                                  * display lock and waits out a full
+                                  * QSPI flush — so the dip is a single
+                                  * step down, swap, single step up. */
+#define FR_SOFT_DIP_MS 20
+
+/* The squash's low point (image scale, 256 = 1.0x). */
+#define FR_SQUASH_MIN 246        /* ~96% */
+
+/* First-frame preload: only the three big first frames behind the
+ * hottest switches — the listening and thinking kit blanks and the
+ * level-up celebration's first frame — read into PSRAM once the
+ * player is idling, so entering those states skips the slowest FAT
+ * reads. ~86 KB in total at the shipped sizes. The kits' small
+ * sprites and geom files stay on the file path on purpose: the
+ * first device run of this round warmed all fifteen assets (~148
+ * KB) and the free-PSRAM margin it left (~100 KB) was thin enough
+ * to hurt neighbours; the blanks are the reads that dominate the
+ * build time anyway. Every entry is optional and a failed
+ * allocation just leaves that asset on the file path. Listening
+ * first (every voice turn starts there), then level-up, then
+ * thinking. */
+static const char *const FR_PRELOAD_PATHS[] = {
+    "/meet/sprites/listening/blank.jpg",
+    "/meet/frames/levelup/f000.jpg",
+    "/meet/sprites/thinking/blank.jpg",
+};
+#define FR_PRELOAD_COUNT (sizeof(FR_PRELOAD_PATHS) / sizeof(FR_PRELOAD_PATHS[0]))
+
+typedef struct {
+    const uint8_t *data;   /* PSRAM, owned by the table */
+    size_t len;
+} preload_ent_t;
+
+/* PSRAM, like every other big static in this project: the table is
+ * metadata for PSRAM payloads and internal RAM is the scarce one. */
+EXT_RAM_BSS_ATTR static preload_ent_t s_pre[FR_PRELOAD_COUNT];
+EXT_RAM_BSS_ATTR static int s_pre_next;   /* next FR_PRELOAD_PATHS index */
+
 /* Visuals the resolver can ask for. */
 typedef enum {
     V_NONE = 0,   /* pixel face (widget hidden) */
@@ -233,6 +287,60 @@ static bool read_file(const char *path, size_t *len_out)
     }
     *len_out = n;
     return true;
+}
+
+/* The preloaded bytes for path, or NULL when that asset is not (yet)
+ * resident — callers then take the file path they always took. */
+static const uint8_t *preload_get(const char *path, size_t *len_out)
+{
+    for (size_t i = 0; i < FR_PRELOAD_COUNT; i++) {
+        if (s_pre[i].data && !strcmp(FR_PRELOAD_PATHS[i], path)) {
+            *len_out = s_pre[i].len;
+            return s_pre[i].data;
+        }
+    }
+    return NULL;
+}
+
+/* Load one more preload entry from storage into PSRAM. Called from
+ * the player's idle passes, one file at a time, so the reads spread
+ * over frames that already have their next frame decoded. A failure
+ * is permanent for that entry this boot (the index still advances)
+ * and only costs the speedup, never the state. */
+static void preload_step(void)
+{
+    if (s_pre_next >= (int)FR_PRELOAD_COUNT) {
+        return;
+    }
+    const char *path = FR_PRELOAD_PATHS[s_pre_next++];
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return;
+    }
+    long size = -1;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        size = ftell(f);
+    }
+    if (size <= 0 || size > FR_FILE_MAX || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+    uint8_t *buf = heap_caps_malloc((size_t)size, MUSE_BIG_CAPS);
+    if (!buf) {
+        fclose(f);
+        ESP_LOGW(TAG, "preload %s: no PSRAM, staying on the file path", path);
+        return;
+    }
+    size_t n = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (n != (size_t)size) {
+        heap_caps_free(buf);
+        return;
+    }
+    s_pre[s_pre_next - 1].data = buf;
+    s_pre[s_pre_next - 1].len = (size_t)size;
+    ESP_LOGI(TAG, "preload %s: %u bytes (free psram %u)", path, (unsigned)size,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
 /* Decode one 466x466 JPEG with an already-open handle into out
@@ -423,12 +531,23 @@ static bool build_kit(const char *name, uint16_t *out)
 {
     char path[96];
     snprintf(path, sizeof(path), "/meet/sprites/%s/blank.jpg", name);
-    if (!decode_jpeg_file(path, out)) {
+    size_t clen;
+    const uint8_t *cached = preload_get(path, &clen);
+    if (cached ? !decode_jpeg_mem(cached, clen, out) : !decode_jpeg_file(path, out)) {
         return false;
     }
     snprintf(path, sizeof(path), "/meet/sprites/%s/geom.json", name);
     size_t len;
-    if (!read_file(path, &len) || len >= FR_FILE_MAX) {
+    cached = preload_get(path, &clen);
+    if (cached) {
+        /* The parser wants a NUL-terminated buffer: stage the
+         * resident copy through the scratch, like a file read. */
+        if (clen >= FR_FILE_MAX) {
+            return false;
+        }
+        memcpy(s_file, cached, clen);
+        len = clen;
+    } else if (!read_file(path, &len) || len >= FR_FILE_MAX) {
         return false;
     }
     s_file[len] = '\0';   /* len < FR_FILE_MAX here, so this is in bounds */
@@ -452,16 +571,20 @@ static bool build_kit(const char *name, uint16_t *out)
         int y0 = cJSON_GetArrayItem(rect, 1)->valueint;
         snprintf(path, sizeof(path), "/meet/sprites/%s/%s.png", name, order[i]);
         size_t plen;
-        if (!read_file(path, &plen)) {
-            ok = false;
-            break;
+        const uint8_t *pdata = preload_get(path, &plen);
+        if (!pdata) {
+            if (!read_file(path, &plen)) {
+                ok = false;
+                break;
+            }
+            pdata = s_file;
         }
-        /* Decode from a copy: the PNG bytes share s_file with nothing
-         * else right now, but decode_png_mem keeps no reference after
-         * the call, so this is safe as-is. */
+        /* Decode from the bytes as-is: decode_png_mem keeps no
+         * reference after the call, so the shared scratch and the
+         * resident copy are both safe sources. */
         uint8_t *rgba = NULL;
         int w = 0, h = 0;
-        if (!decode_png_mem(s_file, plen, &rgba, &w, &h)) {
+        if (!decode_png_mem(pdata, plen, &rgba, &w, &h)) {
             ok = false;
             break;
         }
@@ -484,10 +607,22 @@ static visual_t s_swap_vis = V_NONE;
  * Set by dip_fade_out(), consumed by the player's enter path. */
 static bool s_dip;
 
+/* Mid-soft-dip (interactive switches, see FR_SOFT_DIP_BOTTOM): the
+ * incoming visual must start at the dip's bottom opa, not at full,
+ * so the player can fade it back up. Set by the enter path just
+ * before its swap; consumed — read and cleared — by show_front(),
+ * so no later frame swap can inherit it. */
+static bool s_soft_hold;
+
 /* Display lock held by the caller (the show_* paths take it). */
+/* The live squash factor (256 = 1.0x), written by the squash
+ * animation in LVGL context and read here so a frame swap mid-squash
+ * re-applies the in-flight factor instead of resetting it. */
+static volatile int32_t s_squash_factor = 256;
+
 static void apply_framing(visual_t v)
 {
-    lv_image_set_scale(s_img, 256);
+    lv_image_set_scale(s_img, s_squash_factor);
     lv_obj_align(s_img, LV_ALIGN_CENTER, 0,
                  (muse_board->minimal_face ? FR_FACE_DY : 0) +
                  ((v == V_WAKING || v == V_STILL) ? FR_WAKING_DY : 0));
@@ -500,8 +635,11 @@ static void show_front(void)
     lv_image_set_src(s_img, &s_dsc);
     apply_framing(s_swap_vis);
     /* Mid-dip the incoming visual starts black; the player fades it
-     * in right after the swap (see dip_fade_out()). */
-    lv_obj_set_style_opa(s_img, s_dip ? 0 : LV_OPA_COVER, 0);
+     * in right after the swap (see dip_fade_out()). Mid-soft-dip it
+     * starts at the dip's bottom instead (see s_soft_hold). */
+    lv_obj_set_style_opa(s_img,
+                         s_dip ? 0 : (s_soft_hold ? FR_SOFT_DIP_BOTTOM : LV_OPA_COVER), 0);
+    s_soft_hold = false;
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(s_img);
     muse_board->display_unlock();
@@ -613,6 +751,67 @@ static void dip_fade_in(void)
     muse_board->display_unlock();
 }
 
+/* The soft dip for interactive switches (see FR_SOFT_DIP_BOTTOM):
+ * the outgoing face sinks to ~63% while the incoming one builds,
+ * the swap lands at the bottom (show_front honours s_soft_hold),
+ * and soft_dip_fade_in() brings it back up. Same per-step lock
+ * discipline as the waking dip. Not a crossfade: the two faces are
+ * never on screen together. */
+static void soft_dip_fade_out(void)
+{
+    for (int opa = LV_OPA_COVER; opa > FR_SOFT_DIP_BOTTOM; opa -= FR_SOFT_DIP_STEP) {
+        muse_board->display_lock(-1);
+        lv_obj_set_style_opa(s_img, (lv_opa_t)(opa - FR_SOFT_DIP_STEP < FR_SOFT_DIP_BOTTOM
+                                                  ? FR_SOFT_DIP_BOTTOM
+                                                  : opa - FR_SOFT_DIP_STEP),
+                             0);
+        lv_obj_invalidate(s_img);
+        muse_board->display_unlock();
+        vTaskDelay(pdMS_TO_TICKS(FR_SOFT_DIP_MS));
+    }
+}
+
+static void soft_dip_fade_in(void)
+{
+    for (int opa = FR_SOFT_DIP_BOTTOM; opa < LV_OPA_COVER; opa += FR_SOFT_DIP_STEP) {
+        muse_board->display_lock(-1);
+        lv_obj_set_style_opa(s_img, (lv_opa_t)(opa + FR_SOFT_DIP_STEP > LV_OPA_COVER
+                                                  ? LV_OPA_COVER
+                                                  : opa + FR_SOFT_DIP_STEP),
+                             0);
+        lv_obj_invalidate(s_img);
+        muse_board->display_unlock();
+        vTaskDelay(pdMS_TO_TICKS(FR_SOFT_DIP_MS));
+    }
+}
+
+/* Whether the cur -> want switch gets the soft dip: only between
+ * two interactive faces. Boot (STILL/NONE), the waking handoff (its
+ * own defined dip, and want==V_WAKING never), sleep (PAUSED) and
+ * fallback entries stay exactly as they were. */
+static bool soft_dip_pair(visual_t cur, visual_t want)
+{
+    if (want == V_WAKING || want == V_NONE || want == V_PAUSED) {
+        return false;
+    }
+    switch (cur) {
+    case V_IDLE:
+    case V_LISTENING:
+    case V_THINKING:
+    case V_SPEAKING:
+    case V_WORKING:
+    case V_MAKING:
+    case V_LEVELUP:
+    case V_HAPPY:
+    case V_SLEEPY:
+    case V_DIZZY:
+    case V_REST:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* ---- which visual should be up ---- */
 
 static visual_t s_last_active = V_NONE;   /* last SPEAKING/THINKING seen */
@@ -631,6 +830,64 @@ static bool s_pet_levelup_turn = true;
 void muse_frames_pet_tap(void)
 {
     s_pet_pending = true;
+}
+
+/* ---- instant touch feedback (LVGL context only) ----
+ * The squash rides the image widget's own scale (lv_image_set_scale),
+ * NOT the object transform: a style transform makes LVGL render the
+ * widget into a layer buffer, and on this board that allocation
+ * (106-137 KB) cannot be served once the action library is up — the
+ * first device run of this round (2026-11-17) logged dozens of
+ * lv_draw_layer_alloc_buf failures around the press and the switch
+ * it was meant to decorate took 1.6 s. The image's own scale is
+ * applied by the image drawer while it samples the source, with no
+ * layer. apply_framing() re-applies s_squash_factor at every swap,
+ * so the animation also survives frame swaps instead of being reset
+ * by them. The press half is fast (70 ms down to FR_SQUASH_MIN);
+ * the recovery overshoots a touch past 1.0x on its way back, which
+ * is what makes it read as a spring rather than a zoom. A
+ * re-trigger deletes the running half and starts from wherever the
+ * scale currently is. */
+static void squash_exec(void *obj, int32_t v)
+{
+    s_squash_factor = v;
+    lv_image_set_scale((lv_obj_t *)obj, v);
+}
+
+static void squash_recover(lv_anim_t *a)
+{
+    lv_obj_t *img = (lv_obj_t *)a->var;
+    lv_anim_t b;
+    lv_anim_init(&b);
+    lv_anim_set_var(&b, img);
+    lv_anim_set_exec_cb(&b, squash_exec);
+    lv_anim_set_values(&b, s_squash_factor, 256);
+    lv_anim_set_duration(&b, 190);
+    lv_anim_set_path_cb(&b, lv_anim_path_overshoot);
+    lv_anim_start(&b);
+}
+
+void muse_frames_squash(void)
+{
+    if (!s_img || lv_obj_has_flag(s_img, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    lv_image_set_pivot(s_img, FR_W / 2, FR_H / 2);
+    lv_anim_delete(s_img, squash_exec);
+    int32_t cur = s_squash_factor;
+    if (cur <= 0 || cur > 512) {   /* the recovery overshoots past 256
+                                    * legitimately: only nonsense resets */
+        cur = 256;
+    }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_img);
+    lv_anim_set_exec_cb(&a, squash_exec);
+    lv_anim_set_values(&a, cur, FR_SQUASH_MIN);
+    lv_anim_set_duration(&a, 70);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_ready_cb(&a, squash_recover);
+    lv_anim_start(&a);
 }
 
 static visual_t resolve_target(void)
@@ -745,7 +1002,11 @@ static bool enter_seq_frame(visual_t v, int idx, uint16_t *into)
     char path[96];
     snprintf(path, sizeof(path), "/meet/frames/%s/f%03d.jpg", SEQS[v].dir, idx);
     s_dec_what = VIS_NAMES[v];
-    if (!decode_jpeg_file(path, into)) {
+    size_t clen;
+    const uint8_t *cached = preload_get(path, &clen);
+    bool ok = cached ? decode_jpeg_mem(cached, clen, into)
+                     : decode_jpeg_file(path, into);
+    if (!ok) {
         s_broken[v] = true;
         ESP_LOGW(TAG, "%s: frame %d unusable, fallback face for this state", VIS_NAMES[v], idx);
         return false;
@@ -907,7 +1168,16 @@ static void player_task(void *arg)
         }
 
         if (want != cur) {
-            /* Enter a new visual. */
+            /* Enter a new visual. The two timestamps bracket the
+             * switch for the log line below: total is what a state
+             * request waits for a new face, build is the part the
+             * preload can shrink (asset reads + decode/composite). */
+            int64_t t_req = esp_timer_get_time();
+            bool soft = !s_dip && soft_dip_pair(cur, want);
+            if (soft) {
+                soft_dip_fade_out();   /* the build below runs dimmed */
+            }
+            int64_t t_build = esp_timer_get_time();
             bool ok = true;
             if (SEQS[want].dir) {
                 seq_idx = 0;
@@ -915,6 +1185,7 @@ static void player_task(void *arg)
                 ok = enter_seq_frame(want, 0, back_buffer());
                 if (ok) {
                     s_swap_vis = want;
+                    s_soft_hold = soft;
                     swap_buffers();
                     deadline = esp_timer_get_time() + FR_PERIOD_US;
                 }
@@ -926,14 +1197,17 @@ static void player_task(void *arg)
                     s_broken[want] = true;
                 } else {
                     s_swap_vis = want;
+                    s_soft_hold = soft;
                     swap_buffers();
                     mouth_since = esp_timer_get_time();
                 }
             } else {
+                s_soft_hold = soft;
                 ok = enter_still(want);
             }
             if (!ok) {
                 s_dip = false;   /* the fallback face comes up as-is */
+                s_soft_hold = false;
                 if (want == V_WAKING) {
                     s_waking_done = true;
                 }
@@ -945,9 +1219,14 @@ static void player_task(void *arg)
                 continue;
             }
             ESP_LOGI(TAG, "show %s", VIS_NAMES[want]);
+            ESP_LOGI(TAG, "enter %s: %lld ms (build %lld ms)", VIS_NAMES[want],
+                     (long long)(esp_timer_get_time() - t_req) / 1000,
+                     (long long)(esp_timer_get_time() - t_build) / 1000);
             if (s_dip) {
                 s_dip = false;
                 dip_fade_in();
+            } else if (soft) {
+                soft_dip_fade_in();
             }
             cur = want;
             continue;
@@ -1011,6 +1290,16 @@ static void player_task(void *arg)
                 }
                 seq_next = next;
                 seq_ready = true;
+            }
+            if (cur == V_IDLE && seq_ready && s_waking_done
+                && esp_timer_get_time() + 30000 < deadline) {
+                /* Idle with the next frame already decoded and a
+                 * real margin before it is due: spend the slack
+                 * warming the first-frame preload, one asset per
+                 * pass (see FR_PRELOAD_PATHS). The deadline gate is
+                 * the Codex review's point — seq_ready alone does
+                 * not prove the read cannot crowd the swap. */
+                preload_step();
             }
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
