@@ -88,8 +88,7 @@ class FramesFeelRoundTest(unittest.TestCase):
     """The B-route "feel" round (2026-11-17): instant squash feedback
     on presses and a compressed first-frame preload for the hottest
     states. (The round's shallow dip on interactive switches was
-    removed again by the headphones round later the same day — see
-    FramesHeadphonesRoundTest.)"""
+    removed again later the same day — see FramesDipRemovalTest.)"""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -117,26 +116,26 @@ class FramesFeelRoundTest(unittest.TestCase):
         self.assertIn("LV_OBJ_FLAG_HIDDEN", body)
 
     def test_preload_covers_kits_and_levelup_first_frame(self) -> None:
-        # Only the three big first frames are warmed; the kits' small
-        # sprites stay on the file path (PSRAM margin discipline —
-        # see FR_PRELOAD_PATHS comment).
+        # Only the three big first frames are warmed (PSRAM margin
+        # discipline — see the FR_PRELOAD_PATHS comment). Since the
+        # smooth round the two kit faces are baked poses stills, so
+        # the table warms those single files instead of kit blanks.
         for path in (
-            "/meet/sprites/listening/blank.jpg",
-            "/meet/sprites/thinking/blank.jpg",
+            "/meet/poses/listening.jpg",
+            "/meet/poses/thinking.jpg",
             "/meet/frames/levelup/f000.jpg",
         ):
             self.assertIn(path, self.src)
         table = self.src.index("FR_PRELOAD_PATHS[]")
         body = self.src[table:table + 400]
-        self.assertNotIn("spr_eye_L.png", body)
-        self.assertNotIn("geom.json", body)
+        self.assertNotIn("sprites/", body)
         # Listening is warmed before thinking: it heads the table.
-        self.assertLess(self.src.index("/meet/sprites/listening/blank.jpg"),
-                        self.src.index("/meet/sprites/thinking/blank.jpg"))
+        self.assertLess(self.src.index("/meet/poses/listening.jpg"),
+                        self.src.index("/meet/poses/thinking.jpg"))
 
-    def test_preload_feeds_kit_build_and_seq_enter(self) -> None:
-        kit = self.src.index("static bool build_kit")
-        self.assertIn("preload_get(path, &clen)", self.src[kit:kit + 4200])
+    def test_preload_feeds_still_decode_and_seq_enter(self) -> None:
+        still = self.src.index("static bool decode_still")
+        self.assertIn("preload_get(path, &clen)", self.src[still:still + 900])
         seq = self.src.index("static bool enter_seq_frame")
         self.assertIn("preload_get(path, &clen)", self.src[seq:seq + 900])
         # Warmed only from idle passes with the next frame ready and
@@ -150,50 +149,18 @@ class FramesFeelRoundTest(unittest.TestCase):
         self.assertIn('"enter %s: %lld ms (build %lld ms)"', self.src)
 
 
-class FramesHeadphonesRoundTest(unittest.TestCase):
-    """The headphones round (2026-11-17): a pat raises an embedded
-    headphone sprite over the idle face instead of cutting to a
-    different picture, and the interactive soft dip is gone (Hugh's
-    "darkens first" complaint; Codex consultation on file in the
-    project records). The waking dip-to-black is Hugh-approved and
-    stays exactly as it was."""
+class FramesDipRemovalTest(unittest.TestCase):
+    """The interactive soft dip is gone (2026-11-17, Hugh's "darkens
+    first" complaint; Codex consultation on file in the project
+    records): interactive enters swap whole at full opa. It shipped
+    in the headphones round; the headphones overlay itself was
+    removed whole later the same day on Hugh's call — see
+    FramesSmoothRoundTest. The waking dip-to-black is Hugh-approved
+    and stays exactly as it was."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.src = FRAMES.read_text(encoding="utf-8")
-
-    def test_pet_tap_prefers_the_phones(self) -> None:
-        tap = self.src.index("void muse_frames_pet_tap(void)")
-        body = self.src[tap:tap + 700]
-        # The sprite answers first; only a build without it falls
-        # back to the alternating still reactions.
-        self.assertIn("if (phones_tap())", body)
-        self.assertLess(body.index("phones_tap()"),
-                        body.index("s_pet_pending = true"))
-
-    def test_phones_attach_uses_indexed_sprite(self) -> None:
-        # I8, not RGB565A8: this board copies .rodata into PSRAM at
-        # boot, and the indexed sprite costs ~70 KB there against
-        # ~200 KB. Stride is the index plane's row width.
-        self.assertIn("d->header.cf = LV_COLOR_FORMAT_I8;", self.src)
-        self.assertIn("d->header.stride = (uint32_t)p->w;", self.src)
-        self.assertNotIn("LV_COLOR_FORMAT_RGB565A8", self.src)
-        self.assertIn('"phones sprite: %d pieces, %u bytes embedded"',
-                      self.src)
-
-    def test_phones_animation_shape(self) -> None:
-        self.assertIn("#define FR_PHONES_TRAVEL 300", self.src)
-        self.assertIn("#define FR_PHONES_OVERSHOOT 7", self.src)
-        self.assertIn("#define FR_PHONES_HOLD_MS 2000", self.src)
-        # The sway tables track all 40 idle frames.
-        for name in ("FR_SWAY_X[40]", "FR_SWAY_Y[40]"):
-            self.assertIn(name, self.src)
-
-    def test_phones_leave_with_the_idle_face(self) -> None:
-        enter = self.src.index("if (want != cur) {")
-        body = self.src[enter:enter + 900]
-        self.assertIn("if (want != V_IDLE) {", body)
-        self.assertIn("phones_force_off();", body)
 
     def test_no_soft_dip_anywhere(self) -> None:
         self.assertNotIn("FR_SOFT_DIP", self.src)
@@ -227,23 +194,50 @@ class FramesHeadphonesRoundTest(unittest.TestCase):
         self.assertIn("vTaskDelay(pdMS_TO_TICKS(30))", self.src)
         self.assertIn("dip_fade_in();", self.src)
 
-    def test_hold_keeps_seated_state_until_the_fall_moves(self) -> None:
-        # Codex review (2026-11-17): the delayed fall after the hold
-        # must not read PH_FALLING during the hold — a pat then means
-        # "off now", not "rise again". The state flips in the fall's
-        # own exec, and starts delete both exec flavours.
-        self.assertIn("static void phones_fall_exec(void *var, int32_t v)",
-                      self.src)
-        self.assertIn("if (s_phones_state == PH_SEATED)", self.src)
-        self.assertIn("lv_anim_set_exec_cb(&a, phones_fall_exec);",
-                      self.src)
-        self.assertIn("phones_anim_delete_all();", self.src)
+class FramesSmoothRoundTest(unittest.TestCase):
+    """The smooth round (2026-11-17): the four kit faces are baked
+    offline into single poses stills (no runtime compositing), the
+    player speculatively pre-builds thinking while listening sits
+    static, and the headphones overlay is removed whole on Hugh's
+    call (he saw it on the device and did not like it)."""
 
-    def test_force_off_checks_state_under_the_lock(self) -> None:
-        off = self.src.index("static void phones_force_off(void)")
-        body = self.src[off:off + 900]
-        self.assertLess(body.index("display_lock(-1)"),
-                        body.index("s_phones_state == PH_OFF"))
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = FRAMES.read_text(encoding="utf-8")
+
+    def test_kit_faces_are_baked_stills_not_runtime_sprites(self) -> None:
+        self.assertNotIn("build_kit", self.src)
+        self.assertNotIn("png.h", self.src)
+        self.assertNotIn("/meet/sprites/", self.src)
+        still = self.src.index("static bool decode_still")
+        body = self.src[still:still + 900]
+        self.assertIn('"/meet/poses/%s.jpg"', body)
+        self.assertIn("decode_jpeg_file(path, out)", body)
+
+    def test_speculative_thinking_prebuild_epoch_rules(self) -> None:
+        # Built only while listening sits static, into the back
+        # buffer, by the player itself (sole decoder, no display
+        # lock held while decoding).
+        self.assertIn(
+            "if (cur == V_LISTENING && !s_spec_ready && !s_broken[V_THINKING])",
+            self.src)
+        self.assertIn("decode_still(V_THINKING, back_buffer())", self.src)
+        self.assertIn('"spec thinking: built in %lld ms"', self.src)
+        # Consumed only at the recorded epoch; anything else spends
+        # it and says so.
+        self.assertIn("s_spec_epoch == s_epoch", self.src)
+        self.assertIn('"spec thinking: hit"', self.src)
+        self.assertIn('"spec thinking: wasted"', self.src)
+
+    def test_headphones_overlay_removed(self) -> None:
+        for gone in (
+            "phones_tap", "phones_force_off", "muse_phones_pieces",
+            "FR_SWAY", "FR_PHONES_TRAVEL", "phones_apply_locked",
+        ):
+            self.assertNotIn(gone, self.src)
+        # The pat is back to the plain pending flag.
+        tap = self.src.index("void muse_frames_pet_tap(void)")
+        self.assertIn("s_pet_pending = true;", self.src[tap:tap + 300])
 
 
 if __name__ == "__main__":

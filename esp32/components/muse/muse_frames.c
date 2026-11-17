@@ -20,19 +20,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_jpeg_dec.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "png.h"
 
 #include "muse_board.h"
 #include "muse_boot_still.h"
 #include "muse_meeting.h"
-#include "muse_phones_sprite.h"
 #include "muse_mem.h"
 #include "muse_state.h"
 #include "muse_ui.h"
@@ -41,9 +38,14 @@
 /*
  * The action library (project P8) lives on the meeting storage
  * partition, mounted at /meet by muse_meeting: frames/<state>/fNNN.jpg
- * sequences, sprites/<state>/ kits (blank.jpg + geom.json + PNG parts)
- * and poses/<state>.jpg stills, all 466x466. This player is the only
- * reader besides the meeting console's dump.
+ * sequences and poses/<state>.jpg stills, all 466x466. The four
+ * part-composited faces (listening/thinking/sleepy/dizzy) were kits
+ * once — a blank plate plus PNG parts blended at runtime, ~120-250 ms
+ * per entry — and are baked offline into single poses stills since
+ * the smooth round (the parts and the compositor stay in the dev
+ * tree; the baked pixels are the device's own composite, verified
+ * byte-for-byte against a runtime build before encoding). This
+ * player is the only reader besides the meeting console's dump.
  *
  * RAM discipline (the 1.75C's internal RAM is the scarce resource, see
  * muse_meeting.c's prewarm comment): both frame buffers, the file
@@ -139,22 +141,20 @@ static const char *TAG = "muse_frames";
 #define FR_SQUASH_MIN 246        /* ~96% */
 
 /* First-frame preload: only the three big first frames behind the
- * hottest switches — the listening and thinking kit blanks and the
- * level-up celebration's first frame — read into PSRAM once the
- * player is idling, so entering those states skips the slowest FAT
- * reads. ~86 KB in total at the shipped sizes. The kits' small
- * sprites and geom files stay on the file path on purpose: the
- * first device run of this round warmed all fifteen assets (~148
- * KB) and the free-PSRAM margin it left (~100 KB) was thin enough
- * to hurt neighbours; the blanks are the reads that dominate the
- * build time anyway. Every entry is optional and a failed
- * allocation just leaves that asset on the file path. Listening
- * first (every voice turn starts there), then level-up, then
- * thinking. */
+ * hottest switches — the listening and thinking stills (baked kit
+ * composites since the smooth round) and the level-up celebration's
+ * first frame — read into PSRAM once the player is idling, so
+ * entering those states skips the slowest FAT reads. ~86 KB in
+ * total at the shipped sizes; the margin lesson stands from the
+ * first device run of the preload round, which warmed fifteen
+ * assets (~148 KB) and left free PSRAM thin enough to hurt
+ * neighbours. Every entry is optional and a failed allocation just
+ * leaves that asset on the file path. Listening first (every voice
+ * turn starts there), then level-up, then thinking. */
 static const char *const FR_PRELOAD_PATHS[] = {
-    "/meet/sprites/listening/blank.jpg",
+    "/meet/poses/listening.jpg",
     "/meet/frames/levelup/f000.jpg",
-    "/meet/sprites/thinking/blank.jpg",
+    "/meet/poses/thinking.jpg",
 };
 #define FR_PRELOAD_COUNT (sizeof(FR_PRELOAD_PATHS) / sizeof(FR_PRELOAD_PATHS[0]))
 
@@ -212,12 +212,8 @@ static const char *const VIS_NAMES[V_COUNT] = {
     [V_HAPPY] = "happy",     [V_MUSIC] = "music",     [V_STILL] = "still",
 };
 
-/* Kit states are composited from sprites/<name>/; still states are a
- * single poses/<name>.jpg. Speaking is three frames picked by level. */
-static bool vis_is_kit(visual_t v)
-{
-    return v == V_LISTENING || v == V_THINKING || v == V_SLEEPY || v == V_DIZZY;
-}
+/* Still states are a single poses/<name>.jpg (the four ex-kit faces
+ * included, baked offline). Speaking is three frames picked by level. */
 static bool vis_is_still(visual_t v)
 {
     return v == V_REST || v == V_HAPPY || v == V_MUSIC;
@@ -233,6 +229,22 @@ static int s_front;
 static uint8_t *s_file;      /* PSRAM scratch: one asset file, whole */
 static jpeg_dec_handle_t s_jdec;
 static bool s_broken[V_COUNT];   /* asset failed once: pixel face for it */
+
+/* Speculative thinking pre-build (smooth round). While the listening
+ * face sits static, the player decodes the thinking still — the
+ * common next visual in a voice turn — into the back buffer, so the
+ * switch costs a swap instead of a decode. Ownership is trivially
+ * safe: the player is the only task that ever decodes, and it never
+ * holds the display lock while doing so. s_epoch invalidates the
+ * pre-build: it bumps on every visual enter and every broken-target
+ * diversion, and the enter path only consumes a pre-build whose
+ * recorded epoch is still current (any other enter logs it wasted).
+ * A demand build always preempts: the worst case is waiting out the
+ * one speculative decode already in flight (~a still's decode time),
+ * the same order as the statics poll cadence itself. */
+static bool s_spec_ready;        /* back buffer holds the thinking still */
+static uint32_t s_spec_epoch;    /* s_epoch when the pre-build finished */
+static uint32_t s_epoch;         /* bumped on every enter / broken diversion */
 
 /* muse_frames_hold(): the requester sets s_hold_req; the player
  * acknowledges in s_hold_ack once it has closed the decoder and
@@ -397,197 +409,21 @@ static bool decode_jpeg_file(const char *path, uint16_t *out)
     return decode_jpeg_mem(s_file, len, out);
 }
 
-/* ---- PNG sprites (kits) ---- */
+/* ---- stills ---- */
 
-typedef struct {
-    const uint8_t *data;
-    size_t len, pos;
-} png_src_t;
-
-static void png_read_cb(png_structp png, png_bytep out, png_size_t n)
-{
-    png_src_t *s = (png_src_t *)png_get_io_ptr(png);
-    if (s->pos + n > s->len) {
-        png_error(png, "short read");
-        return;
-    }
-    memcpy(out, s->data + s->pos, n);
-    s->pos += n;
-}
-
-/* Decode a PNG in memory to a fresh PSRAM RGBA8888 buffer (row-major,
- * R,G,B,A per pixel). Caller frees with heap_caps_free. */
-static bool decode_png_mem(const uint8_t *data, size_t len, uint8_t **rgba, int *w, int *h)
-{
-    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png) {
-        return false;
-    }
-    png_infop info = png_create_info_struct(png);
-    if (!info) {
-        png_destroy_read_struct(&png, NULL, NULL);
-        return false;
-    }
-    /* Volatile: both are assigned after setjmp, so a longjmp out of a
-     * corrupt PNG would otherwise leave them indeterminate and the
-     * cleanup below could free a garbage pointer — exactly in the
-     * broken-asset case this decoder exists to survive. */
-    volatile bool ok = false;
-    uint8_t *volatile buf = NULL;
-    if (setjmp(png_jmpbuf(png))) {
-        goto done;
-    }
-    {
-        png_src_t src = { data, len, 0 };
-        png_set_read_fn(png, &src, png_read_cb);
-        png_read_info(png, info);
-        png_uint_32 pw, ph;
-        int bit_depth, color_type;
-        png_get_IHDR(png, info, &pw, &ph, &bit_depth, &color_type, NULL, NULL, NULL);
-        if (pw == 0 || ph == 0 || pw > 512 || ph > 512) {
-            goto done;
-        }
-        if (color_type == PNG_COLOR_TYPE_PALETTE) {
-            png_set_palette_to_rgb(png);
-        }
-        if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
-            png_set_expand_gray_1_2_4_to_8(png);
-        }
-        if (png_get_valid(png, info, PNG_INFO_tRNS)) {
-            png_set_tRNS_to_alpha(png);
-        }
-        if (bit_depth == 16) {
-            png_set_strip_16(png);
-        }
-        if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
-            png_set_gray_to_rgb(png);
-        }
-        if (!(color_type & PNG_COLOR_MASK_ALPHA)) {
-            png_set_add_alpha(png, 0xff, PNG_FILLER_AFTER);
-        }
-        png_read_update_info(png, info);   /* rows come out R,G,B,A */
-        buf = heap_caps_malloc((size_t)pw * ph * 4, MUSE_BIG_CAPS);
-        if (!buf) {
-            goto done;
-        }
-        for (png_uint_32 y = 0; y < ph; y++) {
-            png_read_row(png, buf + (size_t)y * pw * 4, NULL);
-        }
-        *rgba = buf;
-        *w = (int)pw;
-        *h = (int)ph;
-        ok = true;
-    }
-done:
-    if (!ok) {
-        heap_caps_free((void *)buf);
-    }
-    png_destroy_read_struct(&png, &info, NULL);
-    return ok;
-}
-
-/* Alpha-blend one RGBA sprite over the RGB565 frame at (x0, y0),
- * clipped to the frame. Blending is done in 565 component space —
- * a hair of banding on the soft blush edges, invisible at arm's length. */
-static void blend_sprite(uint16_t *frame, const uint8_t *rgba, int w, int h, int x0, int y0)
-{
-    for (int y = 0; y < h; y++) {
-        int fy = y0 + y;
-        if (fy < 0 || fy >= FR_H) {
-            continue;
-        }
-        for (int x = 0; x < w; x++) {
-            int fx = x0 + x;
-            if (fx < 0 || fx >= FR_W) {
-                continue;
-            }
-            const uint8_t *p = rgba + ((size_t)y * w + x) * 4;
-            uint32_t a = p[3];
-            if (a == 0) {
-                continue;
-            }
-            uint16_t *dst = &frame[(size_t)fy * FR_W + fx];
-            if (a == 255) {
-                *dst = (uint16_t)(((p[0] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[2] >> 3));
-                continue;
-            }
-            uint32_t ia = 255 - a;
-            uint32_t r = (((*dst >> 11) & 0x1f) * ia + (p[0] >> 3) * a) / 255;
-            uint32_t g = (((*dst >> 5) & 0x3f) * ia + (p[1] >> 2) * a) / 255;
-            uint32_t b = ((*dst & 0x1f) * ia + (p[2] >> 3) * a) / 255;
-            *dst = (uint16_t)((r << 11) | (g << 5) | b);
-        }
-    }
-}
-
-/* Build a kit state's face into out: the featureless blank, then the
- * five sprites at the rectangles geom.json records. */
-static bool build_kit(const char *name, uint16_t *out)
+/* Decode visual v's still (poses/<name>.jpg) into out, through the
+ * preload when the asset is resident. Every still state goes through
+ * here: the plain poses and, since the smooth round, the four faces
+ * that used to be composited from sprite kits at runtime. */
+static bool decode_still(visual_t v, uint16_t *out)
 {
     char path[96];
-    snprintf(path, sizeof(path), "/meet/sprites/%s/blank.jpg", name);
+    snprintf(path, sizeof(path), "/meet/poses/%s.jpg", VIS_NAMES[v]);
+    s_dec_what = VIS_NAMES[v];
     size_t clen;
     const uint8_t *cached = preload_get(path, &clen);
-    if (cached ? !decode_jpeg_mem(cached, clen, out) : !decode_jpeg_file(path, out)) {
-        return false;
-    }
-    snprintf(path, sizeof(path), "/meet/sprites/%s/geom.json", name);
-    size_t len;
-    cached = preload_get(path, &clen);
-    if (cached) {
-        /* The parser wants a NUL-terminated buffer: stage the
-         * resident copy through the scratch, like a file read. */
-        if (clen >= FR_FILE_MAX) {
-            return false;
-        }
-        memcpy(s_file, cached, clen);
-        len = clen;
-    } else if (!read_file(path, &len) || len >= FR_FILE_MAX) {
-        return false;
-    }
-    s_file[len] = '\0';   /* len < FR_FILE_MAX here, so this is in bounds */
-    cJSON *root = cJSON_Parse((const char *)s_file);
-    if (!root) {
-        return false;
-    }
-    cJSON *sprites = cJSON_GetObjectItemCaseSensitive(root, "sprites");
-    static const char *const order[] = {
-        "spr_blush_L", "spr_blush_R", "spr_eye_L", "spr_eye_R", "spr_mouth",
-    };
-    bool ok = true;
-    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]) && ok; i++) {
-        cJSON *sp = cJSON_GetObjectItemCaseSensitive(sprites, order[i]);
-        cJSON *rect = sp ? cJSON_GetObjectItemCaseSensitive(sp, "rect") : NULL;
-        if (!rect || cJSON_GetArraySize(rect) != 4) {
-            ok = false;
-            break;
-        }
-        int x0 = cJSON_GetArrayItem(rect, 0)->valueint;
-        int y0 = cJSON_GetArrayItem(rect, 1)->valueint;
-        snprintf(path, sizeof(path), "/meet/sprites/%s/%s.png", name, order[i]);
-        size_t plen;
-        const uint8_t *pdata = preload_get(path, &plen);
-        if (!pdata) {
-            if (!read_file(path, &plen)) {
-                ok = false;
-                break;
-            }
-            pdata = s_file;
-        }
-        /* Decode from the bytes as-is: decode_png_mem keeps no
-         * reference after the call, so the shared scratch and the
-         * resident copy are both safe sources. */
-        uint8_t *rgba = NULL;
-        int w = 0, h = 0;
-        if (!decode_png_mem(pdata, plen, &rgba, &w, &h)) {
-            ok = false;
-            break;
-        }
-        blend_sprite(out, rgba, w, h, x0, y0);
-        heap_caps_free(rgba);
-    }
-    cJSON_Delete(root);
-    return ok;
+    return cached ? decode_jpeg_mem(cached, clen, out)
+                  : decode_jpeg_file(path, out);
 }
 
 /* ---- display (always under the board's display lock) ---- */
@@ -898,301 +734,6 @@ static void dip_fade_in(void)
     muse_board->display_unlock();
 }
 
-/* ---- the headphones: a pat reaction that moves, not a cut ----
- *
- * A pat used to cut the whole picture to the happy still — a
- * different composition, so however it was faded it read as a jump.
- * When the build carries the embedded sprite (muse_phones_sprite.h),
- * a pat instead raises the headphones onto the idle face that is
- * already up: the accessory is three small LVGL images (band, two
- * cups) over the frame widget, animated on the LVGL tick, so the
- * face itself never changes and the motion is continuous. The
- * sprite data is embedded LVGL I8 (palette + index plane, see
- * muse_phones_sprite.h for why not RGB565A8); the widgets point
- * straight at it — no decode, no extra buffers.
- *
- * The idle head is not still either: the sequence sways (measured
- * from the shipped frames by eye-patch tracking: a slow lean that
- * reaches ~+27 px, a look-away around frames 9-21 whose translation
- * is interpolated, blinks read as noise and were smoothed out). The
- * overlay follows the frame on screen through FR_SWAY — translation
- * only; the look-away's tilt is not corrected, which is part of why
- * the wear is kept short. The table is indexed by the idle frame
- * the player has just swapped in.
- *
- * Cycle: rise ~0.55 s ease-out with a small overshoot past the seat,
- * a ~0.16 s settle back onto it, a 2 s hold, then a ~0.38 s fall
- * back below the frame. A pat mid-flight reverses from wherever the
- * accessory currently is. Leaving IDLE (a turn, a recording, sleep)
- * takes the phones off at once — the player calls
- * phones_force_off() before it paints anything else. Without the
- * sprite, pats keep the original alternating reactions (the resolver
- * branch below), so other boards are unchanged. */
-#define FR_PHONES_TRAVEL 300     /* px below the seat: out of frame */
-#define FR_PHONES_OVERSHOOT 7    /* px past the seat at the rise's end */
-#define FR_PHONES_HOLD_MS 2000
-#define FR_PHONES_MAX_PIECES 8
-
-static const int8_t FR_SWAY_X[40] = {
-    0, 0, 0, 1, 1, 0, 0, -1, -4, -6, -8, -10, -12, -14, -15, -17,
-    -18, -20, -21, -23, -24, -24, -8, 4, 12, 17, 21, 24, 25, 26,
-    26, 27, 27, 26, 25, 20, 13, 6, 3, 1,
-};
-static const int8_t FR_SWAY_Y[40] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 1, 1, 1, 1, 1, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -2, -2, -3, -4,
-    -5, -6, -6, -6, -4, -3, -1, -1, 0, 0,
-};
-
-typedef enum {
-    PH_OFF = 0,   /* hidden, parked below the frame */
-    PH_RISING,
-    PH_SEATED,    /* on the ears; the fall is pending on a delay */
-    PH_FALLING,
-} phones_state_t;
-
-static const muse_phones_piece_t *s_phones_piece;
-static int s_phones_count;
-/* The widget/descriptor tables are metadata for flash payloads:
- * PSRAM, like the preload table — internal RAM is the scarce one. */
-EXT_RAM_BSS_ATTR static lv_obj_t *s_phones_obj[FR_PHONES_MAX_PIECES];
-EXT_RAM_BSS_ATTR static lv_image_dsc_t s_phones_dsc[FR_PHONES_MAX_PIECES];
-static bool s_phones_ready;          /* sprite linked and widgets up */
-static volatile phones_state_t s_phones_state;
-static int32_t s_phones_dy = FR_PHONES_TRAVEL;   /* current travel offset */
-static int s_phones_anchor;          /* anim identity (the var pointer) */
-static bool s_phones_track;          /* the idle sequence is on screen */
-static int s_sway_idx;               /* idle frame on screen */
-/* Step cadence of the current run, for the acceptance log line. */
-static int s_ph_steps;
-static int64_t s_ph_t0, s_ph_last, s_ph_maxgap;
-
-static void phones_apply(void)
-{
-    if (!s_phones_ready || s_phones_state == PH_OFF) {
-        return;
-    }
-    int sx = 0, sy = 0;
-    if (s_phones_track && s_sway_idx >= 0 && s_sway_idx < 40) {
-        sx = FR_SWAY_X[s_sway_idx];
-        sy = FR_SWAY_Y[s_sway_idx];
-    }
-    int dy = muse_board->minimal_face ? FR_FACE_DY : 0;
-    for (int i = 0; i < s_phones_count; i++) {
-        lv_obj_set_pos(s_phones_obj[i], s_phones_piece[i].x + sx,
-                       s_phones_piece[i].y + dy + s_phones_dy + sy);
-    }
-}
-
-/* The player's frame swaps run under the display lock discipline of
- * the show_* paths; the UI's own calls (attach, pats) are already in
- * LVGL context. The sway index is written inside the lock: the LVGL
- * side reads it in phones_apply(), so the hand-off stays under the
- * one lock both sides already share (Codex review, 2026-11-17). */
-static void phones_apply_locked(int sway_idx)
-{
-    muse_board->display_lock(-1);
-    s_sway_idx = sway_idx;
-    phones_apply();
-    muse_board->display_unlock();
-}
-
-static void phones_set_hidden(bool hidden)
-{
-    for (int i = 0; i < s_phones_count; i++) {
-        if (hidden) {
-            lv_obj_add_flag(s_phones_obj[i], LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_remove_flag(s_phones_obj[i], LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-}
-
-static void phones_run_reset(void)
-{
-    s_ph_steps = 0;
-    s_ph_t0 = esp_timer_get_time();
-    s_ph_last = s_ph_t0;
-    s_ph_maxgap = 0;
-}
-
-static void phones_exec(void *var, int32_t v)
-{
-    (void)var;
-    int64_t now = esp_timer_get_time();
-    if (s_ph_last) {
-        int64_t gap = now - s_ph_last;
-        if (gap > s_ph_maxgap) {
-            s_ph_maxgap = gap;
-        }
-    }
-    s_ph_last = now;
-    s_ph_steps++;
-    s_phones_dy = v;
-    phones_apply();
-}
-
-static void phones_log_run(const char *what)
-{
-    int64_t ms = (esp_timer_get_time() - s_ph_t0) / 1000;
-    ESP_LOGI(TAG, "phones %s: %d steps in %lld ms (max gap %lld ms)", what,
-             s_ph_steps, (long long)ms, (long long)(s_ph_maxgap / 1000));
-}
-
-static void phones_fall_start(int32_t delay_ms);   /* below */
-
-/* The fall's exec: the state only becomes PH_FALLING when the fall
- * actually starts moving. With the post-settle hold the fall anim
- * sits delayed for FR_PHONES_HOLD_MS while the state must still
- * read PH_SEATED — a pat in that window means "take them off now"
- * (phones_tap's SEATED case), not "rise again" (its FALLING case).
- * Codex review, 2026-11-17. */
-static void phones_fall_exec(void *var, int32_t v)
-{
-    if (s_phones_state == PH_SEATED) {
-        s_phones_state = PH_FALLING;
-    }
-    phones_exec(var, v);
-}
-
-/* Anims on the anchor come in two exec flavours; a fresh start has
- * to delete both or a delayed fall survives a re-rise. */
-static void phones_anim_delete_all(void)
-{
-    lv_anim_delete(&s_phones_anchor, phones_exec);
-    lv_anim_delete(&s_phones_anchor, phones_fall_exec);
-}
-
-static void phones_settled(lv_anim_t *a)
-{
-    (void)a;
-    phones_log_run("seated");
-    s_phones_state = PH_SEATED;
-    s_phones_dy = 0;
-    phones_apply();
-    /* The hold, then the fall — one delayed anim, so a pat during
-     * the hold only has to delete it and start the fall now. */
-    phones_fall_start(FR_PHONES_HOLD_MS);
-}
-
-static void phones_rise_overshot(lv_anim_t *a)
-{
-    (void)a;
-    lv_anim_t b;
-    lv_anim_init(&b);
-    lv_anim_set_var(&b, &s_phones_anchor);
-    lv_anim_set_exec_cb(&b, phones_exec);
-    lv_anim_set_values(&b, s_phones_dy, 0);
-    lv_anim_set_duration(&b, 160);
-    lv_anim_set_path_cb(&b, lv_anim_path_ease_in_out);
-    lv_anim_set_ready_cb(&b, phones_settled);
-    lv_anim_start(&b);
-}
-
-static void phones_rise_start(void)
-{
-    phones_anim_delete_all();
-    if (s_phones_state == PH_OFF) {
-        s_phones_dy = FR_PHONES_TRAVEL;
-        phones_set_hidden(false);
-    }
-    s_phones_state = PH_RISING;
-    phones_run_reset();
-    phones_apply();
-    int32_t dist = s_phones_dy + FR_PHONES_OVERSHOOT;
-    if (dist < 0) {
-        dist = -dist;
-    }
-    int dur = 90 + 450 * (int)dist / (FR_PHONES_TRAVEL + FR_PHONES_OVERSHOOT);
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, &s_phones_anchor);
-    lv_anim_set_exec_cb(&a, phones_exec);
-    lv_anim_set_values(&a, s_phones_dy, -FR_PHONES_OVERSHOOT);
-    lv_anim_set_duration(&a, dur);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_set_ready_cb(&a, phones_rise_overshot);
-    lv_anim_start(&a);
-}
-
-static void phones_fell(lv_anim_t *a)
-{
-    (void)a;
-    phones_log_run("off");
-    s_phones_state = PH_OFF;
-    s_phones_dy = FR_PHONES_TRAVEL;
-    phones_set_hidden(true);
-}
-
-static void phones_fall_start(int32_t delay_ms)
-{
-    phones_anim_delete_all();
-    if (delay_ms == 0) {
-        s_phones_state = PH_FALLING;
-    }   /* a delayed fall keeps PH_SEATED until phones_fall_exec */
-    phones_run_reset();
-    int32_t dist = FR_PHONES_TRAVEL - s_phones_dy;
-    if (dist < 0) {
-        dist = -dist;
-    }
-    int dur = 90 + 290 * (int)dist / FR_PHONES_TRAVEL;
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, &s_phones_anchor);
-    lv_anim_set_exec_cb(&a, phones_fall_exec);
-    lv_anim_set_values(&a, s_phones_dy, FR_PHONES_TRAVEL);
-    lv_anim_set_duration(&a, dur);
-    lv_anim_set_delay(&a, delay_ms);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
-    lv_anim_set_ready_cb(&a, phones_fell);
-    lv_anim_start(&a);
-}
-
-/* A pat, in LVGL context: toggle the accessory. False when this
- * build has no sprite — the caller then takes the original path. */
-static bool phones_tap(void)
-{
-    if (!s_phones_ready) {
-        return false;
-    }
-    switch (s_phones_state) {
-    case PH_OFF:
-    case PH_FALLING:
-        phones_rise_start();
-        break;
-    case PH_RISING:
-    case PH_SEATED:
-        phones_fall_start(0);
-        break;
-    }
-    return true;
-}
-
-/* The player is leaving the idle face (or the face is going away):
- * the accessory comes off at once, whatever it was doing. Runs in
- * the player's context, under the display lock like the show_*
- * paths it precedes. */
-static void phones_force_off(void)
-{
-    if (!s_phones_ready) {
-        return;
-    }
-    muse_board->display_lock(-1);
-    if (s_phones_state == PH_OFF) {
-        /* Checked under the lock: a pat landing between an unlocked
-         * check and the lock could otherwise start a rise that this
-         * force-off then misses (Codex review, 2026-11-17). */
-        muse_board->display_unlock();
-        return;
-    }
-    phones_anim_delete_all();
-    s_phones_state = PH_OFF;
-    s_phones_dy = FR_PHONES_TRAVEL;
-    phones_set_hidden(true);
-    muse_board->display_unlock();
-    ESP_LOGI(TAG, "phones off (state change)");
-}
-
 /* ---- which visual should be up ---- */
 
 static visual_t s_last_active = V_NONE;   /* last SPEAKING/THINKING seen */
@@ -1201,19 +742,17 @@ static bool s_levelup_pending;
 static float s_prev_happy;
 static bool s_waking_done;
 
-/* Pet taps (muse_frames_pet_tap): with the headphones sprite the
- * tap is answered in LVGL context by the overlay above; without it,
- * a pending request plus which of the two reactions is next.
- * Written by the UI task, consumed only by the player's resolver in
- * IDLE, so a tap lands between turns, never in the middle of one. */
+/* Pet taps (muse_frames_pet_tap): a pending request plus which of
+ * the two reactions is next. Written by the UI task, consumed only
+ * by the player's resolver in IDLE, so a tap lands between turns,
+ * never in the middle of one. (The headphones overlay that used to
+ * answer taps on sprite builds was removed whole on Hugh's call,
+ * 2026-11-17: he saw it on the device and did not like it.) */
 static volatile bool s_pet_pending;
 static bool s_pet_levelup_turn = true;
 
 void muse_frames_pet_tap(void)
 {
-    if (phones_tap()) {
-        return;
-    }
     s_pet_pending = true;
 }
 
@@ -1357,21 +896,12 @@ static visual_t resolve_target(void)
 
 /* ---- entering visuals ---- */
 
-/* Decode visual v's still content (kit composite or poses still) into
- * the back buffer and swap it in. False (and v marked broken) when the
- * asset is unusable; the fallback face stays up then. */
+/* Decode visual v's still into the back buffer and swap it in.
+ * False (and v marked broken) when the asset is unusable; the
+ * fallback face stays up then. */
 static bool enter_still(visual_t v)
 {
-    bool ok;
-    if (vis_is_kit(v)) {
-        s_dec_what = VIS_NAMES[v];
-        ok = build_kit(VIS_NAMES[v], back_buffer());
-    } else {
-        char path[96];
-        snprintf(path, sizeof(path), "/meet/poses/%s.jpg", VIS_NAMES[v]);
-        s_dec_what = VIS_NAMES[v];
-        ok = decode_jpeg_file(path, back_buffer());
-    }
+    bool ok = decode_still(v, back_buffer());
     if (!ok) {
         s_broken[v] = true;
         ESP_LOGW(TAG, "%s: asset unusable, fallback face for this state", VIS_NAMES[v]);
@@ -1533,7 +1063,6 @@ static void player_task(void *arg)
         if (want == V_NONE) {
             if (cur != V_NONE) {
                 s_dip = false;
-                phones_force_off();
                 hide_face();
                 cur = V_NONE;
             }
@@ -1541,9 +1070,8 @@ static void player_task(void *arg)
             continue;
         }
         if (s_broken[want]) {
-            if (want != V_IDLE) {
-                phones_force_off();
-            }
+            s_spec_ready = false;   /* a diversion spends the epoch too */
+            s_epoch++;
             s_dip = false;   /* the fallback face comes up as-is */
             if (want == V_WAKING) {
                 s_waking_done = true;   /* no waking asset: don't wedge on it */
@@ -1560,17 +1088,27 @@ static void player_task(void *arg)
             /* Enter a new visual. The two timestamps bracket the
              * switch for the log line below: total is what a state
              * request waits for a new face, build is the part the
-             * preload can shrink (asset reads + decode/composite). */
+             * preload can shrink (asset reads + decode). */
             int64_t t_req = esp_timer_get_time();
-            if (want != V_IDLE) {
-                /* Off before the present paints anything: the
-                 * overlay is an LVGL guest over the idle face only. */
-                phones_force_off();
-            }
             s_enter_swap = true;   /* an enter, not a frame advance */
             int64_t t_build = esp_timer_get_time();
             bool ok = true;
-            if (SEQS[want].dir) {
+            /* A current-epoch thinking pre-build is pixel-identical
+             * to what enter_still would decode: swap it straight in.
+             * Any other enter spends the pre-build (logged wasted
+             * when there was one). */
+            bool spec_hit = want == V_THINKING && s_spec_ready
+                            && s_spec_epoch == s_epoch;
+            if (s_spec_ready && !spec_hit) {
+                ESP_LOGI(TAG, "spec thinking: wasted");
+            }
+            s_spec_ready = false;
+            s_epoch++;
+            if (spec_hit) {
+                s_swap_vis = want;
+                swap_buffers();
+                ESP_LOGI(TAG, "spec thinking: hit");
+            } else if (SEQS[want].dir) {
                 seq_idx = 0;
                 seq_ready = false;
                 ok = enter_seq_frame(want, 0, back_buffer());
@@ -1615,10 +1153,6 @@ static void player_task(void *arg)
                 dip_fade_in();
             }
             cur = want;
-            s_phones_track = (want == V_IDLE);
-            if (want == V_IDLE) {
-                phones_apply_locked(0);
-            }
             continue;
         }
 
@@ -1662,11 +1196,6 @@ static void player_task(void *arg)
                         seq_idx = SEQS[cur].oneshot ? SEQS[cur].frames - 1
                                                      : seq_idx % SEQS[cur].frames;
                     }
-                }
-                if (cur == V_IDLE && s_phones_state != PH_OFF) {
-                    /* The headphones ride the sway of the frame that
-                     * just went up (see FR_SWAY). */
-                    phones_apply_locked(seq_idx);
                 }
                 now = esp_timer_get_time();
             }
@@ -1723,7 +1252,24 @@ static void player_task(void *arg)
             continue;
         }
 
-        /* Statics: nothing to do until the state changes. */
+        /* Statics: nothing to do until the state changes — except,
+         * while listening sits up, speculatively building thinking
+         * into the back buffer (see s_spec_ready). The resolver runs
+         * again immediately after, so a state change that landed
+         * during the decode is picked up next pass. */
+        if (cur == V_LISTENING && !s_spec_ready && !s_broken[V_THINKING]) {
+            int64_t t_spec = esp_timer_get_time();
+            if (decode_still(V_THINKING, back_buffer())) {
+                s_spec_ready = true;
+                s_spec_epoch = s_epoch;
+                ESP_LOGI(TAG, "spec thinking: built in %lld ms",
+                         (long long)(esp_timer_get_time() - t_spec) / 1000);
+            } else {
+                s_broken[V_THINKING] = true;
+                ESP_LOGW(TAG, "thinking: asset unusable, fallback face for this state");
+            }
+            continue;
+        }
         vTaskDelay(pdMS_TO_TICKS(120));
     }
 }
@@ -1787,65 +1333,6 @@ void muse_frames_attach(lv_obj_t *face)
             ESP_LOGW(TAG, "boot still unusable: library/pixel fallback only");
             heap_caps_free(s_still);
             s_still = NULL;
-        }
-    }
-
-    /* The headphones overlay (see the phones section above): one
-     * image widget per sprite piece, created right after the face
-     * image so the pieces draw over it — and before the dialog
-     * muse_ui.c adds to the same tile later, so captions stay on
-     * top. The descriptors point straight at the embedded I8 blobs:
-     * no decode, no extra buffers. A build without the
-     * generated sprite gets the stub's empty table, no widgets, and
-     * pats keep the alternating reactions. Like the widget creation
-     * above, this runs in the UI's own context during build_screen(),
-     * so no lock is taken. */
-    size_t npieces = 0;
-    const muse_phones_piece_t *pieces = muse_phones_pieces(&npieces);
-    if (pieces && npieces > 0) {
-        if (npieces > FR_PHONES_MAX_PIECES) {
-            npieces = FR_PHONES_MAX_PIECES;
-        }
-        s_phones_piece = pieces;
-        s_phones_count = (int)npieces;
-        size_t total = 0;
-        bool ok = true;
-        for (int i = 0; i < s_phones_count && ok; i++) {
-            const muse_phones_piece_t *p = &pieces[i];
-            lv_image_dsc_t *d = &s_phones_dsc[i];
-            d->header.magic = LV_IMAGE_HEADER_MAGIC;
-            d->header.cf = LV_COLOR_FORMAT_I8;
-            d->header.w = p->w;
-            d->header.h = p->h;
-            d->header.stride = (uint32_t)p->w;
-            d->data_size = p->data_size;
-            d->data = p->data;
-            total += p->data_size;
-            s_phones_obj[i] = lv_image_create(face);
-            if (!s_phones_obj[i]) {
-                ok = false;
-                break;
-            }
-            lv_image_set_src(s_phones_obj[i], d);
-            lv_obj_remove_flag(s_phones_obj[i], LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_remove_flag(s_phones_obj[i], LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_add_flag(s_phones_obj[i], LV_OBJ_FLAG_HIDDEN);
-        }
-        if (ok) {
-            s_phones_state = PH_OFF;
-            s_phones_dy = FR_PHONES_TRAVEL;
-            s_phones_ready = true;
-            ESP_LOGI(TAG, "phones sprite: %d pieces, %u bytes embedded",
-                     s_phones_count, (unsigned)total);
-        } else {
-            for (int i = 0; i < s_phones_count; i++) {
-                if (s_phones_obj[i]) {
-                    lv_obj_delete(s_phones_obj[i]);
-                    s_phones_obj[i] = NULL;
-                }
-            }
-            s_phones_count = 0;
-            ESP_LOGW(TAG, "phones sprite: widget creation failed, pats unchanged");
         }
     }
 
