@@ -23,6 +23,7 @@
 #include "esp_heap_caps.h"
 #include "esp_jpeg_dec.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -100,6 +101,30 @@ static const char *TAG = "muse_frames";
  * with no step at the first swap. */
 #define FR_WAKING_DY 15
 
+/* Waking -> idle seam experiment (2026-11-17): instead of dipping
+ * through black, the last FR_CONV_FRAMES frames of waking zoom the
+ * face — through the image widget's own scale, the B-round-proven
+ * path — until its geometry matches idle's first frame, then hard-
+ * cut. Measured on the shipped frames with the dark-feature method
+ * (threshold <80, calibrated against idle f000): idle f000 eye span
+ * 146, eye line y 183.1, face top 38; waking f055 (same pose) eye
+ * span 112, eye line y 129.3, top 24, eye midpoint (235, 129).
+ * Scaling waking by 146/112 = 1.304 (LVGL 334) about that midpoint
+ * lands its eye line on its own y=129 in image space; the widget
+ * then needs dy 203 - 129 = 74 on screen to sit on idle's eye line
+ * (183.1 + FR_FACE_DY 20), i.e. FR_CONV_DY_END 39 on top of the
+ * usual 20 + FR_WAKING_DY 15. Cross-checks under this transform:
+ * the mouth lands within 0.6 px of idle's, the eyes within a pixel
+ * of idle's size; the head top lands ~8 px low, accepted. Set
+ * FR_WAKING_CONVERGE to 0 and the Hugh-approved dip path runs
+ * again, untouched — Hugh's eyes decide which one ships. */
+#define FR_WAKING_CONVERGE 1
+#define FR_CONV_FRAMES 4          /* last 4 frames at 8 fps = 0.5 s */
+#define FR_CONV_SCALE_END 334     /* 146/112 in LVGL scale (256=1x) */
+#define FR_CONV_PIVOT_X 235       /* waking f055 eye midpoint */
+#define FR_CONV_PIVOT_Y 129
+#define FR_CONV_DY_END 39         /* extra dy on top of 20 + 15 */
+
 /* Core the player task is pinned to. Decoding a 466x466 frame takes
  * ~100 ms of wall time (P8 acceptance log), and the measured time is
  * wall time, so whatever shares the core inflates it directly: on
@@ -136,6 +161,16 @@ static const char *TAG = "muse_frames";
  * the PSRAM budget does not have. The waking handoff keeps its own
  * full dip-to-black (Hugh-approved, dip_fade_out() below); nothing
  * here applies to it. */
+
+/* The one exception to the hard-cut rule (Hugh, 2026-11-17): the
+ * idle rotation's variant-to-variant change — and only that — is a
+ * true crossfade. It needs no third buffer after all: the present
+ * path's fill callback can read both frame buffers and mix them per
+ * pixel with complementary weights (see crossfade_swap()). Every
+ * interactive switch still hard-cuts at full opa through
+ * show_front(); the fade is entered only from the rotation's own
+ * enter, flagged by s_rot_fade, and its log line ("fade a->b: N
+ * steps, T ms") keeps it distinguishable from a present in captures. */
 
 /* The squash's low point (image scale, 256 = 1.0x). */
 #define FR_SQUASH_MIN 246        /* ~96% */
@@ -174,6 +209,18 @@ typedef enum {
     V_PAUSED,     /* keep whatever is up, decode nothing */
     V_WAKING,
     V_IDLE,
+    V_IDLE2,     /* idle rotation pool (see ROT_POOL) */
+    V_IDLE3,
+    V_IDLE4,
+    V_IDLE5,
+    V_STRETCH,   /* the waking artwork again, as an idle stretch */
+    V_DANCE1,
+    V_DANCE2,
+    V_DANCE3,
+    V_DANCE4,
+    V_DANCE5,
+    V_DANCE6,
+    V_FLIP,      /* one-shot somersault gag, low rotation weight */
     V_WORKING,
     V_MAKING,
     V_LEVELUP,
@@ -191,13 +238,26 @@ typedef enum {
 
 typedef struct {
     const char *dir;   /* under /meet/frames */
-    int frames;
+    int frames;        /* stored frames (pingpong: one direction) */
     bool oneshot;
+    bool pingpong;     /* play forward then back: cycle is 2n-2 */
 } seq_def_t;
 
 static const seq_def_t SEQS[V_COUNT] = {
     [V_WAKING] = { "waking", 56, true },
     [V_IDLE] = { "idle", 40, false },
+    [V_IDLE2] = { "idle2", 8, false, true },
+    [V_IDLE3] = { "idle3", 9, false, true },
+    [V_IDLE4] = { "idle4", 42, false },
+    [V_IDLE5] = { "idle5", 83, false },
+    [V_STRETCH] = { "waking", 56, false },
+    [V_DANCE1] = { "dance1", 35, false },
+    [V_DANCE2] = { "dance2", 29, false },
+    [V_DANCE3] = { "dance3", 39, false },
+    [V_DANCE4] = { "dance4", 34, false },
+    [V_DANCE5] = { "dance5", 36, false },
+    [V_DANCE6] = { "dance6", 25, false },
+    [V_FLIP] = { "flip", 33, true },
     [V_WORKING] = { "working", 40, false },
     [V_MAKING] = { "making", 40, false },
     [V_LEVELUP] = { "levelup", 40, true },
@@ -210,7 +270,25 @@ static const char *const VIS_NAMES[V_COUNT] = {
     [V_LISTENING] = "listening", [V_THINKING] = "thinking",
     [V_SLEEPY] = "sleepy",   [V_DIZZY] = "dizzy",     [V_REST] = "rest",
     [V_HAPPY] = "happy",     [V_MUSIC] = "music",     [V_STILL] = "still",
+    [V_IDLE2] = "idle2",     [V_IDLE3] = "idle3",     [V_IDLE4] = "idle4",
+    [V_IDLE5] = "idle5",     [V_STRETCH] = "stretch",
+    [V_DANCE1] = "dance1",   [V_DANCE2] = "dance2",   [V_DANCE3] = "dance3",
+    [V_DANCE4] = "dance4",   [V_DANCE5] = "dance5",   [V_DANCE6] = "dance6",
+    [V_FLIP] = "flip",
 };
+
+/* Sequence positions are cycle positions: for a ping-pong sequence
+ * the cycle runs 0..n-1..1 (2n-2 steps) over the n stored frames. */
+static int seq_cycle(visual_t v)
+{
+    return SEQS[v].pingpong ? 2 * SEQS[v].frames - 2 : SEQS[v].frames;
+}
+
+static int seq_file_idx(visual_t v, int pos)
+{
+    int n = SEQS[v].frames;
+    return (SEQS[v].pingpong && pos >= n) ? 2 * n - 2 - pos : pos;
+}
 
 /* Still states are a single poses/<name>.jpg (the four ex-kit faces
  * included, baked offline). Speaking is three frames picked by level. */
@@ -451,12 +529,48 @@ static bool s_dip;
  * re-applies the in-flight factor instead of resetting it. */
 static volatile int32_t s_squash_factor = 256;
 
+/* Waking convergence state (FR_WAKING_CONVERGE): while active, the
+ * waking widget zooms about the measured pivot instead of resting
+ * at the squash factor. Written by the player (conv_update) ahead
+ * of the swap that shows each converged frame, read here under the
+ * display lock like s_squash_factor. Reset by any non-waking enter. */
+static bool s_conv_active;
+static int32_t s_conv_scale = 256;
+static int32_t s_conv_dy;
+
 static void apply_framing(visual_t v)
 {
     lv_image_set_scale(s_img, s_squash_factor);
+    if (v == V_WAKING && s_conv_active) {
+        lv_image_set_pivot(s_img, FR_CONV_PIVOT_X, FR_CONV_PIVOT_Y);
+        lv_image_set_scale(s_img, s_conv_scale);
+    }
     lv_obj_align(s_img, LV_ALIGN_CENTER, 0,
                  (muse_board->minimal_face ? FR_FACE_DY : 0) +
-                 ((v == V_WAKING || v == V_STILL) ? FR_WAKING_DY : 0));
+                 ((v == V_WAKING || v == V_STILL) ? FR_WAKING_DY : 0) +
+                 ((v == V_WAKING && s_conv_active) ? s_conv_dy : 0));
+}
+
+/* Convergence for the waking frame the next swap puts up: the last
+ * FR_CONV_FRAMES frames ramp scale 256 -> FR_CONV_SCALE_END and the
+ * extra dy 0 -> FR_CONV_DY_END in equal steps. */
+static void conv_update(int pos)
+{
+    if (!FR_WAKING_CONVERGE) {
+        return;
+    }
+    int start = SEQS[V_WAKING].frames - FR_CONV_FRAMES;
+    if (pos < start) {
+        return;
+    }
+    float p = (float)(pos - start + 1) / (float)FR_CONV_FRAMES;
+    s_conv_scale = 256 + (int32_t)((FR_CONV_SCALE_END - 256) * p);
+    s_conv_dy = (int32_t)(FR_CONV_DY_END * p);
+    if (!s_conv_active || pos >= SEQS[V_WAKING].frames - 1) {
+        ESP_LOGI(TAG, "waking converge: frame %d scale %d dy extra %d",
+                 pos, (int)s_conv_scale, (int)s_conv_dy);
+    }
+    s_conv_active = true;
 }
 
 static void squash_exec(void *obj, int32_t v);   /* defined with the squash */
@@ -521,6 +635,39 @@ static void pres_fill(uint8_t *dst, int stride, int row, int rows, void *arg)
                                          ((v & 31) * o / 255));
                 d[x] = (uint16_t)((nv << 8) | (nv >> 8));
             }
+        }
+        dst += stride;
+    }
+}
+
+typedef struct {
+    const uint16_t *oldb;   /* outgoing frame's rect base */
+    const uint16_t *newb;   /* incoming frame's rect base */
+    int a;                  /* incoming weight 0..255; old gets 255-a */
+} fade_arg_t;
+
+/* fill() for the rotation crossfade: pres_fill's two-source sibling.
+ * The weights are complementary (a and 255-a), so a pixel's total
+ * brightness is preserved across the blend — a crossfade, not a
+ * dip. At a = 255 the output is exactly the new frame. */
+static void fade_fill(uint8_t *dst, int stride, int row, int rows, void *arg)
+{
+    const fade_arg_t *p = arg;
+    const int w = FR_PRES_X1 - FR_PRES_X0;
+    const int a = p->a, ia = 255 - a;
+    const uint16_t *os = p->oldb + (size_t)row * FR_W;
+    const uint16_t *ns = p->newb + (size_t)row * FR_W;
+    for (int r = 0; r < rows; r++) {
+        uint16_t *d = (uint16_t *)dst;
+        const uint16_t *o = os + (size_t)r * FR_W;
+        const uint16_t *n = ns + (size_t)r * FR_W;
+        for (int x = 0; x < w; x++) {
+            uint16_t ov = o[x], nv = n[x];
+            uint16_t out = (uint16_t)(
+                ((((ov >> 11) & 31) * ia + ((nv >> 11) & 31) * a) / 255 << 11) |
+                ((((ov >> 5) & 63) * ia + ((nv >> 5) & 63) * a) / 255 << 5) |
+                (((ov & 31) * ia + (nv & 31) * a) / 255));
+            d[x] = (uint16_t)((out << 8) | (out >> 8));
         }
         dst += stride;
     }
@@ -683,6 +830,87 @@ static uint16_t *back_buffer(void)
     return s_buf[s_front ^ 1];
 }
 
+/* The idle rotation's crossfade (see the note at the top of the
+ * file): blend the front buffer into the back buffer on the panel
+ * in FR_FADE_STEPS complementary steps, then flip the front and
+ * re-source the widget, exactly like a swap. A blend step costs
+ * ~48 ms of wire time (measured on device, 2026-11-17: the
+ * two-source fill is about twice a plain present's), so 6 steps
+ * plus short delays land the fade at ~370 ms. The display lock is
+ * taken per step, never for the fade's whole length; the widget
+ * still points at the old buffer during the steps, so an LVGL
+ * refresh in between repaints the old picture and the next step
+ * overwrites it — the same self-healing transient a direct present
+ * has. Only the rotation's enter calls this (s_rot_fade); every
+ * interactive switch keeps the opa-255 hard cut. Falls back to a
+ * plain swap when the board cannot present directly. */
+#define FR_FADE_STEPS 6
+#define FR_FADE_STEP_MS 15
+
+static void crossfade_swap(visual_t from)
+{
+    int64_t t0 = esp_timer_get_time();
+    int dy = muse_board->minimal_face ? FR_FACE_DY : 0;
+    int y0 = FR_PRES_TOP > dy ? FR_PRES_TOP : dy;
+    fade_arg_t a = {
+        s_buf[s_front] + (size_t)(y0 - dy) * FR_W + FR_PRES_X0,
+        s_buf[s_front ^ 1] + (size_t)(y0 - dy) * FR_W + FR_PRES_X0,
+        0,
+    };
+    /* Eligibility and the bottom boundary are re-decided under each
+     * step's lock (Codex review): a decision sampled once would go
+     * stale inside the fade's ~350 ms — the face tile can be swiped
+     * away or the dialog can come up mid-fade, and later steps must
+     * not keep painting the face over either. An abort before the
+     * first step out falls back to the plain swap; an abort after
+     * that still flips and re-sources the widget, so the player
+     * state stays consistent and LVGL's next repaint of the face
+     * area shows the new variant whole. */
+    int y1 = FR_H;
+    int steps_done = 0;
+    bool aborted = false;
+    for (int k = 1; k <= FR_FADE_STEPS; k++) {
+        muse_board->display_lock(-1);
+        if (!present_ok()) {
+            muse_board->display_unlock();
+            aborted = true;
+            break;
+        }
+        if (k == 1) {
+            present_squash_cancel();
+        }
+        y1 = present_bottom();
+        a.a = 255 * k / FR_FADE_STEPS;
+        muse_board->draw_frame(FR_PRES_X0, y0, FR_PRES_X1, y1, 8, fade_fill, &a);
+        muse_board->display_unlock();
+        steps_done = k;
+        if (k < FR_FADE_STEPS) {
+            vTaskDelay(pdMS_TO_TICKS(FR_FADE_STEP_MS));
+        }
+    }
+    if (aborted && steps_done == 0) {
+        swap_buffers();
+        return;
+    }
+    if (aborted) {
+        ESP_LOGW(TAG, "fade aborted at step %d", steps_done);
+    }
+    s_front ^= 1;
+    muse_board->display_lock(-1);
+    s_dsc.data = (const uint8_t *)s_buf[s_front];
+    lv_image_set_src(s_img, &s_dsc);
+    apply_framing(s_swap_vis);
+    lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
+    muse_board->display_unlock();
+    if (!aborted) {
+        present_border(y1);
+    }
+    ESP_LOGI(TAG, "fade %s->%s: %d steps, %lld ms", VIS_NAMES[from],
+             VIS_NAMES[s_swap_vis], steps_done,
+             (long long)(esp_timer_get_time() - t0) / 1000);
+}
+
 /* levelup's exit used to fade the last frame out here (LVGL opa
  * steps 200 -> 0, ~45 ms apart) and hide the widget, leaving a
  * dark gap while idle built. It was the same brightness excursion
@@ -732,6 +960,141 @@ static void dip_fade_in(void)
     lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
     lv_obj_invalidate(s_img);
     muse_board->display_unlock();
+}
+
+/* ---- idle rotation ----
+ *
+ * The resolver's plain "idle" is a pool, not a single sequence
+ * (Hugh, 2026-11-17: every animation that can pass as idle joins;
+ * framing differences between variants are absorbed by the
+ * crossfade, see crossfade_swap()). A shuffle bag deals the visits:
+ * normal variants hold three slots each, low-weight ones (the six
+ * official dances and the flip gag) one — so a low variant surfaces
+ * occasionally, never twice in a row, and no variant repeats
+ * back-to-back. Each visit plays its loops (ping-pong variants
+ * count a forward-and-back as one loop; their per-loop time is
+ * ~2 s against the full sequences' 4-10 s, so they get more loops
+ * for a comparable dwell), then the player rotates: the next
+ * variant is picked here, and its enter crossfades. State faces
+ * (working/making/taking-notes semantics, the headphones rule) are
+ * NOT pool members: idle showing them would fake the status the
+ * face exists to report. */
+typedef struct {
+    visual_t v;
+    int loops_min, loops_max;
+    bool low;   /* low weight: one bag slot, never after another low */
+} rot_ent_t;
+
+static const rot_ent_t ROT_POOL[] = {
+    { V_IDLE,    2, 3, false },
+    { V_IDLE2,   6, 8, false },
+    { V_IDLE3,   6, 8, false },
+    { V_IDLE4,   2, 3, false },
+    { V_IDLE5,   2, 3, false },
+    { V_STRETCH, 1, 1, false },
+    { V_DANCE1,  2, 2, true },
+    { V_DANCE2,  2, 2, true },
+    { V_DANCE3,  2, 2, true },
+    { V_DANCE4,  2, 2, true },
+    { V_DANCE5,  2, 2, true },
+    { V_DANCE6,  2, 2, true },
+    { V_FLIP,    1, 1, true },
+};
+#define ROT_N (sizeof(ROT_POOL) / sizeof(ROT_POOL[0]))
+#define ROT_BAG_MAX 32
+
+static visual_t s_rot_cur = V_IDLE;   /* variant the pool is visiting */
+static int s_rot_loops;               /* loops left in this visit */
+static bool s_rot_fade;               /* next idle enter crossfades */
+static int s_bag[ROT_BAG_MAX];
+static int s_bag_n;
+static int s_bag_pos;                 /* == s_bag_n: bag empty */
+
+static const rot_ent_t *rot_find(visual_t v)
+{
+    for (size_t i = 0; i < ROT_N; i++) {
+        if (ROT_POOL[i].v == v) {
+            return &ROT_POOL[i];
+        }
+    }
+    return NULL;
+}
+
+static bool is_idle_variant(visual_t v)
+{
+    return rot_find(v) != NULL;
+}
+
+static int visit_loops(visual_t v)
+{
+    const rot_ent_t *e = rot_find(v);
+    if (!e) {
+        return 2;
+    }
+    if (e->loops_max <= e->loops_min) {
+        return e->loops_min;
+    }
+    return e->loops_min
+           + (int)(esp_random() % (uint32_t)(e->loops_max - e->loops_min + 1));
+}
+
+static void rot_refill(void)
+{
+    int n = 0;
+    for (size_t i = 0; i < ROT_N && n < ROT_BAG_MAX; i++) {
+        int reps = ROT_POOL[i].low ? 1 : 3;
+        for (int r = 0; r < reps && n < ROT_BAG_MAX; r++) {
+            s_bag[n++] = (int)i;
+        }
+    }
+    for (int i = n - 1; i > 0; i--) {
+        int j = (int)(esp_random() % (uint32_t)(i + 1));
+        int tmp = s_bag[i];
+        s_bag[i] = s_bag[j];
+        s_bag[j] = tmp;
+    }
+    s_bag_n = n;
+    s_bag_pos = 0;
+}
+
+/* The next variant to visit after cur: never cur itself, never a
+ * broken one, never a low-weight one right after a low-weight one.
+ * Skipped slots are spent (the multiplicities make that cheap);
+ * an exhausted bag is refilled once before giving up to V_IDLE. */
+static visual_t rot_pick_next(visual_t cur)
+{
+    const rot_ent_t *ce = rot_find(cur);
+    bool cur_low = ce && ce->low;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        while (s_bag_pos < s_bag_n) {
+            const rot_ent_t *e = &ROT_POOL[s_bag[s_bag_pos++]];
+            if (e->v == cur || s_broken[e->v] || (cur_low && e->low)) {
+                continue;
+            }
+            return e->v;
+        }
+        rot_refill();
+    }
+    return V_IDLE;
+}
+
+/* End the current visit: pick the next variant and flag its enter
+ * to crossfade. A no-op when a rotation is already pending (a frame
+ * skip in the same pass must not spend two picks), and re-arms the
+ * visit when the bag hands back the current variant itself. */
+static void rot_advance(visual_t cur)
+{
+    if (s_rot_fade) {
+        return;
+    }
+    visual_t nxt = rot_pick_next(cur);
+    if (nxt != cur) {
+        ESP_LOGI(TAG, "idle rotate: %s -> %s", VIS_NAMES[cur], VIS_NAMES[nxt]);
+        s_rot_cur = nxt;
+        s_rot_fade = true;
+    } else {
+        s_rot_loops = visit_loops(cur);
+    }
 }
 
 /* ---- which visual should be up ---- */
@@ -912,8 +1275,9 @@ static bool enter_still(visual_t v)
     return true;
 }
 
-static bool enter_seq_frame(visual_t v, int idx, uint16_t *into)
+static bool enter_seq_frame(visual_t v, int pos, uint16_t *into)
 {
+    int idx = seq_file_idx(v, pos);   /* cycle position -> stored frame */
     char path[96];
     snprintf(path, sizeof(path), "/meet/frames/%s/f%03d.jpg", SEQS[v].dir, idx);
     s_dec_what = VIS_NAMES[v];
@@ -1053,6 +1417,12 @@ static void player_task(void *arg)
                 s_waking_done = true;   /* interrupted or pre-empted */
             }
         }
+        /* Idle rotation: the resolver's plain idle is whichever pool
+         * variant the shuffle bag is visiting. After the waking gate,
+         * so the boot sequence still gets its first calm moment. */
+        if (want == V_IDLE) {
+            want = s_rot_cur;
+        }
         if (want == V_PAUSED) {
             /* Screen dark or settings up: hold the frame, and do not
              * let the schedule run away while nobody is watching. */
@@ -1073,6 +1443,10 @@ static void player_task(void *arg)
             s_spec_ready = false;   /* a diversion spends the epoch too */
             s_epoch++;
             s_dip = false;   /* the fallback face comes up as-is */
+            s_rot_fade = false;
+            if (is_idle_variant(want) && want != V_IDLE) {
+                s_rot_cur = V_IDLE;   /* rotation falls back to plain idle */
+            }
             if (want == V_WAKING) {
                 s_waking_done = true;   /* no waking asset: don't wedge on it */
             }
@@ -1093,6 +1467,11 @@ static void player_task(void *arg)
             s_enter_swap = true;   /* an enter, not a frame advance */
             int64_t t_build = esp_timer_get_time();
             bool ok = true;
+            /* A rotation enter crossfades; any other enter spends
+             * the flag. Read before the spec handling below, which
+             * can also produce this swap. */
+            bool fade_enter = s_rot_fade && is_idle_variant(want);
+            s_rot_fade = false;
             /* A current-epoch thinking pre-build is pixel-identical
              * to what enter_still would decode: swap it straight in.
              * Any other enter spends the pre-build (logged wasted
@@ -1114,7 +1493,12 @@ static void player_task(void *arg)
                 ok = enter_seq_frame(want, 0, back_buffer());
                 if (ok) {
                     s_swap_vis = want;
-                    swap_buffers();
+                    if (fade_enter) {
+                        s_enter_swap = false;   /* the fade presents itself */
+                        crossfade_swap(cur);
+                    } else {
+                        swap_buffers();
+                    }
                     deadline = esp_timer_get_time() + FR_PERIOD_US;
                 }
             } else if (want == V_SPEAKING) {
@@ -1152,6 +1536,16 @@ static void player_task(void *arg)
                 s_dip = false;
                 dip_fade_in();
             }
+            if (is_idle_variant(want)) {
+                s_rot_loops = visit_loops(want);   /* a fresh visit */
+            }
+            if (want != V_WAKING) {
+                /* Convergence is waking-only; the swap above already
+                 * re-framed this visual without it. */
+                s_conv_active = false;
+                s_conv_scale = 256;
+                s_conv_dy = 0;
+            }
             cur = want;
             continue;
         }
@@ -1162,12 +1556,31 @@ static void player_task(void *arg)
             if (!deadline) {
                 deadline = now + FR_PERIOD_US;
             }
-            bool last = SEQS[cur].oneshot && seq_idx >= SEQS[cur].frames - 1;
+            bool last = SEQS[cur].oneshot && seq_idx >= seq_cycle(cur) - 1;
             if (now >= deadline && last) {
                 /* A one-shot played out (its last frame had its dwell). */
                 if (cur == V_WAKING) {
                     s_waking_done = true;
-                    dip_fade_out();   /* dip through black into idle */
+                    if (FR_WAKING_CONVERGE) {
+                        /* Land the seam on the endpoint geometry even
+                         * when a frame skip left the last displayed
+                         * frame short of it (Codex review): force the
+                         * final convergence step onto the frame that
+                         * is up, then hold it into the cut — the
+                         * widget keeps that scale and dy until the
+                         * idle enter's own swap re-frames it. */
+                        conv_update(SEQS[V_WAKING].frames - 1);
+                        muse_board->display_lock(-1);
+                        apply_framing(V_WAKING);
+                        lv_obj_invalidate(s_img);
+                        muse_board->display_unlock();
+                        ESP_LOGI(TAG, "waking converge: seam at scale %d, dy %d",
+                                 (int)FR_CONV_SCALE_END,
+                                 (int)((muse_board->minimal_face ? FR_FACE_DY : 0)
+                                       + FR_WAKING_DY + FR_CONV_DY_END));
+                    } else {
+                        dip_fade_out();   /* dip through black into idle */
+                    }
                 }
                 if (cur == V_LEVELUP) {
                     s_levelup_pending = false;
@@ -1175,14 +1588,29 @@ static void player_task(void *arg)
                      * site): the last frame stays up and the next
                      * visual's swap replaces it whole. */
                 }
+                if (is_idle_variant(cur)) {
+                    /* A one-shot pool member (the flip) ends its
+                     * visit here instead of at a loop wrap. */
+                    rot_advance(cur);
+                }
                 cur = V_NONE;   /* the resolver picks the next visual */
                 continue;
             }
             if (now >= deadline && seq_ready) {
+                if (cur == V_WAKING) {
+                    conv_update(seq_next);   /* geometry for the frame
+                                              * this swap puts up */
+                }
                 s_swap_vis = cur;
                 swap_buffers();
                 seq_idx = seq_next;
                 seq_ready = false;
+                if (seq_idx == 0 && is_idle_variant(cur)
+                    && s_rot_loops > 0 && --s_rot_loops == 0) {
+                    /* The visit's loops are played: the next pass
+                     * enters the picked variant, crossfading. */
+                    rot_advance(cur);
+                }
                 /* Keep the 125 ms grid: count whole periods the decode
                  * overran and skip that many frames ahead. */
                 int64_t late = now - deadline;
@@ -1192,16 +1620,30 @@ static void player_task(void *arg)
                     s_dec_skipped += (uint32_t)skip;
                     deadline += (int64_t)skip * FR_PERIOD_US;
                     seq_idx += skip;
-                    if (seq_idx >= SEQS[cur].frames) {
-                        seq_idx = SEQS[cur].oneshot ? SEQS[cur].frames - 1
-                                                     : seq_idx % SEQS[cur].frames;
+                    if (seq_idx >= seq_cycle(cur)) {
+                        if (SEQS[cur].oneshot) {
+                            seq_idx = seq_cycle(cur) - 1;
+                        } else {
+                            if (is_idle_variant(cur) && s_rot_loops > 0) {
+                                /* Wraps the skip jumped over complete
+                                 * loops too (Codex review, 2026-11-17):
+                                 * count them, or a loaded player could
+                                 * stretch a visit indefinitely. */
+                                int wraps = seq_idx / seq_cycle(cur);
+                                s_rot_loops -= wraps < s_rot_loops ? wraps : s_rot_loops;
+                                if (s_rot_loops == 0) {
+                                    rot_advance(cur);
+                                }
+                            }
+                            seq_idx %= seq_cycle(cur);
+                        }
                     }
                 }
                 now = esp_timer_get_time();
             }
             if (!seq_ready && !last) {
                 int next = seq_idx + 1;
-                if (next >= SEQS[cur].frames) {
+                if (next >= seq_cycle(cur)) {
                     next = 0;   /* loops wrap; one-shots never get here (last) */
                 }
                 if (!enter_seq_frame(cur, next, back_buffer())) {
@@ -1217,10 +1659,10 @@ static void player_task(void *arg)
                 seq_next = next;
                 seq_ready = true;
             }
-            if (cur == V_IDLE && seq_ready && s_waking_done
+            if (is_idle_variant(cur) && seq_ready && s_waking_done
                 && esp_timer_get_time() + 30000 < deadline) {
-                /* Idle with the next frame already decoded and a
-                 * real margin before it is due: spend the slack
+                /* An idle variant with the next frame already decoded
+                 * and a real margin before it is due: spend the slack
                  * warming the first-frame preload, one asset per
                  * pass (see FR_PRELOAD_PATHS). The deadline gate is
                  * the Codex review's point — seq_ready alone does

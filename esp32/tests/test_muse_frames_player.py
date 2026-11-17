@@ -141,7 +141,8 @@ class FramesFeelRoundTest(unittest.TestCase):
         # Warmed only from idle passes with the next frame ready and
         # a real margin before it is due (Codex review, 2026-11-17:
         # seq_ready alone does not prove the read fits the slack).
-        self.assertIn("if (cur == V_IDLE && seq_ready && s_waking_done",
+        # Since the idle-expansion round "idle" is any pool variant.
+        self.assertIn("if (is_idle_variant(cur) && seq_ready && s_waking_done",
                       self.src)
         self.assertIn("esp_timer_get_time() + 30000 < deadline", self.src)
 
@@ -238,6 +239,115 @@ class FramesSmoothRoundTest(unittest.TestCase):
         # The pat is back to the plain pending flag.
         tap = self.src.index("void muse_frames_pet_tap(void)")
         self.assertIn("s_pet_pending = true;", self.src[tap:tap + 300])
+
+
+class FramesIdleExpansionRoundTest(unittest.TestCase):
+    """The idle-expansion round (2026-11-17): the idle face becomes a
+    rotating pool of variants dealt by a shuffle bag, variant changes
+    crossfade in the present path (the ONLY fade in the player), and
+    the waking -> idle seam converges geometrically instead of
+    dipping (the dip stays in the source behind its switch)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = FRAMES.read_text(encoding="utf-8")
+
+    def test_pool_covers_all_idle_variants_and_dances(self) -> None:
+        for name in (
+            "V_IDLE2", "V_IDLE3", "V_IDLE4", "V_IDLE5", "V_STRETCH",
+            "V_DANCE1", "V_DANCE2", "V_DANCE3", "V_DANCE4", "V_DANCE5",
+            "V_DANCE6", "V_FLIP",
+        ):
+            self.assertIn(f"[{name}] = ", self.src)      # SEQS entry
+            self.assertIn(f"{{ {name},", self.src)      # ROT_POOL entry
+        # Ping-pong variants store one direction only.
+        self.assertIn('[V_IDLE2] = { "idle2", 8, false, true }', self.src)
+        self.assertIn('[V_IDLE3] = { "idle3", 9, false, true }', self.src)
+        self.assertIn("2 * SEQS[v].frames - 2", self.src)   # the cycle
+        self.assertIn("seq_file_idx(v, pos)", self.src)
+
+    def test_state_faces_are_not_pool_members(self) -> None:
+        # Working/making carry work semantics (and the headphones
+        # rule): idle must never fake them.
+        pool = self.src.index("ROT_POOL[]")
+        body = self.src[pool:self.src.index("};", pool)]
+        self.assertNotIn("V_WORKING", body)
+        self.assertNotIn("V_MAKING", body)
+        self.assertNotIn("V_LEVELUP", body)
+        self.assertNotIn("V_WAKING", body)
+
+    def test_shuffle_bag_weights_and_no_repeat_rules(self) -> None:
+        self.assertIn("int reps = ROT_POOL[i].low ? 1 : 3;", self.src)
+        pick = self.src.index("static visual_t rot_pick_next")
+        body = self.src[pick:pick + 1400]
+        self.assertIn("e->v == cur", body)          # never back-to-back
+        self.assertIn("s_broken[e->v]", body)       # never a broken one
+        self.assertIn("(cur_low && e->low)", body)  # low never after low
+        self.assertIn("rot_refill();", body)
+        # The resolver's idle is mapped through the bag's visit.
+        self.assertIn("if (want == V_IDLE) {\n            want = s_rot_cur;",
+                      self.src)
+        # A broken pool variant falls the rotation back to plain idle.
+        self.assertIn("s_rot_cur = V_IDLE;   /* rotation falls back to plain idle */",
+                      self.src)
+
+    def test_crossfade_only_on_rotation_enters(self) -> None:
+        # The fade is entered solely from the sequence enter path,
+        # gated on the rotation flag and an idle-variant target.
+        self.assertIn("bool fade_enter = s_rot_fade && is_idle_variant(want);",
+                      self.src)
+        self.assertIn("crossfade_swap(cur);", self.src)
+        self.assertEqual(self.src.count("crossfade_swap(cur);"), 1)
+        # Complementary weights: brightness preserved, not a dip.
+        fade = self.src.index("static void fade_fill")
+        body = self.src[fade:fade + 1600]
+        self.assertIn("const int a = p->a, ia = 255 - a;", body)
+        self.assertIn("255 * k / FR_FADE_STEPS", self.src)
+        self.assertIn('"fade %s->%s: %d steps, %lld ms"', self.src)
+        # The interactive hard cut is untouched: show_front still
+        # presents at full opa with no fade involvement.
+        show = self.src.index("static void show_front(void)")
+        sbody = self.src[show:self.src.index("static void hide_face(void)", show)]
+        self.assertNotIn("crossfade", sbody)
+        self.assertNotIn("fade_fill", sbody)
+
+    def test_waking_convergence_switch_and_geometry(self) -> None:
+        self.assertIn("#define FR_WAKING_CONVERGE 1", self.src)
+        self.assertIn("#define FR_CONV_SCALE_END 334", self.src)
+        self.assertIn("#define FR_CONV_PIVOT_X 235", self.src)
+        self.assertIn("#define FR_CONV_PIVOT_Y 129", self.src)
+        self.assertIn("#define FR_CONV_DY_END 39", self.src)
+        # Convergence rides the image's own scale about the pivot,
+        # applied through apply_framing like the squash.
+        frame = self.src.index("static void apply_framing")
+        body = self.src[frame:frame + 1200]
+        self.assertIn("lv_image_set_pivot(s_img, FR_CONV_PIVOT_X, FR_CONV_PIVOT_Y)",
+                      body)
+        self.assertIn("lv_image_set_scale(s_img, s_conv_scale)", body)
+        # The dip path survives verbatim behind the switch.
+        self.assertIn("if (FR_WAKING_CONVERGE) {", self.src)
+        self.assertIn("dip_fade_out();   /* dip through black into idle */",
+                      self.src)
+        self.assertIn('"waking converge: frame %d scale %d dy extra %d"',
+                      self.src)
+        # A frame skip must not leave the seam short of the endpoint:
+        # the last frame is forced to full convergence at the exit.
+        self.assertIn("conv_update(SEQS[V_WAKING].frames - 1);", self.src)
+
+    def test_codex_review_fixes(self) -> None:
+        # Skipped-over wraps complete loops too, or a loaded player
+        # could stretch a visit indefinitely; all rotation triggers
+        # funnel through the one advance helper.
+        self.assertIn("int wraps = seq_idx / seq_cycle(cur);", self.src)
+        self.assertIn("static void rot_advance(visual_t cur)", self.src)
+        self.assertIn("if (s_rot_fade) {\n        return;\n    }", self.src)
+        # Fade eligibility is re-decided under each step's lock, and
+        # an abort is logged as its own line (never a "present").
+        fade = self.src.index("static void crossfade_swap")
+        body = self.src[fade:fade + 3600]
+        self.assertIn("if (!present_ok()) {", body)
+        self.assertIn("y1 = present_bottom();", body)
+        self.assertIn('"fade aborted at step %d"', body)
 
 
 if __name__ == "__main__":
