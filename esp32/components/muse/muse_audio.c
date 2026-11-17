@@ -74,14 +74,16 @@ static float s_hpf_x1, s_hpf_y1;
  * missing processing, in the one place all three consumers of
  * muse_audio_read() share (voice notes, live calls, meeting audio):
  *
- *   high-pass (the shared one above) -> two one-pole high-shelf stages
- *   (+7 dB each over a 1.4 kHz corner, +14 dB of shelf in all) -> a
- *   chunk-wise AGC (20 ms chunks, gain ramped across the chunk from the
- *   previous chunk's measurement, target -20 dBFS, +18/-6 dB range,
- *   frozen while the chunk measures under the -45 dBFS gate so pauses
- *   don't pump the room up) -> a tanh soft limiter under the int16
- *   clamp, so the button clicks and pops the AGC now reaches for are
- *   squashed, not clipped.
+ *   high-pass (the shared one above) -> a second one-pole high-pass
+ *   at 90 Hz inside the block (keeps handling rumble out of the
+ *   AGC's meter and out of the shelf's input) -> two one-pole
+ *   high-shelf stages (+7 dB each over a 1.4 kHz corner, +14 dB of
+ *   shelf in all) -> a chunk-wise AGC (20 ms chunks, gain ramped
+ *   across the chunk from the previous chunk's measurement, target
+ *   -20 dBFS, +18/-6 dB range, frozen while the chunk measures
+ *   under the -45 dBFS gate so pauses don't pump the room up) -> a
+ *   tanh soft limiter under the int16 clamp, so the button clicks
+ *   and pops the AGC now reaches for are squashed, not clipped.
  *
  * Constants were tuned offline against real recordings (dev
  * mic-dsp-sim.py replicates this block coefficient for coefficient):
@@ -89,21 +91,38 @@ static float s_hpf_x1, s_hpf_y1;
  * ~10% and the voice level from ~-34 to ~-21 dBFS. Retune here, in
  * this one place, if a future sample says otherwise.
  *
+ * Retune (evening round, 2026-11-17; ablation in dev/mic-ablate.py
+ * over the two raw reference notes, memo metrics: consonant-band
+ * shares, per-band segmental SNR, tilt): the shelf stays at 2x7 dB
+ * — it is the single biggest consonant-share lever and its SNR cost
+ * on the noisier note is fully repaid by the other two changes.
+ * The AGC's gain-up release slows 0.10 -> 0.04 per chunk (~0.5 s):
+ * segmental SNR in the 1-3.4k and 3.4-7k bands improves on both
+ * notes (+2..+4 dB on the noisy one) because the gain stops chasing
+ * syllable gaps. The 90 Hz second pole adds a further small share
+ * and SNR gain on both notes. PGA stays 30 dB and no AFE/NS is
+ * integrated — the research memo (dev/调研-收音改进.md) settled
+ * both: the analog gain is not the problem, and the AFE does not
+ * fit this firmware's memory budget.
+ *
  * The block between the EXTRACT markers is compiled standalone by
  * tests/test_muse_audio_dsp.py: keep it free of IDF/LVGL identifiers.
  */
 /* MIC_DSP_EXTRACT_BEGIN */
 #define MIC_EQ_CORNER_HZ 1400.0f
 #define MIC_EQ_STAGE_DB 7.0f
+#define MIC_HPF2_HZ 90.0f       /* second high-pass pole, inside the block */
 #define MIC_AGC_TARGET_DBFS (-20.0f)
 #define MIC_AGC_MAX_GAIN_DB 18.0f
 #define MIC_AGC_MIN_GAIN_DB (-6.0f)
 #define MIC_AGC_GATE_DBFS (-45.0f)
 #define MIC_AGC_ATTACK 0.50f    /* per chunk when the gain comes down */
-#define MIC_AGC_RELEASE 0.10f   /* per chunk when the gain goes up */
+#define MIC_AGC_RELEASE 0.04f   /* per chunk when the gain goes up (~0.5 s) */
 #define MIC_LIMIT_KNEE 0.79f    /* soft-limiter knee, fraction of full scale */
 
 typedef struct {
+    float hp2_a;        /* second-pole high-pass coefficient */
+    float hp2_x1, hp2_y1;
     float eq_a;         /* one-pole lowpass coefficient, both shelf stages */
     float eq_k;         /* per-stage shelf multiplier (linear gain - 1) */
     float eq_lp1, eq_lp2;
@@ -115,8 +134,11 @@ typedef struct {
 
 static void mic_dsp_reset(mic_dsp_t *d, float rate)
 {
-    float rc = 1.0f / (2.0f * (float)M_PI * MIC_EQ_CORNER_HZ);
+    float rc = 1.0f / (2.0f * (float)M_PI * MIC_HPF2_HZ);
     float dt = 1.0f / rate;
+    d->hp2_a = rc / (rc + dt);
+    d->hp2_x1 = d->hp2_y1 = 0.0f;
+    rc = 1.0f / (2.0f * (float)M_PI * MIC_EQ_CORNER_HZ);
     d->eq_a = rc / (rc + dt);
     d->eq_k = powf(10.0f, MIC_EQ_STAGE_DB / 20.0f) - 1.0f;
     d->eq_lp1 = d->eq_lp2 = 0.0f;
@@ -136,11 +158,16 @@ static float mic_dsp_limit(float y)
     return y < 0.0f ? -mag : mag;
 }
 
-/* One sample in (already high-passed), one out: the two shelf stages,
- * the AGC's ramped gain for this point in the chunk (i of n), and the
+/* One sample in (already high-passed by the shared pole), one out:
+ * the block's own second high-pass pole, the two shelf stages, the
+ * AGC's ramped gain for this point in the chunk (i of n), and the
  * limiter. The chunk's energy is tallied pre-gain for mic_dsp_chunk_end. */
 static float mic_dsp_post(mic_dsp_t *d, float y, int i, int n)
 {
+    float hx = y;
+    y = d->hp2_a * (d->hp2_y1 + hx - d->hp2_x1);
+    d->hp2_x1 = hx;
+    d->hp2_y1 = y;
     d->eq_lp1 += (1.0f - d->eq_a) * (y - d->eq_lp1);
     float e = y + d->eq_k * (y - d->eq_lp1);
     d->eq_lp2 += (1.0f - d->eq_a) * (e - d->eq_lp2);
@@ -310,8 +337,9 @@ esp_err_t muse_audio_init(int volume, int mic_gain_db)
 
 #if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
     mic_dsp_reset(&s_mic_dsp, MUSE_AUDIO_RATE);
-    ESP_LOGI(TAG, "mic DSP on: shelf 2x%.0f dB over %.0f Hz, AGC to %.0f dBFS (gate %.0f)",
-             MIC_EQ_STAGE_DB, MIC_EQ_CORNER_HZ, MIC_AGC_TARGET_DBFS, MIC_AGC_GATE_DBFS);
+    ESP_LOGI(TAG, "mic DSP on: hp2 %.0f Hz, shelf 2x%.0f dB over %.0f Hz, AGC to %.0f dBFS (gate %.0f, release %.2f)",
+             MIC_HPF2_HZ, MIC_EQ_STAGE_DB, MIC_EQ_CORNER_HZ, MIC_AGC_TARGET_DBFS,
+             MIC_AGC_GATE_DBFS, MIC_AGC_RELEASE);
 #endif
 
     ESP_LOGI(TAG, "audio ready: %d Hz, %d ch, vol %d, mic gain %d dB", MUSE_AUDIO_RATE, CHANNELS, volume, mic_gain_db);
@@ -557,6 +585,43 @@ esp_err_t muse_audio_read(int16_t *mono, size_t frames)
     return ESP_OK;
 }
 
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
+/* Playback makeup chain, this board only: a fixed digital gain
+ * through its own tanh soft limiter. The constants live here, NOT
+ * in the mic DSP block: the mic chain keeps its own knee
+ * (MIC_LIMIT_KNEE), and the two retunes must never move each other.
+ *
+ * The gain is +12 dB in two steps: +6 dB from the night round
+ * (2026-11-16, loopback-measured +5 dB) and another +6 dB now, at
+ * Hugh's word ("raise it twofold and try"). The codec volume curve
+ * already runs the ES8311 DAC at its top, so all of this is
+ * digital: what it buys is speech RMS, and what it costs is peak
+ * bend in the limiter. On the shipped TTS sample (offline replica,
+ * dev/pb-sim.py): RMS -13.7 -> -8.7 dBFS (+5.0 of the +6 dB asked;
+ * the limiter eats the rest off the peaks), crest 13.7 -> 8.7 dB,
+ * limiter engagement 0.8% -> 5.2% of samples. The knee moved
+ * 0.79 -> 0.89 with the gain: at x4 the old knee engaged 7.4% of
+ * samples, the higher one engages fewer and leaves short
+ * transients alone, bending only the sustained loud parts.
+ * Sustained loud tones distort audibly either way — that is the
+ * bounded cost of the ask. The settings slider stays the master
+ * gate: this multiplies whatever it lets through, never bypasses
+ * it. Device before/after: the round record's loopback table. */
+#define PB_GAIN 4.0f
+#define PB_LIMIT_KNEE 0.89f
+
+static float pb_limit(float y)
+{
+    const float knee = PB_LIMIT_KNEE * 32768.0f;
+    float a = fabsf(y);
+    if (a <= knee) {
+        return y;
+    }
+    float mag = knee + (32768.0f - knee) * tanhf((a - knee) / (32768.0f - knee));
+    return y < 0.0f ? -mag : mag;
+}
+#endif   /* CONFIG_MUSE_BOARD_WAVESHARE_S3_175C */
+
 esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
 {
     if (muse_board->mic_init) {
@@ -572,20 +637,9 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
         for (size_t i = 0; i < n; i++) {
 #if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C
-            /* Playback makeup gain, this board only. The codec volume
-             * curve already runs the ES8311 DAC at its top (vol 100 =
-             * 0 dB on the curve, and the BSP's hw_gain correction puts
-             * full scale ~+3.6 dB into the DAC), so there is no clean
-             * headroom left in the analog chain — but TTS speech sits
-             * far below full scale (peaks around -6 dBFS), which is
-             * why replies sounded quiet. A fixed +6 dB here, through
-             * the mic chain's tanh soft limiter so loud passages bend
-             * instead of clipping, lifts speech into the range the DAC
-             * can actually deliver. The settings slider stays the
-             * master gate: this multiplies whatever it lets through,
-             * it does not bypass it. The before/after delta is measured
-             * on the gadget loopback (night round, 2026-11-16). */
-            int16_t v = mute ? 0 : (int16_t)mic_dsp_limit((float)mono[i] * 2.0f);
+            /* Playback makeup gain, this board only (see the PB
+             * block above muse_audio_write for the numbers). */
+            int16_t v = mute ? 0 : (int16_t)pb_limit((float)mono[i] * PB_GAIN);
             s_out_stereo[2 * i] = v;
             s_out_stereo[2 * i + 1] = v;
 #else

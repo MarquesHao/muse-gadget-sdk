@@ -13,9 +13,10 @@
 
 """The 1.75C microphone voice DSP (muse_audio.c).
 
-The block between the MIC_DSP_EXTRACT markers — two one-pole high-shelf
-stages, the chunk-wise AGC and the tanh soft limiter that
-muse_audio_read() runs on this board only — is extracted verbatim,
+The block between the MIC_DSP_EXTRACT markers — a second one-pole
+high-pass, two one-pole high-shelf stages, the chunk-wise AGC and
+the tanh soft limiter that muse_audio_read() runs on this board
+only — is extracted verbatim,
 compiled on the host and driven with sines: the shelf curve, the AGC's
 convergence to its target, the noise gate's freeze, the gain clamp and
 the limiter's ceiling are all pinned numerically. The expected values
@@ -40,10 +41,13 @@ AUDIO = ROOT / "components" / "muse" / "muse_audio.c"
 GATE = "#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175C"
 
 # Shelf gain of the extracted block alone (unity AGC, limiter clear of
-# the test level), dB, from the tuning replica.
+# the test level), dB, from the tuning replica. The evening retune
+# (2026-11-17) added the block's own 90 Hz high-pass pole ahead of
+# the shelf, which costs the low end a little (250 Hz: 1.16 -> 0.49);
+# the shelf stages themselves are unchanged at 2x7 dB.
 SHELF_DB = {
-    250: 1.16, 500: 3.51, 1000: 7.34, 2000: 10.30,
-    3000: 11.16, 4000: 11.50, 6000: 11.74,
+    250: 0.49, 500: 3.23, 1000: 7.15, 2000: 10.14,
+    3000: 11.01, 4000: 11.35, 6000: 11.59,
 }
 
 DRIVER = r"""
@@ -219,7 +223,8 @@ class MicDspTest(unittest.TestCase):
         # Retuning is a one-place edit: every tuning constant is defined
         # inside the extracted block, nowhere else in the file.
         block = extract_block(self.source)
-        for name in ("MIC_EQ_CORNER_HZ", "MIC_EQ_STAGE_DB", "MIC_AGC_TARGET_DBFS",
+        for name in ("MIC_EQ_CORNER_HZ", "MIC_EQ_STAGE_DB", "MIC_HPF2_HZ",
+                     "MIC_AGC_TARGET_DBFS", "MIC_AGC_RELEASE",
                      "MIC_AGC_MAX_GAIN_DB", "MIC_AGC_GATE_DBFS", "MIC_LIMIT_KNEE"):
             self.assertEqual(self.source.count("#define " + name), 1, name)
             self.assertIn("#define " + name, block, name)

@@ -243,10 +243,12 @@ class FramesSmoothRoundTest(unittest.TestCase):
 
 class FramesIdleExpansionRoundTest(unittest.TestCase):
     """The idle-expansion round (2026-11-17): the idle face becomes a
-    rotating pool of variants dealt by a shuffle bag, variant changes
-    crossfade in the present path (the ONLY fade in the player), and
-    the waking -> idle seam converges geometrically instead of
-    dipping (the dip stays in the source behind its switch)."""
+    rotating pool of variants dealt by a shuffle bag, and the
+    waking -> idle seam converges geometrically instead of dipping
+    (the dip stays in the source behind its switch). Variant
+    changes crossfaded for a day; the evening fixes round removed
+    the fade (it read as flicker on device) — rotation enters now
+    hard-cut like every other switch."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -307,25 +309,25 @@ class FramesIdleExpansionRoundTest(unittest.TestCase):
         self.assertIn("s_rot_cur = V_IDLE;   /* rotation falls back to plain idle */",
                       self.src)
 
-    def test_crossfade_only_on_rotation_enters(self) -> None:
-        # The fade is entered solely from the sequence enter path,
-        # gated on the rotation flag and an idle-variant target.
-        self.assertIn("bool fade_enter = s_rot_fade && is_idle_variant(want);",
-                      self.src)
-        self.assertIn("crossfade_swap(cur);", self.src)
-        self.assertEqual(self.src.count("crossfade_swap(cur);"), 1)
-        # Complementary weights: brightness preserved, not a dip.
-        fade = self.src.index("static void fade_fill")
-        body = self.src[fade:fade + 1600]
-        self.assertIn("const int a = p->a, ia = 255 - a;", body)
-        self.assertIn("255 * k / FR_FADE_STEPS", self.src)
-        self.assertIn('"fade %s->%s: %d steps, %lld ms"', self.src)
-        # The interactive hard cut is untouched: show_front still
-        # presents at full opa with no fade involvement.
-        show = self.src.index("static void show_front(void)")
-        sbody = self.src[show:self.src.index("static void hide_face(void)", show)]
-        self.assertNotIn("crossfade", sbody)
-        self.assertNotIn("fade_fill", sbody)
+    def test_rotation_enters_hard_cut(self) -> None:
+        # Evening fixes round (Hugh's call, 2026-11-17): the
+        # rotation crossfade read as flicker on device and is gone
+        # whole — machinery, flag and log line. A rotation enter is
+        # an ordinary sequence enter through swap_buffers().
+        for gone in ("crossfade_swap", "fade_fill", "fade_arg_t",
+                     "FR_FADE_STEPS", "FR_FADE_STEP_MS", "s_rot_fade",
+                     "fade_enter", '"fade %s->%s'):
+            self.assertNotIn(gone, self.src)
+        # The pending flag only tracks that a pick was spent; any
+        # enter clears it, and the sequence enter swaps directly.
+        self.assertIn("static bool s_rot_pending;", self.src)
+        self.assertIn("s_rot_pending = false;", self.src)
+        seq = self.src.index("} else if (SEQS[want].dir) {")
+        body = self.src[seq:seq + 700]
+        self.assertIn("swap_buffers();", body)
+        # The waking dip is not part of this: it stays verbatim.
+        self.assertIn("static void dip_fade_out(void)", self.src)
+        self.assertIn("static void dip_fade_in(void)", self.src)
 
     def test_waking_convergence_switch_and_geometry(self) -> None:
         self.assertIn("#define FR_WAKING_CONVERGE 1", self.src)
@@ -356,14 +358,55 @@ class FramesIdleExpansionRoundTest(unittest.TestCase):
         # funnel through the one advance helper.
         self.assertIn("int wraps = seq_idx / seq_cycle(cur);", self.src)
         self.assertIn("static void rot_advance(visual_t cur)", self.src)
-        self.assertIn("if (s_rot_fade) {\n        return;\n    }", self.src)
-        # Fade eligibility is re-decided under each step's lock, and
-        # an abort is logged as its own line (never a "present").
-        fade = self.src.index("static void crossfade_swap")
-        body = self.src[fade:fade + 3600]
-        self.assertIn("if (!present_ok()) {", body)
-        self.assertIn("y1 = present_bottom();", body)
-        self.assertIn('"fade aborted at step %d"', body)
+        self.assertIn("if (s_rot_pending) {\n        return;\n    }", self.src)
+
+
+class FramesEveningFixesTest(unittest.TestCase):
+    """The evening fixes round (2026-11-17): the listening still
+    breathes (a slow +-3% scale ride on the image's own scale, the
+    squash's mechanism) so a held talk key no longer leaves a
+    frozen wallpaper up."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.src = FRAMES.read_text(encoding="utf-8")
+
+    def test_breath_parameters(self) -> None:
+        self.assertIn("#define FR_BREATH_MIN 248", self.src)
+        self.assertIn("#define FR_BREATH_MAX 264", self.src)
+        self.assertIn("#define FR_BREATH_HALF_MS 1200", self.src)
+        start = self.src.index("static void breath_start(void)")
+        body = self.src[start:start + 1500]
+        # Ping-pong ease-in-out, repeating, on its own exec callback
+        # (never the squash's, so neither delete can kill the other).
+        self.assertIn("lv_anim_set_exec_cb(&a, breath_exec);", body)
+        self.assertIn("lv_anim_set_reverse_duration(&a, FR_BREATH_HALF_MS);",
+                      body)
+        self.assertIn("lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);",
+                      body)
+        self.assertIn('"breath: on (listening)"', body)
+
+    def test_breath_starts_only_while_listening_is_up(self) -> None:
+        statics = self.src.index("/* Statics: nothing to do")
+        body = self.src[statics:statics + 1200]
+        self.assertIn("if (cur == V_LISTENING) {\n            breath_start();",
+                      body)
+        # The speculative thinking build is untouched by the breath.
+        self.assertIn('"spec thinking: built in %lld ms"', body)
+
+    def test_every_exit_from_the_still_stops_the_breath(self) -> None:
+        for fn in ("static void show_front(void)", "static void hide_face(void)",
+                   "static void show_still(void)"):
+            start = self.src.index(fn)
+            body = self.src[start:self.src.index("\n}\n", start)]
+            self.assertIn("breath_stop_locked();", body, fn)
+        stop = self.src.index("static void breath_stop_locked(void)\n{")
+        body = self.src[stop:stop + 500]
+        # The stop deletes by its own callback and restores the
+        # resting (squash) factor, so no face inherits a breath scale.
+        self.assertIn("lv_anim_delete(s_img, breath_exec);", body)
+        self.assertIn("lv_image_set_scale(s_img, s_squash_factor);", body)
+        self.assertIn('"breath: off"', body)
 
 
 if __name__ == "__main__":

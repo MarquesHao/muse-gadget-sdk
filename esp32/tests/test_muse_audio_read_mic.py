@@ -153,13 +153,19 @@ class MuseAudioCodeclessMicTest(unittest.TestCase):
     def test_speaker_write_has_board_gated_makeup_gain(self) -> None:
         # Night round (2026-11-16): replies sounded quiet with the DAC
         # already at the top of the codec curve, so the write path adds
-        # a soft-limited +6 dB — gated to the 1.75C board, with the
-        # plain passthrough kept for every other board.
+        # a soft-limited +6 dB. Evening round (2026-11-17): Hugh asked
+        # for twofold more — the makeup is +12 dB in all, through the
+        # playback chain's OWN limiter (pb_limit, knee 0.89), not the
+        # mic chain's: the two retunes must never move each other.
+        # Gated to the 1.75C board, plain passthrough elsewhere.
         source = (MUSE / "muse_audio.c").read_text()
         write = _function(source, "muse_audio_write")
         self.assertIn("CONFIG_MUSE_BOARD_WAVESHARE_S3_175C", write)
-        self.assertIn("mic_dsp_limit((float)mono[i] * 2.0f)", write)
+        self.assertIn("pb_limit((float)mono[i] * PB_GAIN)", write)
         self.assertIn("mute ? 0 : mono[i]", write)
+        self.assertIn("#define PB_GAIN 4.0f", source)
+        self.assertIn("#define PB_LIMIT_KNEE 0.89f", source)
+        self.assertIn("static float pb_limit(float y)", source)
 
     def test_this_board_records_from_the_left_mic_only(self) -> None:
         # The 0.5*(L+R) mix cancels 4-5 kHz between the two capsules

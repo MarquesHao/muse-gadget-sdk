@@ -162,15 +162,18 @@ static const char *TAG = "muse_frames";
  * full dip-to-black (Hugh-approved, dip_fade_out() below); nothing
  * here applies to it. */
 
-/* The one exception to the hard-cut rule (Hugh, 2026-11-17): the
- * idle rotation's variant-to-variant change — and only that — is a
- * true crossfade. It needs no third buffer after all: the present
- * path's fill callback can read both frame buffers and mix them per
- * pixel with complementary weights (see crossfade_swap()). Every
- * interactive switch still hard-cuts at full opa through
- * show_front(); the fade is entered only from the rotation's own
- * enter, flagged by s_rot_fade, and its log line ("fade a->b: N
- * steps, T ms") keeps it distinguishable from a present in captures. */
+/* The idle rotation's variant-to-variant change was the one
+ * exception for a day (Hugh, 2026-11-17): a true crossfade mixed
+ * per pixel in the present path's fill callback, no third buffer
+ * needed. On device it read as flicker — six steps over ~370 ms is
+ * only ~16 updates a second, each step is itself a ~48 ms top-down
+ * progressive write, and the code-value blend dips brightness
+ * mid-fade on bright-to-dark pairs (research memo,
+ * dev/调研-切换闪烁.md; Codex consulted and agreed). Hugh called
+ * it the same evening: rotation hard-cuts like everything else.
+ * The crossfade machinery is gone; a rotation enter is an ordinary
+ * swap_buffers() through show_front(). The waking dip below is
+ * not part of this and stays exactly as approved. */
 
 /* The squash's low point (image scale, 256 = 1.0x). */
 #define FR_SQUASH_MIN 246        /* ~96% */
@@ -562,6 +565,7 @@ static void conv_update(int pos)
 }
 
 static void squash_exec(void *obj, int32_t v);   /* defined with the squash */
+static void breath_stop_locked(void);            /* defined with the breath */
 
 /* ---- direct present: a whole face in one panel write ----
  *
@@ -623,39 +627,6 @@ static void pres_fill(uint8_t *dst, int stride, int row, int rows, void *arg)
                                          ((v & 31) * o / 255));
                 d[x] = (uint16_t)((nv << 8) | (nv >> 8));
             }
-        }
-        dst += stride;
-    }
-}
-
-typedef struct {
-    const uint16_t *oldb;   /* outgoing frame's rect base */
-    const uint16_t *newb;   /* incoming frame's rect base */
-    int a;                  /* incoming weight 0..255; old gets 255-a */
-} fade_arg_t;
-
-/* fill() for the rotation crossfade: pres_fill's two-source sibling.
- * The weights are complementary (a and 255-a), so a pixel's total
- * brightness is preserved across the blend — a crossfade, not a
- * dip. At a = 255 the output is exactly the new frame. */
-static void fade_fill(uint8_t *dst, int stride, int row, int rows, void *arg)
-{
-    const fade_arg_t *p = arg;
-    const int w = FR_PRES_X1 - FR_PRES_X0;
-    const int a = p->a, ia = 255 - a;
-    const uint16_t *os = p->oldb + (size_t)row * FR_W;
-    const uint16_t *ns = p->newb + (size_t)row * FR_W;
-    for (int r = 0; r < rows; r++) {
-        uint16_t *d = (uint16_t *)dst;
-        const uint16_t *o = os + (size_t)r * FR_W;
-        const uint16_t *n = ns + (size_t)r * FR_W;
-        for (int x = 0; x < w; x++) {
-            uint16_t ov = o[x], nv = n[x];
-            uint16_t out = (uint16_t)(
-                ((((ov >> 11) & 31) * ia + ((nv >> 11) & 31) * a) / 255 << 11) |
-                ((((ov >> 5) & 63) * ia + ((nv >> 5) & 63) * a) / 255 << 5) |
-                (((ov & 31) * ia + (nv & 31) * a) / 255));
-            d[x] = (uint16_t)((out << 8) | (out >> 8));
         }
         dst += stride;
     }
@@ -740,6 +711,11 @@ static void show_front(void)
 {
     int opa = s_dip ? 0 : LV_OPA_COVER;
     muse_board->display_lock(-1);
+    /* Every swap ends the listening breath (a no-op unless the
+     * breath is running): the face this swap puts up is not the
+     * listening still, and apply_framing below re-applies the
+     * resting scale. */
+    breath_stop_locked();
     /* Eligibility is decided under the lock: the face tile can be
      * swiped away while this swap was building, and a direct write
      * decided on the stale answer would paint the face over the
@@ -774,6 +750,7 @@ static void show_front(void)
 static void hide_face(void)
 {
     muse_board->display_lock(-1);
+    breath_stop_locked();
     lv_obj_add_flag(s_img, LV_OBJ_FLAG_HIDDEN);
     muse_board->display_unlock();
 }
@@ -781,6 +758,7 @@ static void hide_face(void)
 static void show_still(void)
 {
     muse_board->display_lock(-1);
+    breath_stop_locked();
     lv_image_set_src(s_img, &s_still_dsc);
     apply_framing(V_STILL);
     lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
@@ -816,87 +794,6 @@ static void swap_buffers(void)
 static uint16_t *back_buffer(void)
 {
     return s_buf[s_front ^ 1];
-}
-
-/* The idle rotation's crossfade (see the note at the top of the
- * file): blend the front buffer into the back buffer on the panel
- * in FR_FADE_STEPS complementary steps, then flip the front and
- * re-source the widget, exactly like a swap. A blend step costs
- * ~48 ms of wire time (measured on device, 2026-11-17: the
- * two-source fill is about twice a plain present's), so 6 steps
- * plus short delays land the fade at ~370 ms. The display lock is
- * taken per step, never for the fade's whole length; the widget
- * still points at the old buffer during the steps, so an LVGL
- * refresh in between repaints the old picture and the next step
- * overwrites it — the same self-healing transient a direct present
- * has. Only the rotation's enter calls this (s_rot_fade); every
- * interactive switch keeps the opa-255 hard cut. Falls back to a
- * plain swap when the board cannot present directly. */
-#define FR_FADE_STEPS 6
-#define FR_FADE_STEP_MS 15
-
-static void crossfade_swap(visual_t from)
-{
-    int64_t t0 = esp_timer_get_time();
-    int dy = muse_board->minimal_face ? FR_FACE_DY : 0;
-    int y0 = FR_PRES_TOP > dy ? FR_PRES_TOP : dy;
-    fade_arg_t a = {
-        s_buf[s_front] + (size_t)(y0 - dy) * FR_W + FR_PRES_X0,
-        s_buf[s_front ^ 1] + (size_t)(y0 - dy) * FR_W + FR_PRES_X0,
-        0,
-    };
-    /* Eligibility and the bottom boundary are re-decided under each
-     * step's lock (Codex review): a decision sampled once would go
-     * stale inside the fade's ~350 ms — the face tile can be swiped
-     * away or the dialog can come up mid-fade, and later steps must
-     * not keep painting the face over either. An abort before the
-     * first step out falls back to the plain swap; an abort after
-     * that still flips and re-sources the widget, so the player
-     * state stays consistent and LVGL's next repaint of the face
-     * area shows the new variant whole. */
-    int y1 = FR_H;
-    int steps_done = 0;
-    bool aborted = false;
-    for (int k = 1; k <= FR_FADE_STEPS; k++) {
-        muse_board->display_lock(-1);
-        if (!present_ok()) {
-            muse_board->display_unlock();
-            aborted = true;
-            break;
-        }
-        if (k == 1) {
-            present_squash_cancel();
-        }
-        y1 = present_bottom();
-        a.a = 255 * k / FR_FADE_STEPS;
-        muse_board->draw_frame(FR_PRES_X0, y0, FR_PRES_X1, y1, 8, fade_fill, &a);
-        muse_board->display_unlock();
-        steps_done = k;
-        if (k < FR_FADE_STEPS) {
-            vTaskDelay(pdMS_TO_TICKS(FR_FADE_STEP_MS));
-        }
-    }
-    if (aborted && steps_done == 0) {
-        swap_buffers();
-        return;
-    }
-    if (aborted) {
-        ESP_LOGW(TAG, "fade aborted at step %d", steps_done);
-    }
-    s_front ^= 1;
-    muse_board->display_lock(-1);
-    s_dsc.data = (const uint8_t *)s_buf[s_front];
-    lv_image_set_src(s_img, &s_dsc);
-    apply_framing(s_swap_vis);
-    lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
-    lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
-    muse_board->display_unlock();
-    if (!aborted) {
-        present_border(y1);
-    }
-    ESP_LOGI(TAG, "fade %s->%s: %d steps, %lld ms", VIS_NAMES[from],
-             VIS_NAMES[s_swap_vis], steps_done,
-             (long long)(esp_timer_get_time() - t0) / 1000);
 }
 
 /* levelup's exit used to fade the last frame out here (LVGL opa
@@ -953,14 +850,17 @@ static void dip_fade_in(void)
 /* ---- idle rotation ----
  *
  * The resolver's plain "idle" is a pool, not a single sequence
- * (Hugh, 2026-11-17: every animation that can pass as idle joins;
- * framing differences between variants are absorbed by the
- * crossfade, see crossfade_swap()). A shuffle bag deals the visits:
+ * (Hugh, 2026-11-17: every animation that can pass as idle joins).
+ * A shuffle bag deals the visits:
  * normal variants hold three slots each, low-weight ones (the five
  * official dances) one — so a low variant surfaces occasionally,
  * never twice in a row, and no variant repeats back-to-back. Each
  * visit plays its loops, then the player rotates: the next
- * variant is picked here, and its enter crossfades. State faces
+ * variant is picked here, and its enter hard-cuts through the
+ * ordinary swap, framing step and all (the crossfade that was
+ * meant to absorb the framing differences read as flicker and
+ * was removed the same evening — see the note at the top of the
+ * file). State faces
  * (working/making/taking-notes semantics, the headphones rule) are
  * NOT pool members: idle showing them would fake the status the
  * face exists to report.
@@ -992,7 +892,7 @@ static const rot_ent_t ROT_POOL[] = {
 
 static visual_t s_rot_cur = V_IDLE;   /* variant the pool is visiting */
 static int s_rot_loops;               /* loops left in this visit */
-static bool s_rot_fade;               /* next idle enter crossfades */
+static bool s_rot_pending;            /* a rotation enter is pending */
 static int s_bag[ROT_BAG_MAX];
 static int s_bag_n;
 static int s_bag_pos;                 /* == s_bag_n: bag empty */
@@ -1065,20 +965,21 @@ static visual_t rot_pick_next(visual_t cur)
     return V_IDLE;
 }
 
-/* End the current visit: pick the next variant and flag its enter
- * to crossfade. A no-op when a rotation is already pending (a frame
- * skip in the same pass must not spend two picks), and re-arms the
- * visit when the bag hands back the current variant itself. */
+/* End the current visit: pick the next variant; its enter is an
+ * ordinary hard-cut swap. A no-op when a rotation is already
+ * pending (a frame skip in the same pass must not spend two
+ * picks), and re-arms the visit when the bag hands back the
+ * current variant itself. */
 static void rot_advance(visual_t cur)
 {
-    if (s_rot_fade) {
+    if (s_rot_pending) {
         return;
     }
     visual_t nxt = rot_pick_next(cur);
     if (nxt != cur) {
         ESP_LOGI(TAG, "idle rotate: %s -> %s", VIS_NAMES[cur], VIS_NAMES[nxt]);
         s_rot_cur = nxt;
-        s_rot_fade = true;
+        s_rot_pending = true;
     } else {
         s_rot_loops = visit_loops(cur);
     }
@@ -1162,6 +1063,72 @@ void muse_frames_squash(void)
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_set_ready_cb(&a, squash_recover);
     lv_anim_start(&a);
+}
+
+/* ---- the listening breath ----
+ * Holding the talk key leaves the listening face up as a still for
+ * the whole take, and a frozen face reads as a hung device (Hugh,
+ * 2026-11-17: "it is a wallpaper — can it move?"). The breath is
+ * the squash's cheap trick aimed at calm instead of feedback: the
+ * image's own scale rides a slow ease-in-out between -3% and +3%
+ * (a 2.4 s full cycle), no layer buffer, no new assets. It runs
+ * only while the listening still is statically displayed — the
+ * player starts it from the statics branch, after the speculative
+ * thinking build has had its pass — and every way out of the still
+ * stops it: show_front(), hide_face() and show_still() all call
+ * breath_stop_locked() under the display lock, and the stop
+ * re-applies the resting (squash) factor, so the next face never
+ * inherits a breath scale. Its exec callback is its own, so the
+ * squash's delete-by-callback (present_squash_cancel) can never
+ * kill it, nor it the squash. */
+#define FR_BREATH_MIN 248        /* ~-3% */
+#define FR_BREATH_MAX 264        /* ~+3% */
+#define FR_BREATH_HALF_MS 1200   /* one way; a full breath is 2.4 s */
+
+static bool s_breath_on;
+
+static void breath_exec(void *obj, int32_t v)
+{
+    lv_image_set_scale((lv_obj_t *)obj, v);
+}
+
+/* Caller holds the display lock. */
+static void breath_stop_locked(void)
+{
+    if (!s_breath_on) {
+        return;
+    }
+    lv_anim_delete(s_img, breath_exec);
+    s_breath_on = false;
+    lv_image_set_scale(s_img, s_squash_factor);
+    ESP_LOGI(TAG, "breath: off");
+}
+
+/* Called from the player's statics branch while LISTENING is up;
+ * idempotent, and the flag is checked before the lock is taken so
+ * the 120 ms pass costs nothing once the breath is running. */
+static void breath_start(void)
+{
+    if (s_breath_on) {
+        return;
+    }
+    muse_board->display_lock(-1);
+    if (!s_breath_on && s_img && !lv_obj_has_flag(s_img, LV_OBJ_FLAG_HIDDEN)) {
+        lv_image_set_pivot(s_img, FR_W / 2, FR_H / 2);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, s_img);
+        lv_anim_set_exec_cb(&a, breath_exec);
+        lv_anim_set_values(&a, FR_BREATH_MIN, FR_BREATH_MAX);
+        lv_anim_set_duration(&a, FR_BREATH_HALF_MS);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+        lv_anim_set_reverse_duration(&a, FR_BREATH_HALF_MS);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&a);
+        s_breath_on = true;
+        ESP_LOGI(TAG, "breath: on (listening)");
+    }
+    muse_board->display_unlock();
 }
 
 static visual_t resolve_target(void)
@@ -1430,7 +1397,7 @@ static void player_task(void *arg)
             s_spec_ready = false;   /* a diversion spends the epoch too */
             s_epoch++;
             s_dip = false;   /* the fallback face comes up as-is */
-            s_rot_fade = false;
+            s_rot_pending = false;
             if (is_idle_variant(want) && want != V_IDLE) {
                 s_rot_cur = V_IDLE;   /* rotation falls back to plain idle */
             }
@@ -1454,11 +1421,10 @@ static void player_task(void *arg)
             s_enter_swap = true;   /* an enter, not a frame advance */
             int64_t t_build = esp_timer_get_time();
             bool ok = true;
-            /* A rotation enter crossfades; any other enter spends
-             * the flag. Read before the spec handling below, which
-             * can also produce this swap. */
-            bool fade_enter = s_rot_fade && is_idle_variant(want);
-            s_rot_fade = false;
+            /* Any enter spends a pending rotation flag. Read
+             * before the spec handling below, which can also
+             * produce this swap. */
+            s_rot_pending = false;
             /* A current-epoch thinking pre-build is pixel-identical
              * to what enter_still would decode: swap it straight in.
              * Any other enter spends the pre-build (logged wasted
@@ -1480,12 +1446,7 @@ static void player_task(void *arg)
                 ok = enter_seq_frame(want, 0, back_buffer());
                 if (ok) {
                     s_swap_vis = want;
-                    if (fade_enter) {
-                        s_enter_swap = false;   /* the fade presents itself */
-                        crossfade_swap(cur);
-                    } else {
-                        swap_buffers();
-                    }
+                    swap_buffers();
                     deadline = esp_timer_get_time() + FR_PERIOD_US;
                 }
             } else if (want == V_SPEAKING) {
@@ -1595,7 +1556,7 @@ static void player_task(void *arg)
                 if (seq_idx == 0 && is_idle_variant(cur)
                     && s_rot_loops > 0 && --s_rot_loops == 0) {
                     /* The visit's loops are played: the next pass
-                     * enters the picked variant, crossfading. */
+                     * enters the picked variant, hard-cut. */
                     rot_advance(cur);
                 }
                 /* Keep the 125 ms grid: count whole periods the decode
@@ -1683,9 +1644,13 @@ static void player_task(void *arg)
 
         /* Statics: nothing to do until the state changes — except,
          * while listening sits up, speculatively building thinking
-         * into the back buffer (see s_spec_ready). The resolver runs
+         * into the back buffer (see s_spec_ready) and breathing on
+         * the still (see the breath section). The resolver runs
          * again immediately after, so a state change that landed
          * during the decode is picked up next pass. */
+        if (cur == V_LISTENING) {
+            breath_start();
+        }
         if (cur == V_LISTENING && !s_spec_ready && !s_broken[V_THINKING]) {
             int64_t t_spec = esp_timer_get_time();
             if (decode_still(V_THINKING, back_buffer())) {
