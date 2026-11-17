@@ -33,6 +33,8 @@ bool muse_ui_dark(void);
 
 /* From any task: the face tile is the currently visible tile. */
 bool muse_ui_face_active(void);
+/* The minimal face's dialog box (caption / reply text) is on screen. */
+bool muse_ui_dialog_up(void);
 
 /* The functions below run in the LVGL task (or with the display lock held). */
 

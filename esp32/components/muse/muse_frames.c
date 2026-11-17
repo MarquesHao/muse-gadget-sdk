@@ -602,6 +602,13 @@ static bool build_kit(const char *name, uint16_t *out)
  * (see FR_WAKING_DY). Set by every path that swaps. */
 static visual_t s_swap_vis = V_NONE;
 
+/* The next swap_buffers() is a visual-change enter, not a same-visual
+ * frame advance: show_front() may present it straight to the panel
+ * (present_now). Set in the player's enter branch; consumed — read
+ * and cleared — by show_front(), and cleared again if the enter
+ * fails before any swap. */
+static bool s_enter_swap;
+
 /* Mid-dip: waking has faded to black and the next visual swapped in
  * must start at opa 0 so the player can fade it in (dip_fade_in()).
  * Set by dip_fade_out(), consumed by the player's enter path. */
@@ -628,21 +635,182 @@ static void apply_framing(visual_t v)
                  ((v == V_WAKING || v == V_STILL) ? FR_WAKING_DY : 0));
 }
 
+static void squash_exec(void *obj, int32_t v);   /* defined with the squash */
+
+/* ---- direct present: a whole face in one panel write ----
+ *
+ * An LVGL refresh paints a full-screen face in four 118-row bands,
+ * drawn and sent one after another: the sweep takes ~65-75 ms, so
+ * for several panel refreshes the top of the screen shows the new
+ * face while the bottom still shows the old one — the horizontal
+ * split a state switch used to show. The decoded frame is already
+ * whole in PSRAM, so on boards whose driver can write a rectangle
+ * straight to the panel (draw_frame, timed against the panel's scan
+ * like the video path), an enter presents the face's centre in one
+ * such write: the scan runs faster than the writer, so started just
+ * after a scan it reads the old picture everywhere, and the next
+ * scan reads the new one everywhere. No mixed refresh.
+ *
+ * Only the centre goes direct. The fixed chrome — progress ring,
+ * battery arc, status row — and the dialog box are LVGL objects over
+ * the face; the rows and columns they live in stay LVGL's, repaired
+ * by the invalidations in present_border() right after the write
+ * (thin strips, one or two bands each, mostly edge and background
+ * pixels). The widget's source and opa are still updated under the
+ * display lock first, so any later LVGL redraw composites the same
+ * picture. Falls back to the plain LVGL swap whenever anything is
+ * off: no draw_frame, not the minimal face, the face tile not front,
+ * the waking black dip, or the boot/waking stills. A squash still
+ * running is cancelled, not waited out (present_squash_cancel). */
+#define FR_PRES_TOP 52            /* first direct row: below the status row */
+#define FR_PRES_X0 16             /* side columns stay LVGL's: the ring's */
+#define FR_PRES_X1 (FR_W - 16)    /* edge pixels live in them */
+#define FR_PRES_DIALOG_TOP 342    /* dialog up: rows from here stay LVGL's */
+
+typedef struct {
+    const uint16_t *base;   /* the rect's first source pixel */
+    int opa;                /* 255: plain copy; below: scale channels */
+} pres_arg_t;
+
+/* fill() for draw_frame: the rect's rows from the front buffer, in
+ * the panel's byte order (the decoded frames are plain RGB565, the
+ * panel wants them swapped), at the given opa. */
+static void pres_fill(uint8_t *dst, int stride, int row, int rows, void *arg)
+{
+    const pres_arg_t *p = arg;
+    const int w = FR_PRES_X1 - FR_PRES_X0;
+    const uint16_t *src = p->base + (size_t)row * FR_W;
+    for (int r = 0; r < rows; r++) {
+        uint16_t *d = (uint16_t *)dst;
+        const uint16_t *s = src + (size_t)r * FR_W;
+        if (p->opa >= LV_OPA_COVER) {
+            for (int x = 0; x < w; x++) {
+                uint16_t v = s[x];
+                d[x] = (uint16_t)((v << 8) | (v >> 8));
+            }
+        } else {
+            const int o = p->opa;
+            for (int x = 0; x < w; x++) {
+                uint16_t v = s[x];
+                uint16_t nv = (uint16_t)((((v >> 11) & 31) * o / 255 << 11) |
+                                         (((v >> 5) & 63) * o / 255 << 5) |
+                                         ((v & 31) * o / 255));
+                d[x] = (uint16_t)((nv << 8) | (nv >> 8));
+            }
+        }
+        dst += stride;
+    }
+}
+
+static bool present_ok(void)
+{
+    return muse_board->draw_frame && muse_board->minimal_face &&
+           muse_ui_face_active();
+}
+
+/* End a squash that is still running, snapping the widget back to
+ * full scale. The caller holds the display lock. A direct present
+ * writes the face unscaled, so a squash left running would fight it
+ * — and gating the present on the squash instead would defeat the
+ * whole point: the presses that start a squash (a face tap, the talk
+ * key's edge into LISTENING) are the very presses that switch the
+ * face, and their builds routinely outlast the animation's first
+ * steps, so the swap would land mid-squash and fall back to the
+ * banded sweep. The press already had its feedback while the new
+ * face built; the switch itself is the rest of the answer. */
+static void present_squash_cancel(void)
+{
+    lv_anim_delete(s_img, squash_exec);
+    if (s_squash_factor != 256) {
+        s_squash_factor = 256;
+        lv_image_set_scale(s_img, 256);
+    }
+}
+
+/* The last direct row's other side: with the dialog up, its rows
+ * (and the chin under it) stay LVGL's. Read under the display lock —
+ * the dialog's visibility only changes in LVGL context — and the
+ * snapshot is passed down, so the write and the border repair agree
+ * on where the face's territory ends. */
+static int present_bottom(void)
+{
+    return muse_ui_dialog_up() ? FR_PRES_DIALOG_TOP : FR_H;
+}
+
+/* Write the front buffer's centre straight to the panel at opa,
+ * rows [FR_PRES_TOP, y1). Blocks for the write (~26 ms of wire
+ * time). The caller holds the display lock across the write: an
+ * LVGL refresh pass runs under the same lock, so no band of a pass
+ * can interleave with the frame on the panel bus. */
+static void present_now(int opa, int y1)
+{
+    int dy = (muse_board->minimal_face ? FR_FACE_DY : 0) +
+             ((s_swap_vis == V_WAKING || s_swap_vis == V_STILL) ? FR_WAKING_DY : 0);
+    int y0 = FR_PRES_TOP > dy ? FR_PRES_TOP : dy;
+    pres_arg_t a = { s_buf[s_front] + (size_t)(y0 - dy) * FR_W + FR_PRES_X0, opa };
+    int64_t t0 = esp_timer_get_time();
+    muse_board->draw_frame(FR_PRES_X0, y0, FR_PRES_X1, y1, 8, pres_fill, &a);
+    ESP_LOGI(TAG, "present: %lld ms (opa %d)", (long long)(esp_timer_get_time() - t0) / 1000, opa);
+}
+
+/* After a direct write, hand the border back to LVGL: the strips and
+ * columns the write left out (or painted over), redrawn from the
+ * widget's new source at its new opa, chrome included. y1 is the
+ * same snapshot present_now() wrote to. */
+static void present_border(int y1)
+{
+    const lv_area_t areas[] = {
+        { 0, 0, FR_W - 1, FR_PRES_TOP - 1 },              /* status row, arc top */
+        { 64, 40, 151, 99 },                              /* battery arc, left end */
+        { 314, 40, 401, 99 },                             /* battery arc, right end */
+        { 0, FR_PRES_TOP, FR_PRES_X0 - 1, y1 - 1 },       /* ring's left edge */
+        { FR_PRES_X1, FR_PRES_TOP, FR_W - 1, y1 - 1 },    /* ring's right edge */
+        { 216, 448, 249, FR_H - 1 },                      /* ring's bottom point */
+        { 0, FR_PRES_DIALOG_TOP, FR_W - 1, FR_H - 1 },    /* dialog rows, if any */
+    };
+    int n = (int)(sizeof(areas) / sizeof(areas[0])) - (y1 < FR_H ? 0 : 1);
+    muse_board->display_lock(-1);
+    lv_obj_t *scr = lv_screen_active();
+    for (int i = 0; i < n; i++) {
+        lv_obj_invalidate_area(scr, &areas[i]);
+    }
+    muse_board->display_unlock();
+}
+
 static void show_front(void)
 {
+    int opa = s_dip ? 0 : (s_soft_hold ? FR_SOFT_DIP_BOTTOM : LV_OPA_COVER);
     muse_board->display_lock(-1);
+    /* Eligibility is decided under the lock: the face tile can be
+     * swiped away while this swap was building, and a direct write
+     * decided on the stale answer would paint the face over the
+     * tile that just came forward. */
+    bool direct = s_enter_swap && !s_dip && present_ok() &&
+                  s_swap_vis != V_WAKING && s_swap_vis != V_STILL;
+    s_enter_swap = false;
+    if (direct) {
+        present_squash_cancel();   /* before apply_framing re-applies it */
+    }
     s_dsc.data = (const uint8_t *)s_buf[s_front];
     lv_image_set_src(s_img, &s_dsc);
     apply_framing(s_swap_vis);
     /* Mid-dip the incoming visual starts black; the player fades it
      * in right after the swap (see dip_fade_out()). Mid-soft-dip it
      * starts at the dip's bottom instead (see s_soft_hold). */
-    lv_obj_set_style_opa(s_img,
-                         s_dip ? 0 : (s_soft_hold ? FR_SOFT_DIP_BOTTOM : LV_OPA_COVER), 0);
+    lv_obj_set_style_opa(s_img, (lv_opa_t)opa, 0);
     s_soft_hold = false;
     lv_obj_remove_flag(s_img, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_invalidate(s_img);
+    if (!direct) {
+        lv_obj_invalidate(s_img);
+    }
+    int y1 = direct ? present_bottom() : 0;
+    if (direct) {
+        present_now(opa, y1);   /* under the lock: serialized with LVGL */
+    }
     muse_board->display_unlock();
+    if (direct) {
+        present_border(y1);
+    }
 }
 
 static void hide_face(void)
@@ -759,6 +927,24 @@ static void dip_fade_in(void)
  * never on screen together. */
 static void soft_dip_fade_out(void)
 {
+    muse_board->display_lock(-1);
+    if (present_ok()) {   /* decided under the lock: see show_front */
+        /* The same single step, presented whole (present_now): the
+         * dimming used to be a four-band LVGL sweep of its own. The
+         * border is NOT repaired here: it keeps the old face at full
+         * brightness while the new one builds (the chrome over it
+         * never dims either), and the swap's present_border() brings
+         * it to the new face at the dip's bottom in one go — an LVGL
+         * redraw here would only fight the build for PSRAM bandwidth
+         * (measured: ~100 ms on a kit build). */
+        present_squash_cancel();
+        int y1 = present_bottom();
+        lv_obj_set_style_opa(s_img, FR_SOFT_DIP_BOTTOM, 0);
+        present_now(FR_SOFT_DIP_BOTTOM, y1);
+        muse_board->display_unlock();
+        return;
+    }
+    muse_board->display_unlock();
     for (int opa = LV_OPA_COVER; opa > FR_SOFT_DIP_BOTTOM; opa -= FR_SOFT_DIP_STEP) {
         muse_board->display_lock(-1);
         lv_obj_set_style_opa(s_img, (lv_opa_t)(opa - FR_SOFT_DIP_STEP < FR_SOFT_DIP_BOTTOM
@@ -773,6 +959,17 @@ static void soft_dip_fade_out(void)
 
 static void soft_dip_fade_in(void)
 {
+    muse_board->display_lock(-1);
+    if (present_ok()) {   /* decided under the lock: see show_front */
+        present_squash_cancel();
+        int y1 = present_bottom();
+        lv_obj_set_style_opa(s_img, LV_OPA_COVER, 0);
+        present_now(LV_OPA_COVER, y1);
+        muse_board->display_unlock();
+        present_border(y1);
+        return;
+    }
+    muse_board->display_unlock();
     for (int opa = FR_SOFT_DIP_BOTTOM; opa < LV_OPA_COVER; opa += FR_SOFT_DIP_STEP) {
         muse_board->display_lock(-1);
         lv_obj_set_style_opa(s_img, (lv_opa_t)(opa + FR_SOFT_DIP_STEP > LV_OPA_COVER
@@ -1173,6 +1370,7 @@ static void player_task(void *arg)
              * request waits for a new face, build is the part the
              * preload can shrink (asset reads + decode/composite). */
             int64_t t_req = esp_timer_get_time();
+            s_enter_swap = true;   /* an enter, not a frame advance */
             bool soft = !s_dip && soft_dip_pair(cur, want);
             if (soft) {
                 soft_dip_fade_out();   /* the build below runs dimmed */
@@ -1208,6 +1406,7 @@ static void player_task(void *arg)
             if (!ok) {
                 s_dip = false;   /* the fallback face comes up as-is */
                 s_soft_hold = false;
+                s_enter_swap = false;   /* no swap happened */
                 if (want == V_WAKING) {
                     s_waking_done = true;
                 }

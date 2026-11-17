@@ -278,6 +278,11 @@ static int s_boot_hint_stage;
 static float s_boot_hint_until;
 static lv_obj_t *s_caption_lbl;
 static lv_obj_t *s_dialog;   /* minimal face only: the game-style box the caption sits in */
+
+bool muse_ui_dialog_up(void)
+{
+    return s_dialog && !lv_obj_has_flag(s_dialog, LV_OBJ_FLAG_HIDDEN);
+}
 static lv_obj_t *s_reply_lbl;   /* full layout: the reply's page while answering */
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
 static lv_obj_t *s_review_position;
