@@ -22,6 +22,7 @@ Function must not move: same rows, same order, same callbacks.
 
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -127,6 +128,34 @@ class ControlStyleTest(unittest.TestCase):
         self.assertIn("style_slider_ios(s)", slider)
         # A lone slider carries its own group surface.
         self.assertIn("lv_obj_set_style_clip_corner(c, true, 0)", slider)
+
+    def test_slider_style_never_clears_geometry(self) -> None:
+        # Slider position fix (2026-11-18): the quick tile's sliders
+        # rendered at their cards' top-left corner because the style
+        # helper cleared all styles AFTER size/pos were set — LVGL
+        # keeps x/y/w/h in the local style, so remove_style_all wipes
+        # geometry too. The settings slider() sets width/height/align
+        # BEFORE style_slider_ios(s); it is safe today only because
+        # style_slider_ios never clears styles. Pin that, and pin the
+        # container leaving room for the whole knob under the track
+        # (the spacer's y is the container's content floor).
+        body = body_of(self.src, "static void style_slider_ios(")
+        self.assertNotIn("remove_style_all", body)
+        pad = int(re.search(r"lv_obj_set_style_pad_all\(s, (\d+), LV_PART_KNOB\)",
+                            body).group(1))
+        slider = body_of(self.src, "static lv_obj_t *slider(")
+        align = re.search(r"wide_layout\(\) \? (\d+) : s_tiny \? (\d+) : (\d+)",
+                          slider)
+        spacer = re.search(r"lv_obj_align\(spacer, LV_ALIGN_TOP_LEFT, 0, "
+                           r"wide_layout\(\) \? (\d+) : s_tiny \? (\d+) : (\d+)\)",
+                           slider)
+        heights = re.search(r"s_tiny \? (\d+) : (\d+)", slider)
+        # variants in order: wide, tiny, normal
+        align_ys = [int(align.group(1)), int(align.group(2)), int(align.group(3))]
+        spacer_ys = [int(spacer.group(1)), int(spacer.group(2)), int(spacer.group(3))]
+        track_hs = [int(heights.group(2)), int(heights.group(1)), int(heights.group(2))]
+        for align_y, spacer_y, track_h in zip(align_ys, spacer_ys, track_hs):
+            self.assertGreaterEqual(spacer_y, align_y + track_h + pad)
 
     def test_slider_fill_is_apple_blue_with_tick_dots(self) -> None:
         # Style round (2026-11-18): the settings sliders take the same

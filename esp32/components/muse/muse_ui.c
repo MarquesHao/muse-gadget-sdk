@@ -1572,7 +1572,13 @@ static void apply_text_size(void)
  * "white pictogram on colour" read. */
 
 /* The Apple-shaped slider the quick cards share: dark track, iOS-blue
- * fill, white knob with a soft shadow, a forgiving touch area. */
+ * fill, white knob with a soft shadow, a forgiving touch area.
+ * WARNING: this clears the object's styles first, and in LVGL the
+ * position and size live in that same local style — so
+ * remove_style_all also resets x/y/w/h. Callers must set the slider's
+ * size and position AFTER this returns, never before (the 2026-11-18
+ * style round set them before and the sliders rendered at the card's
+ * top-left corner, half under the card above). */
 static void style_quick_slider(lv_obj_t *s)
 {
     lv_obj_remove_style_all(s);
@@ -1736,10 +1742,10 @@ static lv_obj_t *quick_slider_card(lv_obj_t *col, const char *label, bool bright
     }
 
     lv_obj_t *s = lv_slider_create(card);
+    style_quick_slider(s);   /* first: it clears styles, geometry included */
     lv_obj_set_size(s, 288, 8);
-    lv_obj_set_pos(s, 56, 48);
-    style_quick_slider(s);
-    quick_slider_ticks(card, 56, 64, 288);
+    lv_obj_set_pos(s, 56, 50);   /* track centre 54, level with the end glyphs */
+    quick_slider_ticks(card, 56, 66, 288);
     return s;
 }
 

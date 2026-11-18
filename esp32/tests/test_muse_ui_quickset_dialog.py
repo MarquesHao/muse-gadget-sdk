@@ -169,6 +169,42 @@ class QuickSettingsTileTest(unittest.TestCase):
         done = body_of(self.src, "static void on_quickset_bright_done")
         self.assertIn("muse_settings_set_brightness(v)", done)
 
+    def test_slider_card_geometry_stays_inside_the_card(self) -> None:
+        # Slider position fix (2026-11-18): Hugh's photo showed both
+        # quick-tile sliders riding on their cards' top edge, half
+        # hidden under the card above. Root cause: LVGL keeps x/y/w/h
+        # in the object's local style, and style_quick_slider() starts
+        # with lv_obj_remove_style_all — so the size/pos set BEFORE
+        # styling were wiped and the slider rendered at the card's
+        # (0,0) with its default size. Pin the order (style first,
+        # geometry after) and the geometry itself: the slider's full
+        # extent, knob included, must sit inside the card with at
+        # least a knob radius of margin above and below, and the tick
+        # dots must clear the knob and stay inside the card too.
+        card_fn = body_of(self.src, "static lv_obj_t *quick_slider_card")
+        self.assertLess(card_fn.index("style_quick_slider(s)"),
+                        card_fn.index("lv_obj_set_pos(s,"))
+        self.assertLess(card_fn.index("style_quick_slider(s)"),
+                        card_fn.index("lv_obj_set_size(s,"))
+        style = body_of(self.src, "static void style_quick_slider")
+        pad = int(re.search(r"lv_obj_set_style_pad_all\(s, (\d+), LV_PART_KNOB\)",
+                            style).group(1))
+        card_h = int(re.search(r"lv_obj_set_size\(card, lv_pct\(100\), (\d+)\)",
+                               card_fn).group(1))
+        sw, sh = (int(v) for v in re.search(
+            r"lv_obj_set_size\(s, (\d+), (\d+)\)", card_fn).groups())
+        sx, sy = (int(v) for v in re.search(
+            r"lv_obj_set_pos\(s, (\d+), (\d+)\)", card_fn).groups())
+        ticks_y = int(re.search(r"quick_slider_ticks\(card, \d+, (\d+), \d+\)",
+                                card_fn).group(1))
+        knob_r = (sh + 2 * pad) // 2          # the knob rides pad proud each side
+        knob_top, knob_bot = sy - pad, sy + sh + pad
+        self.assertGreaterEqual(knob_top, knob_r)
+        self.assertGreaterEqual(card_h - knob_bot, knob_r)
+        self.assertGreaterEqual(ticks_y, knob_bot)
+        self.assertLessEqual(ticks_y + 3, card_h)
+        self.assertGreater(sx, 0)             # never flush with the card's left edge
+
     def test_quick_tile_hint_has_no_tofu_separator(self) -> None:
         # The middle dot is in neither the Latin face nor the CJK subset
         # font, so it drew as a tofu box between the hint's two halves.
