@@ -80,6 +80,11 @@
 #define COLOR_OK 0x6ff0bf
 #define COLOR_WARN 0xffb45c
 #define COLOR_DANGER 0xff5c5c
+#define COLOR_SEP 0x38383a          /* hairline between grouped rows */
+#define COLOR_IOS_BLUE 0x0a84ff     /* switches on, checkmarks: iOS control blue */
+#define COLOR_CHEVRON 0x48484a      /* the nav chevron's quiet grey */
+#define COLOR_SWITCH_OFF 0x39393d   /* iOS switch track, off */
+#define COLOR_SLIDER_TRACK 0x3a3a3c /* iOS slider track on dark */
 
 typedef void (*text_done_cb_t)(const char *text);
 
@@ -113,7 +118,7 @@ static lv_obj_t *s_home_camera;
 #endif
 
 /* Wi-Fi page. */
-static lv_obj_t *s_wifi_sw, *s_wifi_status, *s_wifi_saved, *s_wifi_scan_btn, *s_wifi_scan_lbl, *s_wifi_list;
+static lv_obj_t *s_wifi_sw, *s_wifi_status, *s_wifi_saved, *s_wifi_saved_hdr, *s_wifi_scan_btn, *s_wifi_scan_lbl, *s_wifi_list;
 static uint32_t s_shown_scan_gen = UINT32_MAX;
 static muse_wifi_ap_t s_aps[MAX_APS];
 static muse_wifi_saved_t s_saved[MUSE_WIFI_SAVED_MAX];
@@ -460,10 +465,15 @@ static lv_obj_t *back_button(lv_obj_t *p)
          * arrow sits on a minimal-face board; it moves down with the
          * page title (MINIMAL_CHROME_TOP) so the arc clears the glyph. */
         lv_obj_align(b, LV_ALIGN_TOP_MID, -112, 28 + (muse_board->minimal_face ? MINIMAL_CHROME_TOP : 0));
+        /* A capsule behind the chevron, as Apple's back buttons sit
+         * on a filled circle/pill on dark pages. */
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x2c2c2e), 0);
+        lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
     }
     lv_obj_add_event_cb(b, on_back, LV_EVENT_CLICKED, NULL);
     lv_obj_t *arrow = label(b, wide_layout() ? &lv_font_montserrat_28 : &lv_font_montserrat_20,
-                            COLOR_ACCENT, LV_SYMBOL_LEFT);
+                            wide_layout() ? COLOR_ACCENT : COLOR_TEXT, LV_SYMBOL_LEFT);
     lv_obj_center(arrow);
     return b;
 }
@@ -485,8 +495,9 @@ static lv_obj_t *page(lv_obj_t *tile, const char *title, bool back, lv_obj_t **l
     catch_swipes(p);
 
     lv_obj_t *t = label(p, wide ? &lv_font_montserrat_28 :
-                        compact || s_tiny ? &lv_font_montserrat_16 : &lv_font_unscii_16, COLOR_ACCENT, title);
-    lv_obj_set_style_text_letter_space(t, wide ? 1 : compact ? 0 : s_tiny ? 1 : 2, 0);
+                        compact || s_tiny ? &lv_font_montserrat_16 :
+                        narrow_panel() ? &lv_font_unscii_16 : &lv_font_montserrat_20, COLOR_TEXT, title);
+    lv_obj_set_style_text_letter_space(t, wide ? 1 : compact ? 0 : 1, 0);
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, (wide ? 24 : compact ? (back ? 12 : 8) : s_tiny ? 18 : 44)
                                              + (muse_board->minimal_face ? MINIMAL_CHROME_TOP : 0));
     if (narrow_panel() && back) {
@@ -517,10 +528,10 @@ static lv_obj_t *page(lv_obj_t *tile, const char *title, bool back, lv_obj_t **l
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, list_top);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    /* Standard layout: rows sit 2 px apart on the black page, so a run of
-     * cards reads as one iOS-style grouped list with hairline separations
-     * instead of a stack of floating pills. */
-    lv_obj_set_style_pad_row(list, wide ? 16 : narrow_panel() || s_tiny ? 6 : 2, 0);
+    /* Groups carry their own surface; the list gap is the air between
+     * a group header, its container and the next group, as on Apple's
+     * settings pages. */
+    lv_obj_set_style_pad_row(list, wide ? 16 : narrow_panel() || s_tiny ? 6 : 12, 0);
     /* Clear the page dots on flat panels, or the bottom curve on round ones. */
     lv_obj_set_style_pad_bottom(list, wide ? 16 : narrow_panel() ? 12 : (compact ? 32 : s_tiny ? 64 : 110), 0);
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
@@ -529,15 +540,87 @@ static lv_obj_t *page(lv_obj_t *tile, const char *title, bool back, lv_obj_t **l
     return p;
 }
 
+/* ---------- grouped containers (iOS settings style) ---------- */
+
+/* A group is one rounded container holding its rows flat, with a
+ * hairline between them — the surface Apple's settings lists are
+ * built from. Its user_data counts the rows added so far, offset by
+ * one so a group is told from a plain parent (user_data NULL). */
+static bool is_group(lv_obj_t *p)
+{
+    return p && lv_obj_get_user_data(p) != NULL;
+}
+
+static int group_rows(lv_obj_t *g)
+{
+    return (int)(intptr_t)lv_obj_get_user_data(g) - 1;
+}
+
+static lv_obj_t *group(lv_obj_t *list)
+{
+    lv_obj_t *g = lv_obj_create(list);
+    lv_obj_remove_style_all(g);
+    lv_obj_set_size(g, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(g, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(g, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_radius(g, s_tiny ? 10 : 14, 0);
+    /* Rows are flat inside; the container's corners clip their
+     * pressed wash, so a group reads as one surface, not a stack. */
+    lv_obj_set_style_clip_corner(g, true, 0);
+    lv_obj_set_flex_flow(g, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_remove_flag(g, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_user_data(g, (void *)(intptr_t)1);
+    return g;
+}
+
+/* A group's children are about to be cleaned and rebuilt (the Wi-Fi
+ * lists): the divider count starts over. */
+static void group_reset(lv_obj_t *g)
+{
+    lv_obj_set_user_data(g, (void *)(intptr_t)1);
+}
+
+/* The hairline over a grouped row, inset to where its label starts —
+ * past the icon tile when the row has one — as iOS draws it. The
+ * first row of a group gets none. Call before creating the row. */
+static void group_sep(lv_obj_t *g, bool icon)
+{
+    if (group_rows(g) < 1) {
+        return;
+    }
+    lv_obj_t *sep = lv_obj_create(g);
+    lv_obj_remove_style_all(sep);
+    lv_obj_set_size(sep, lv_pct(100), 1);
+    lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(COLOR_SEP), 0);
+    lv_obj_set_style_margin_left(sep, wide_layout() ? (icon ? 72 : 24) : icon ? 60 : 16, 0);
+    lv_obj_remove_flag(sep, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void group_row_done(lv_obj_t *g)
+{
+    lv_obj_set_user_data(g, (void *)(intptr_t)(group_rows(g) + 2));
+}
+
 static lv_obj_t *card(lv_obj_t *list, bool clickable)
 {
     lv_obj_t *c = clickable ? lv_button_create(list) : lv_obj_create(list);
     lv_obj_remove_style_all(c);
     lv_obj_set_size(c, lv_pct(100), wide_layout() ? 84 : s_tiny ? TINY_ROW_H : ROW_H);
-    lv_obj_set_style_radius(c, 12, 0);   /* iOS grouped-list corner radius */
-    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_CARD), 0);
-    lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_CARD_PRESSED), LV_STATE_PRESSED);
+    if (is_group(list) && !muse_board->epaper) {
+        /* Flat in its group: the container carries the surface and
+         * the radius; only a press shows, washed over the row. The
+         * e-paper UI keeps a filled row of its own — its sleep rows
+         * are recoloured by pointer, which a transparent row loses. */
+        lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_CARD_PRESSED), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_STATE_PRESSED);
+    } else {
+        lv_obj_set_style_radius(c, 12, 0);   /* iOS grouped-list corner radius */
+        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_CARD), 0);
+        lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_CARD_PRESSED), LV_STATE_PRESSED);
+    }
     lv_obj_set_style_pad_hor(c, wide_layout() ? 24 : stacked_rows() ? 10 : 16, 0);
     lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -546,11 +629,57 @@ static lv_obj_t *card(lv_obj_t *list, bool clickable)
     return c;
 }
 
+/* The iOS icon tile's colour, one per row kind, from Apple's
+ * settings palette, keyed by the symbol the row already carries. */
+static uint32_t icon_color(const char *symbol)
+{
+    if (strcmp(symbol, LV_SYMBOL_WIFI) == 0 || strcmp(symbol, LV_SYMBOL_BLUETOOTH) == 0
+        || strcmp(symbol, LV_SYMBOL_IMAGE) == 0) {
+        return 0x0a84ff;   /* blue */
+    }
+    if (strcmp(symbol, LV_SYMBOL_VOLUME_MAX) == 0) {
+        return 0xff375f;   /* pink-red */
+    }
+    if (strcmp(symbol, LV_SYMBOL_BATTERY_FULL) == 0) {
+        return 0x30d158;   /* green */
+    }
+    if (strcmp(symbol, LV_SYMBOL_POWER) == 0) {
+        return 0xff453a;   /* red */
+    }
+    if (strcmp(symbol, LV_SYMBOL_HOME) == 0) {
+        return 0xbf5af2;   /* purple */
+    }
+    if (strcmp(symbol, LV_SYMBOL_EYE_CLOSE) == 0) {
+        return 0x5e5ce6;   /* indigo */
+    }
+    if (strcmp(symbol, LV_SYMBOL_VIDEO) == 0) {
+        return 0x64d2ff;   /* light blue */
+    }
+    return 0x8e8e93;       /* grey: language, edit, the rest */
+}
+
+/* A small rounded square in the row's own colour, glyph in white. */
+static void icon_tile(lv_obj_t *parent, const char *symbol)
+{
+    lv_obj_t *t = lv_obj_create(parent);
+    lv_obj_remove_style_all(t);
+    lv_obj_set_size(t, 32, 32);
+    lv_obj_set_style_radius(t, 7, 0);
+    lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(t, lv_color_hex(icon_color(symbol)), 0);
+    lv_obj_remove_flag(t, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *g = label(t, &lv_font_montserrat_20, 0xffffff, symbol);
+    lv_obj_center(g);
+}
+
 /* Tappable row: icon, text, right-aligned value. */
 /* Without cb, the row only shows its value. */
 static lv_obj_t *row(lv_obj_t *list, const char *icon, const char *text, lv_obj_t **value_out,
                      lv_event_cb_t cb, void *user)
 {
+    if (is_group(list)) {
+        group_sep(list, icon != NULL && !stacked_rows());
+    }
     lv_obj_t *c = card(list, cb != NULL);
     if (stacked_rows()) {
         /* Explicit bounded lines: a changing value must never squeeze the name. */
@@ -572,13 +701,19 @@ static lv_obj_t *row(lv_obj_t *list, const char *icon, const char *text, lv_obj_
             *value_out = v;
         }
         if (cb) lv_obj_add_event_cb(c, cb, LV_EVENT_CLICKED, user);
+        if (is_group(list)) {
+            group_row_done(list);
+        }
         return c;
     }
     if (icon) {
-        label(c, &lv_font_montserrat_20, COLOR_ACCENT, icon);
+        icon_tile(c, icon);
     }
     lv_obj_t *t = label(c, &lv_font_montserrat_20, COLOR_TEXT, text);
     lv_obj_set_flex_grow(t, 1);
+    /* The icon tile took width from the name; keep the name a floor
+     * so a long value dots out before the name does. */
+    lv_obj_set_style_min_width(t, 90, 0);
     lv_label_set_long_mode(t, LV_LABEL_LONG_MODE_DOTS);
     if (value_out) {
         lv_obj_t *v = label(c, &lv_font_montserrat_16, COLOR_DIM, "");
@@ -589,16 +724,22 @@ static lv_obj_t *row(lv_obj_t *list, const char *icon, const char *text, lv_obj_
     if (cb == on_nav) {
         /* Navigation rows end in a chevron, iOS-style; choice rows keep
          * their checkmark as the value instead. */
-        label(c, &lv_font_montserrat_16, COLOR_DIM, LV_SYMBOL_RIGHT);
+        label(c, &lv_font_montserrat_16, COLOR_CHEVRON, LV_SYMBOL_RIGHT);
     }
     if (cb) {
         lv_obj_add_event_cb(c, cb, LV_EVENT_CLICKED, user);
+    }
+    if (is_group(list)) {
+        group_row_done(list);
     }
     return c;
 }
 
 static lv_obj_t *switch_row(lv_obj_t *list, const char *text, bool on, lv_event_cb_t cb)
 {
+    if (is_group(list)) {
+        group_sep(list, false);
+    }
     lv_obj_t *c = card(list, false);
     lv_obj_t *t = label(c, stacked_rows() ? &lv_font_montserrat_16 : &lv_font_montserrat_20, COLOR_TEXT, text);
     lv_obj_set_flex_grow(t, 1);
@@ -608,17 +749,34 @@ static lv_obj_t *switch_row(lv_obj_t *list, const char *text, bool on, lv_event_
     }
     lv_obj_t *sw = lv_switch_create(c);
     lv_obj_set_size(sw, wide_layout() ? 76 : stacked_rows() ? 44 : 60, wide_layout() ? 42 : s_tiny ? 24 : 32);
-    lv_obj_set_style_bg_color(sw, lv_color_hex(0x3a3358), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(sw, lv_color_hex(COLOR_ACCENT), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    /* The iOS pill: grey track off, blue on, a white knob with a soft
+     * shadow riding it. */
+    lv_obj_set_style_bg_color(sw, lv_color_hex(COLOR_SWITCH_OFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(COLOR_IOS_BLUE), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sw, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(sw, 6, LV_PART_KNOB);
+    lv_obj_set_style_shadow_opa(sw, LV_OPA_30, LV_PART_KNOB);
+    lv_obj_set_style_shadow_ofs_y(sw, 1, LV_PART_KNOB);
     if (on) {
         lv_obj_add_state(sw, LV_STATE_CHECKED);
     }
     lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    if (is_group(list)) {
+        group_row_done(list);
+    }
     return sw;
 }
 
 static lv_obj_t *button(lv_obj_t *list, const char *text, uint32_t color, lv_event_cb_t cb, lv_obj_t **label_out)
 {
+    if (is_group(list)) {
+        group_sep(list, false);
+    }
     lv_obj_t *b = card(list, true);
     lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *l = label(b, stacked_rows() ? &lv_font_montserrat_16 : &lv_font_montserrat_20, color, text);
@@ -630,37 +788,74 @@ static lv_obj_t *button(lv_obj_t *list, const char *text, uint32_t color, lv_eve
     if (label_out) {
         *label_out = l;
     }
+    if (is_group(list)) {
+        group_row_done(list);
+    }
     return b;
+}
+
+/* The iOS slider: a thin track, the set part filled light, and a
+ * white knob with a soft shadow. The knob is mostly pad, so it rides
+ * proud of the thin track the way Apple's does. */
+static void style_slider_ios(lv_obj_t *s)
+{
+    lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_SLIDER_TRACK), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_TEXT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s, 8, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(s, 8, LV_PART_KNOB);
+    lv_obj_set_style_shadow_opa(s, LV_OPA_30, LV_PART_KNOB);
+    lv_obj_set_style_shadow_ofs_y(s, 1, LV_PART_KNOB);
 }
 
 /* Label + value on one line, slider below. */
 static lv_obj_t *slider(lv_obj_t *list, const char *text, int lo, int hi, int value, lv_obj_t **value_out,
                         lv_event_cb_t cb)
 {
+    const bool grouped = is_group(list);
+    if (grouped) {
+        group_sep(list, false);
+    }
     lv_obj_t *c = lv_obj_create(list);
     lv_obj_remove_style_all(c);
     lv_obj_set_size(c, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_hor(c, 8, 0);
+    if (!grouped) {
+        /* On its own it carries a group surface of its own, so a lone
+         * slider reads as a one-row section. */
+        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(c, lv_color_hex(COLOR_CARD), 0);
+        lv_obj_set_style_radius(c, 14, 0);
+        lv_obj_set_style_clip_corner(c, true, 0);
+    }
+    lv_obj_set_style_pad_hor(c, grouped ? 16 : 8, 0);
     lv_obj_set_style_pad_ver(c, 6, 0);
     lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    if (grouped) {
+        group_row_done(list);
+    }
 
     const lv_font_t *font = stacked_rows() ? &lv_font_montserrat_16 : &lv_font_montserrat_20;
     label(c, font, COLOR_TEXT, text);
-    lv_obj_t *v = label(c, font, COLOR_ACCENT, "");
+    lv_obj_t *v = label(c, font, COLOR_DIM, "");
     lv_obj_align(v, LV_ALIGN_TOP_RIGHT, 0, 0);
     *value_out = v;
 
     lv_obj_t *s = lv_slider_create(c);
     lv_obj_set_width(s, lv_pct(94));
-    lv_obj_set_height(s, wide_layout() ? 16 : 12);
+    lv_obj_set_height(s, wide_layout() ? 8 : 6);
     lv_obj_align(s, LV_ALIGN_TOP_MID, 0, wide_layout() ? 50 : s_tiny ? 30 : 40);
     lv_slider_set_range(s, lo, hi);
     lv_slider_set_value(s, value, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(s, lv_color_hex(0x2a2345), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_ACCENT), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_TEXT), LV_PART_KNOB);
-    lv_obj_set_style_pad_all(s, 6, LV_PART_KNOB);
-    lv_obj_set_ext_click_area(s, 16);
+    style_slider_ios(s);
+    /* The track is thinner than the old bar; widen the forgiving area
+     * so the touch target keeps its old height. */
+    lv_obj_set_ext_click_area(s, wide_layout() ? 20 : 19);
     lv_obj_add_event_cb(s, cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s, cb, LV_EVENT_RELEASED, NULL);
 
@@ -671,21 +866,12 @@ static lv_obj_t *slider(lv_obj_t *list, const char *text, int lo, int hi, int va
     return s;
 }
 
-/* A column of rows inside the page's list, filled in later. */
-static lv_obj_t *column(lv_obj_t *list)
-{
-    lv_obj_t *l = lv_obj_create(list);
-    lv_obj_remove_style_all(l);
-    lv_obj_set_size(l, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(l, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(l, wide_layout() ? 14 : s_tiny ? 6 : 10, 0);
-    lv_obj_remove_flag(l, LV_OBJ_FLAG_SCROLLABLE);
-    return l;
-}
-
 /* Label and value, not tappable. */
 static lv_obj_t *info_row(lv_obj_t *list, const char *text)
 {
+    if (is_group(list)) {
+        group_sep(list, false);
+    }
     lv_obj_t *c = card(list, false);
     if (stacked_rows()) {
         /* A MAC address or battery value beside its name overflows these. */
@@ -698,12 +884,19 @@ static lv_obj_t *info_row(lv_obj_t *list, const char *text)
         lv_obj_t *v = label(c, &lv_font_montserrat_16, COLOR_TEXT, "");
         single_line(v, text_w);
         lv_obj_align(v, LV_ALIGN_LEFT_MID, 0, 11);
+        if (is_group(list)) {
+            group_row_done(list);
+        }
         return v;
     }
     lv_obj_set_height(c, wide_layout() ? 60 : 44);
     lv_obj_t *t = label(c, &lv_font_montserrat_16, COLOR_TEXT, text);
     lv_obj_set_flex_grow(t, 1);
-    return label(c, &lv_font_montserrat_16, COLOR_ACCENT, "");
+    lv_obj_t *v = label(c, &lv_font_montserrat_16, COLOR_DIM, "");
+    if (is_group(list)) {
+        group_row_done(list);
+    }
+    return v;
 }
 
 /* ---------- navigation ---------- */
@@ -1104,9 +1297,9 @@ static void rebuild_saved_list(void)
     s_forget_armed = -1;
     s_shown_scan_gen = UINT32_MAX;   /* re-mark the saved ones in the scan list */
     lv_obj_clean(s_wifi_saved);
-    if (n) {
-        note(s_wifi_saved, "Saved networks");
-    }
+    group_reset(s_wifi_saved);
+    lv_obj_set_flag(s_wifi_saved_hdr, LV_OBJ_FLAG_HIDDEN, n == 0);
+    lv_obj_set_flag(s_wifi_saved, LV_OBJ_FLAG_HIDDEN, n == 0);
     for (int i = 0; i < n; i++) {
         row(s_wifi_saved, LV_SYMBOL_WIFI, saved[i].ssid, &s_saved_vals[i], on_wifi_saved, (void *)(intptr_t)i);
     }
@@ -1145,6 +1338,7 @@ static bool rebuild_scan_list(void)
     bool fresh = s_shown_scan_gen != UINT32_MAX, saved_seen = false;
     s_shown_scan_gen = gen;
     lv_obj_clean(s_wifi_list);
+    group_reset(s_wifi_list);
     for (int i = 0; i < n; i++) {
         lv_obj_t *v;
         row(s_wifi_list, NULL, s_aps[i].ssid, &v, on_wifi_ap, (void *)(intptr_t)i);
@@ -1159,7 +1353,8 @@ static bool rebuild_scan_list(void)
         lv_label_set_text(v, buf);
     }
     if (gen && !n) {
-        note(s_wifi_list, "No networks found");
+        lv_obj_t *l = note(s_wifi_list, "No networks found");
+        lv_obj_set_style_pad_ver(l, 12, 0);
     }
     return fresh && saved_seen;
 }
@@ -1187,16 +1382,22 @@ static void build_wifi_page(lv_obj_t *tile)
     s_shown_scan_gen = UINT32_MAX;   /* the lists start empty */
     s_saved_n = -1;
     s_forget_armed = -1;
-    s_wifi_sw = switch_row(list, "Wi-Fi", muse_settings_wifi_on(), on_wifi_sw);
+    lv_obj_t *sw_group = group(list);
+    s_wifi_sw = switch_row(sw_group, "Wi-Fi", muse_settings_wifi_on(), on_wifi_sw);
     s_wifi_status = note(list, "");
 
-    s_wifi_saved = column(list);
-    s_wifi_scan_btn = button(list, TR(LV_SYMBOL_REFRESH "  Scan for networks", LV_SYMBOL_REFRESH "  扫描网络"),
+    s_wifi_saved_hdr = section(list, "Saved networks");
+    lv_obj_add_flag(s_wifi_saved_hdr, LV_OBJ_FLAG_HIDDEN);
+    s_wifi_saved = group(list);
+    lv_obj_add_flag(s_wifi_saved, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *scan_group = group(list);
+    s_wifi_scan_btn = button(scan_group, TR(LV_SYMBOL_REFRESH "  Scan for networks", LV_SYMBOL_REFRESH "  扫描网络"),
                              COLOR_ACCENT, on_wifi_scan, &s_wifi_scan_lbl);
-    s_wifi_list = column(list);
+    s_wifi_list = group(list);
 
-    row(list, LV_SYMBOL_EDIT, TR("Other network...", "其他网络..."), NULL, on_wifi_other, NULL);
-    lv_obj_t *mac = info_row(list, TR("MAC address", "MAC 地址"));
+    lv_obj_t *other_group = group(list);
+    row(other_group, LV_SYMBOL_EDIT, TR("Other network...", "其他网络..."), NULL, on_wifi_other, NULL);
+    lv_obj_t *mac = info_row(other_group, TR("MAC address", "MAC 地址"));
     uint8_t m[6];
     if (sta_mac(m)) {
         char buf[18];
@@ -1333,13 +1534,16 @@ static void build_hatch_page(lv_obj_t *tile)
     s_hatch = page(tile, "MUSE", true, &list);
     s_link_reset_armed_us = 0;
     s_link_status = note(list, "");
-    button(list, TR("Reset pairing", "重置配对"), COLOR_DANGER, on_link_reset, &s_link_reset_lbl);
+    lv_obj_t *reset_group = group(list);
+    button(reset_group, TR("Reset pairing", "重置配对"), COLOR_DANGER, on_link_reset, &s_link_reset_lbl);
     s_hatch_status = note(list, "");
-    row(list, NULL, TR("Server", "服务器"), &s_hatch_host, on_hatch_host, NULL);
-    row(list, NULL, "VM ID", &s_hatch_vm, on_hatch_vm, NULL);
-    row(list, NULL, TR("Device token", "设备令牌"), &s_hatch_token, on_hatch_token, NULL);
-    row(list, NULL, "SDK token", &s_hatch_sdk_token, on_hatch_sdk_token, NULL);
-    button(list, TR("Test connection", "测试连接"), COLOR_ACCENT, on_hatch_test, NULL);
+    lv_obj_t *fields = group(list);
+    row(fields, NULL, TR("Server", "服务器"), &s_hatch_host, on_hatch_host, NULL);
+    row(fields, NULL, "VM ID", &s_hatch_vm, on_hatch_vm, NULL);
+    row(fields, NULL, TR("Device token", "设备令牌"), &s_hatch_token, on_hatch_token, NULL);
+    row(fields, NULL, "SDK token", &s_hatch_sdk_token, on_hatch_sdk_token, NULL);
+    lv_obj_t *test_group = group(list);
+    button(test_group, TR("Test connection", "测试连接"), COLOR_ACCENT, on_hatch_test, NULL);
     note(list, TR("Pair with the Muse app to use your account; a device token here overrides it, and a long one is "
                   "easier to send over Bluetooth. The VM ID picks one of your VMs. The SDK token is from "
                   "gadgets.muse.ai; one set here replaces the firmware's. "
@@ -1415,9 +1619,11 @@ static void build_ble_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
     s_ble = page(tile, TR("BLUETOOTH", "蓝牙"), true, &list);
-    s_ble_sw = switch_row(list, TR("Phone setup", "手机设置"), muse_settings_ble_on(), on_ble_sw);
+    lv_obj_t *sw_group = group(list);
+    s_ble_sw = switch_row(sw_group, TR("Phone setup", "手机设置"), muse_settings_ble_on(), on_ble_sw);
     s_ble_status = note(list, "");
-    button(list, TR("Forget paired phones", "忘记配对的手机"), COLOR_DANGER, on_ble_forget, NULL);
+    lv_obj_t *forget_group = group(list);
+    button(forget_group, TR("Forget paired phones", "忘记配对的手机"), COLOR_DANGER, on_ble_forget, NULL);
     note(list, TR("When on, Muse is visible to phones nearby. Open tools/ble_setup.html in Chrome, "
                   "connect, and enter the code Muse shows to pair.",
                   "打开后，附近的手机能看到 Muse。在 Chrome 里打开 tools/ble_setup.html，连接后输入 Muse 显示的代码配对。"));
@@ -1549,26 +1755,30 @@ static void build_sound_page(lv_obj_t *tile)
     }
     s_sound = page(tile, SOUND_TITLE, true, &list);
     section(list, SOUND_MODE_HINT);
+    lv_obj_t *mode_group = group(list);
     for (int i = 0; i < GADGET_MODE_COUNT; i++) {
-        row(list, NULL, gadget_mode_name(i), &s_mode_checks[i], on_mode_choice,
+        row(mode_group, NULL, gadget_mode_name(i), &s_mode_checks[i], on_mode_choice,
             (void *)(intptr_t)i);
-        lv_obj_set_style_text_color(s_mode_checks[i], lv_color_hex(COLOR_ACCENT), 0);
+        lv_obj_set_style_text_color(s_mode_checks[i], lv_color_hex(COLOR_IOS_BLUE), 0);
     }
     note(list, SOUND_MODE_DESC);
     /* The language rows moved to their own page off the home list
      * (build_language_page); the Sound page keeps sound only. */
 #if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
-    s_notes_sw = switch_row(list, "Voice notes", muse_settings_voice_notes(), on_notes_sw);
+    lv_obj_t *notes_group = group(list);
+    s_notes_sw = switch_row(notes_group, "Voice notes", muse_settings_voice_notes(), on_notes_sw);
     note(list, "Off: hold yellow to talk live, release to listen; blue ends the call. "
                "On: hold yellow to send a voice note. Applies to the next call.");
 #endif
     if (muse_board->audio_init) {
-        s_spk_sw = switch_row(list, SOUND_SPEAKER, muse_settings_speaker_on(), on_speaker_sw);
-        s_vol_sl = slider(list, SOUND_VOLUME, 0, 100, muse_settings_volume(), &s_vol_val, on_volume);
+        lv_obj_t *spk_group = group(list);
+        s_spk_sw = switch_row(spk_group, SOUND_SPEAKER, muse_settings_speaker_on(), on_speaker_sw);
+        s_vol_sl = slider(spk_group, SOUND_VOLUME, 0, 100, muse_settings_volume(), &s_vol_val, on_volume);
     }
     s_gain_sl = slider(list, SOUND_GAIN, 0, MUSE_MIC_GAIN_MAX / 3, muse_settings_mic_gain() / 3, &s_gain_val, on_gain);
 
-    lv_obj_t *meter = lv_obj_create(list);
+    lv_obj_t *meter_group = group(list);
+    lv_obj_t *meter = lv_obj_create(meter_group);
     lv_obj_remove_style_all(meter);
     lv_obj_set_size(meter, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_pad_hor(meter, 8, 0);
@@ -1634,10 +1844,11 @@ static void build_language_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
     s_lang = page(tile, TR("LANGUAGE", "语言"), true, &list);
+    lv_obj_t *g = group(list);
     for (int i = 0; i < MUSE_LANG_COUNT; i++) {
-        row(list, NULL, i == MUSE_LANG_ZH ? "中文" : "English", &s_lang_checks[i], on_lang_choice,
+        row(g, NULL, i == MUSE_LANG_ZH ? "中文" : "English", &s_lang_checks[i], on_lang_choice,
             (void *)(intptr_t)i);
-        lv_obj_set_style_text_color(s_lang_checks[i], lv_color_hex(COLOR_ACCENT), 0);
+        lv_obj_set_style_text_color(s_lang_checks[i], lv_color_hex(COLOR_IOS_BLUE), 0);
     }
     note(list, TR("Takes effect after a restart, which happens on its own.",
                   "点选后设备会自动重启并生效。"));
@@ -1674,13 +1885,16 @@ static void build_sleep_page(lv_obj_t *tile)
     lv_obj_t *list;
     s_sleep = page(tile, TR("AUTO-SLEEP", "自动休眠"), true, &list);
     s_sleep_shown = -1;
-    note(list, TR("Turn the screen off after Muse has been idle for:", "Muse 空闲多久后关屏："));
+    lv_obj_t *sleep_hdr = section(list, TR("Turn the screen off after Muse has been idle for:", "Muse 空闲多久后关屏："));
+    lv_label_set_long_mode(sleep_hdr, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_t *g = group(list);
     for (int i = 0; i < SLEEP_COUNT; i++) {
-        s_sleep_rows[i] = row(list, NULL, sleep_display_name(i), &s_sleep_checks[i], on_sleep_choice,
+        s_sleep_rows[i] = row(g, NULL, sleep_display_name(i), &s_sleep_checks[i], on_sleep_choice,
                               (void *)(intptr_t)i);
-        lv_obj_set_style_text_color(s_sleep_checks[i], lv_color_hex(COLOR_ACCENT), 0);
+        lv_obj_set_style_text_color(s_sleep_checks[i], lv_color_hex(COLOR_IOS_BLUE), 0);
     }
-    button(list, TR(LV_SYMBOL_EYE_CLOSE "  Sleep now", LV_SYMBOL_EYE_CLOSE "  立即休眠"), COLOR_ACCENT, on_sleep_now, NULL);
+    lv_obj_t *now_group = group(list);
+    button(now_group, TR(LV_SYMBOL_EYE_CLOSE "  Sleep now", LV_SYMBOL_EYE_CLOSE "  立即休眠"), COLOR_ACCENT, on_sleep_now, NULL);
     note(list, TR("Tap the screen or press either button to wake.", "点屏幕或按任意一个键唤醒。"));
 }
 
@@ -1722,15 +1936,17 @@ static void build_battery_page(lv_obj_t *tile)
     s_battery = page(tile, TR("BATTERY", "电池"), true, &list);
     s_batt_shown_us = 0;
     s_batt_status = note(list, "");
-    s_batt_level = info_row(list, TR("Battery", "电池"));
-    s_batt_drain = info_row(list, TR("Used", "已用"));
-    s_batt_full = info_row(list, TR("A full charge", "满电续航"));
-    s_batt_off = info_row(list, TR("Screen off", "关屏时间"));
-    s_batt_slept = info_row(list, TR("Chip asleep", "芯片休眠"));
-    s_batt_wakes = info_row(list, TR("Wakes", "唤醒次数"));
-    s_batt_busy = info_row(list, TR("CPU busy", "CPU 忙碌"));
+    lv_obj_t *g = group(list);
+    s_batt_level = info_row(g, TR("Battery", "电池"));
+    s_batt_drain = info_row(g, TR("Used", "已用"));
+    s_batt_full = info_row(g, TR("A full charge", "满电续航"));
+    s_batt_off = info_row(g, TR("Screen off", "关屏时间"));
+    s_batt_slept = info_row(g, TR("Chip asleep", "芯片休眠"));
+    s_batt_wakes = info_row(g, TR("Wakes", "唤醒次数"));
+    s_batt_busy = info_row(g, TR("CPU busy", "CPU 忙碌"));
     s_batt_awake = note(list, "");
-    button(list, TR(LV_SYMBOL_REFRESH "  Start over", LV_SYMBOL_REFRESH "  重新开始"), COLOR_ACCENT, on_battery_reset, NULL);
+    lv_obj_t *reset_group = group(list);
+    button(reset_group, TR(LV_SYMBOL_REFRESH "  Start over", LV_SYMBOL_REFRESH "  重新开始"), COLOR_ACCENT, on_battery_reset, NULL);
     note(list, TR("Measures from unplugging USB until it's plugged back in. The gauge moves in 1% steps, so give it a "
                   "few hours. Chip asleep is time in light sleep; CPU busy is time a core was running a task.",
                   "从拔掉 USB 开始测，到再插上为止。电量按 1% 一格走，给它几个小时。芯片休眠是浅睡眠的时间；"
@@ -1829,8 +2045,9 @@ static void build_power_page(lv_obj_t *tile)
     lv_obj_t *list;
     s_power = page(tile, TR("POWER", "电源"), true, &list);
     note(list, TR("Power Muse off completely?", "要完全关机吗？"));
-    button(list, TR(LV_SYMBOL_POWER "  Power off", LV_SYMBOL_POWER "  关机"), COLOR_DANGER, on_power_off, NULL);
-    button(list, TR("Cancel", "取消"), COLOR_TEXT, on_back, NULL);
+    lv_obj_t *g = group(list);
+    button(g, TR(LV_SYMBOL_POWER "  Power off", LV_SYMBOL_POWER "  关机"), COLOR_DANGER, on_power_off, NULL);
+    button(g, TR("Cancel", "取消"), COLOR_TEXT, on_back, NULL);
     char text[128];
     const char *power = muse_board->power_button ? muse_board->power_button : muse_board->talk_button;
     const char *sleep = muse_board->power_button ? muse_board->power_button : muse_board->aux_button;
@@ -1874,26 +2091,27 @@ static void build_home(lv_obj_t *tile)
 {
     lv_obj_t *list;
     s_home = page(tile, TR("SETTINGS", "设置"), false, &list);
-    row(list, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
-    row(list, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);
-    row(list, LV_SYMBOL_BLUETOOTH, TR("Bluetooth", "蓝牙"), &s_home_ble, on_nav, (void *)&BLE);
+    lv_obj_t *g = group(list);
+    row(g, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
+    row(g, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);
+    row(g, LV_SYMBOL_BLUETOOTH, TR("Bluetooth", "蓝牙"), &s_home_ble, on_nav, (void *)&BLE);
     if (screen_only()) {
-        row(list, LV_SYMBOL_IMAGE, TR("Screen", "屏幕"), &s_home_sound, on_nav, (void *)&SOUND);
+        row(g, LV_SYMBOL_IMAGE, TR("Screen", "屏幕"), &s_home_sound, on_nav, (void *)&SOUND);
     } else {
-        row(list, LV_SYMBOL_VOLUME_MAX, SOUND_NAV, &s_home_sound, on_nav, (void *)&SOUND);
+        row(g, LV_SYMBOL_VOLUME_MAX, SOUND_NAV, &s_home_sound, on_nav, (void *)&SOUND);
     }
 #if CONFIG_MUSE_CJK_FONT
-    row(list, LV_SYMBOL_KEYBOARD, TR("Language", "语言"), &s_home_lang, on_nav, (void *)&LANGUAGE);
+    row(g, LV_SYMBOL_KEYBOARD, TR("Language", "语言"), &s_home_lang, on_nav, (void *)&LANGUAGE);
 #endif
-    row(list, LV_SYMBOL_EYE_CLOSE, TR("Sleep", "休眠"), &s_home_sleep, on_nav, (void *)&SLEEP);
-    row(list, LV_SYMBOL_BATTERY_FULL, TR("Battery", "电池"), &s_home_battery, on_nav, (void *)&BATTERY);
+    row(g, LV_SYMBOL_EYE_CLOSE, TR("Sleep", "休眠"), &s_home_sleep, on_nav, (void *)&SLEEP);
+    row(g, LV_SYMBOL_BATTERY_FULL, TR("Battery", "电池"), &s_home_battery, on_nav, (void *)&BATTERY);
 #if CONFIG_MUSE_VIDEO
     if (muse_video_supported()) {
-        row(list, LV_SYMBOL_VIDEO, TR("Phone camera", "手机相机"), &s_home_camera, on_camera, NULL);
+        row(g, LV_SYMBOL_VIDEO, TR("Phone camera", "手机相机"), &s_home_camera, on_camera, NULL);
     }
 #endif
     if (muse_board->power_off) {
-        row(list, LV_SYMBOL_POWER, TR("Power off", "关机"), NULL, on_nav, (void *)&POWER);
+        row(g, LV_SYMBOL_POWER, TR("Power off", "关机"), NULL, on_nav, (void *)&POWER);
     }
     s_about = note(list, "");
 }

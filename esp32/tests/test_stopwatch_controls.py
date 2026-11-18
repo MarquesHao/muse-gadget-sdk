@@ -320,6 +320,7 @@ static void on_power_off(void *p) { (void)p; }
 static void on_back(void *p) { (void)p; }
 static void *page(void *tile, const char *title, bool back, void **list) { (void)tile; (void)title; (void)back; *list = (void *)1; return *list; }
 static void note(void *list, const char *text) { (void)list; strcpy(shown, text); }
+static void *group(void *list) { return list; }   /* the iOS grouped container: a pass-through here */
 static void button(void *list, const char *text, int color, void (*cb)(void *), void *data) { (void)list; (void)text; (void)color; (void)cb; (void)data; }
 ''' + function(source, 'build_power_page') + r'''
 int main(void) {

@@ -125,6 +125,7 @@ static lv_obj_t *s_face;
  * the controls live on their own tile, left of the face. */
 static lv_obj_t *s_quick_tile;
 static lv_obj_t *s_qset_checks[MUSE_GADGET_MODE_COUNT], *s_qset_vol_val, *s_qset_vol_sl;
+static lv_obj_t *s_qset_segments[MUSE_GADGET_MODE_COUNT], *s_qset_segment_labels[MUSE_GADGET_MODE_COUNT];
 static bool s_qset_syncing;   /* quickset_refresh is setting the slider itself */
 static int s_qset_shown_mode = -1, s_qset_shown_vol = -1;   /* what the tile last painted */
 /* Keep these names in sync with GADGET_MODE_NAMES in muse_settings_ui.c:
@@ -689,7 +690,7 @@ static void build_button_icons(lv_obj_t *face)
     lv_obj_align(s_aux_icon, a->align, a->x, a->y);
 }
 
-/* Keep the tile's rows honest while it sits next to the face: the mode
+/* Keep the quick settings tile in sync while it sits next to the face: the mode
  * can also change on the Sound page, and the volume with it. Driven from
  * the same 250 ms chrome tick that refreshes the settings pages; the
  * shown-value cache keeps it a no-op when nothing moved. */
@@ -700,7 +701,14 @@ static void quickset_refresh(void)
     if (gm != s_qset_shown_mode) {
         s_qset_shown_mode = gm;
         for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
-            if (s_qset_checks[i]) {
+            lv_obj_t *seg = s_qset_segments[i];
+            if (seg) {
+                bool selected = i == gm;
+                lv_obj_set_style_bg_opa(seg, selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+                lv_obj_set_style_shadow_width(seg, selected ? 8 : 0, 0);
+                lv_obj_set_style_text_color(s_qset_segment_labels[i],
+                                            lv_color_hex(selected ? COLOR_LIT : 0x8e8e93), 0);
+            } else if (s_qset_checks[i]) {
                 lv_label_set_text(s_qset_checks[i], i == gm ? LV_SYMBOL_OK : "");
             }
         }
@@ -1497,12 +1505,7 @@ static void apply_text_size(void)
 }
 #endif
 
-/* The quick settings tile's contents: the retired tap-face card's
- * controls on their own page — the three gadget modes, the volume
- * slider and (on the minimal-face board) the top-key hint. Rows speak
- * the settings pages' language: dark cards, radius 12. The column
- * starts below the fixed chrome (battery arc and status row) that the
- * minimal-face board keeps on the screen over every tile. */
+/* Start below the fixed chrome on the minimal-face board. */
 static void build_quick_tile(lv_obj_t *tile)
 {
     lv_obj_t *col = lv_obj_create(tile);
@@ -1517,23 +1520,59 @@ static void build_quick_tile(lv_obj_t *tile)
     lv_obj_t *title = make_label(col, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
     lv_label_set_text(title, ui_lang_zh() ? "快速设置" : "Quick settings");
 
-    for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
-        lv_obj_t *row = lv_obj_create(col);
-        lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, lv_pct(100), 48);
-        lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(row, 12, 0);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_hor(row, 14, 0);
-        lv_obj_set_style_pad_column(row, 10, 0);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, on_quickset_mode, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        s_qset_checks[i] = make_label(row, &lv_font_montserrat_20, COLOR_ACCENT);
-        lv_obj_set_width(s_qset_checks[i], 26);
-        lv_obj_t *name = make_label(row, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
-        lv_label_set_text(name, quick_mode_name(i));
+    if (!s_small) {
+        lv_obj_t *track = lv_obj_create(col);
+        lv_obj_remove_style_all(track);
+        lv_obj_set_size(track, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(track, lv_color_hex(0x39393d), 0);
+        lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(track, 10, 0);
+        lv_obj_set_style_pad_all(track, 2, 0);
+        lv_obj_set_flex_flow(track, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_column(track, 2, 0);
+        lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+
+        for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
+            lv_obj_t *seg = lv_button_create(track);
+            lv_obj_remove_style_all(seg);
+            lv_obj_set_flex_grow(seg, 1);
+            lv_obj_set_height(seg, 40);
+            lv_obj_set_ext_click_area(seg, 3);
+            lv_obj_set_style_radius(seg, 8, 0);
+            lv_obj_set_style_bg_color(seg, lv_color_hex(0x636366), 0);
+            /* A press washes lighter at once, before the selection
+             * repaint lands: a segment tap is one-shot (Meeting
+             * leaves the tile), so it must feel answered. */
+            lv_obj_set_style_bg_color(seg, lv_color_hex(0x7a7a7e), LV_STATE_PRESSED);
+            lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, LV_STATE_PRESSED);
+            lv_obj_set_style_shadow_opa(seg, LV_OPA_30, 0);
+            lv_obj_set_style_shadow_ofs_y(seg, 1, 0);
+            lv_obj_add_event_cb(seg, on_quickset_mode, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            lv_obj_t *name = make_label(seg, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_16)), 0x8e8e93);
+            lv_label_set_text(name, quick_mode_name(i));
+            lv_obj_center(name);
+            s_qset_segments[i] = seg;
+            s_qset_segment_labels[i] = name;
+        }
+    } else {
+        for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
+            lv_obj_t *row = lv_obj_create(col);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, lv_pct(100), 48);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), 0);
+            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(row, 12, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_hor(row, 14, 0);
+            lv_obj_set_style_pad_column(row, 10, 0);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, on_quickset_mode, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            s_qset_checks[i] = make_label(row, &lv_font_montserrat_20, COLOR_ACCENT);
+            lv_obj_set_width(s_qset_checks[i], 26);
+            lv_obj_t *name = make_label(row, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
+            lv_label_set_text(name, quick_mode_name(i));
+        }
     }
 
     lv_obj_t *vol_row = lv_obj_create(col);
@@ -1546,21 +1585,35 @@ static void build_quick_tile(lv_obj_t *tile)
     lv_obj_set_flex_align(vol_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(vol_row, 14, 0);
     lv_obj_set_style_pad_column(vol_row, 10, 0);
-    lv_obj_t *vol_name = make_label(vol_row, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
-    lv_label_set_text(vol_name, ui_lang_zh() ? "音量" : "Volume");
+    lv_obj_t *vol_mid = make_label(vol_row, &lv_font_montserrat_16, COLOR_DIM);
+    lv_label_set_text(vol_mid, LV_SYMBOL_VOLUME_MID);
     s_qset_vol_sl = lv_slider_create(vol_row);
+    lv_obj_remove_style_all(s_qset_vol_sl);
+    lv_obj_set_height(s_qset_vol_sl, 6);
+    lv_obj_set_style_bg_color(s_qset_vol_sl, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_qset_vol_sl, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_qset_vol_sl, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_qset_vol_sl, lv_color_hex(COLOR_LIT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_qset_vol_sl, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_qset_vol_sl, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_qset_vol_sl, lv_color_hex(0xffffff), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(s_qset_vol_sl, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_radius(s_qset_vol_sl, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_qset_vol_sl, 8, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(s_qset_vol_sl, 8, LV_PART_KNOB);
+    lv_obj_set_style_shadow_opa(s_qset_vol_sl, LV_OPA_30, LV_PART_KNOB);
+    lv_obj_set_style_shadow_ofs_y(s_qset_vol_sl, 1, LV_PART_KNOB);
     lv_slider_set_range(s_qset_vol_sl, 0, 100);
     lv_slider_set_value(s_qset_vol_sl, muse_settings_volume(), LV_ANIM_OFF);
-    /* Forgiving fingers: the track is a thin line on a 466 px round
-     * screen, so widen the hit area well past the drawn slider (the
-     * settings page's sliders already take 16). Looks unchanged. */
-    lv_obj_set_ext_click_area(s_qset_vol_sl, 16);
+    /* Keep the hit area wider than the thin track: the target keeps
+     * the old bar's height. */
+    lv_obj_set_ext_click_area(s_qset_vol_sl, 19);
     lv_obj_set_flex_grow(s_qset_vol_sl, 1);
     lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_PRESS_LOST, NULL);
-    s_qset_vol_val = make_label(vol_row, muse_lang_montserrat(&lv_font_montserrat_14), COLOR_LIT);
-    lv_obj_set_width(s_qset_vol_val, 30);
+    lv_obj_t *vol_max = make_label(vol_row, &lv_font_montserrat_20, COLOR_DIM);
+    lv_label_set_text(vol_max, LV_SYMBOL_VOLUME_MAX);
 
     if (muse_board->minimal_face) {
         lv_obj_t *keys = make_label(col, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
@@ -1568,7 +1621,7 @@ static void build_quick_tile(lv_obj_t *tile)
                                             : "Top key: hold to talk · tap to call");
     }
 
-    s_qset_shown_mode = s_qset_shown_vol = -1;   /* first refresh paints the checks and the value */
+    s_qset_shown_mode = s_qset_shown_vol = -1;   /* first refresh paints the current settings */
     quickset_refresh();
 }
 
