@@ -122,6 +122,44 @@ class QuickSettingsTileTest(unittest.TestCase):
         # The tile refreshes from the chrome tick, like the settings pages.
         self.assertIn("quickset_refresh();", body_of(self.src, "static void update_chrome"))
 
+    def test_quick_tile_palette_is_neutral_not_violet(self) -> None:
+        # Menu fix round (2026-11-18): Hugh's photos showed this tile in
+        # a lavender wash — the face palette's dim/lit colours are
+        # violet-tinted (0x8b84a8 / 0xf2efff) and the segmented track was
+        # a mid grey the selected segment blended into. The tile now has
+        # neutral iOS greys of its own; the face palette is untouched.
+        build = body_of(self.src, "static void build_quick_tile")
+        self.assertIn("lv_obj_set_style_bg_color(track, lv_color_hex(0x1c1c1e), 0)", build)
+        self.assertIn("0xaeaeb2", build)
+        refresh = body_of(self.src, "static void quickset_refresh")
+        self.assertIn("selected ? 0xffffff : 0xaeaeb2", refresh)
+
+    def test_quick_tile_hint_has_no_tofu_separator(self) -> None:
+        # The middle dot is in neither the Latin face nor the CJK subset
+        # font, so it drew as a tofu box between the hint's two halves.
+        build = body_of(self.src, "static void build_quick_tile")
+        self.assertIn("顶键：按住说话，轻点通话", build)
+        self.assertNotIn("·", build)
+
+    def test_quick_tile_column_centred_on_minimal_face(self) -> None:
+        # The column used to hug the top of the circle and leave its
+        # lower half empty (Hugh's photo, 2026-11-18).
+        build = body_of(self.src, "static void build_quick_tile")
+        self.assertIn("lv_obj_align(col, LV_ALIGN_CENTER, 0, -10)", build)
+
+    def test_chrome_vacates_the_header_off_the_face(self) -> None:
+        # The battery arc and the status row are screen-level chrome: off
+        # the face they sliced through the settings pages' back capsule
+        # and title (Hugh's photos, 2026-11-18). Off-face they hide; the
+        # face tile's chrome is unchanged.
+        chrome = body_of(self.src, "static void update_chrome")
+        self.assertIn("bool off_face = muse_board->minimal_face && page != 1", chrome)
+        self.assertIn("s_chrome_off_face = off_face", chrome)
+        power = body_of(self.src, "static void update_power")
+        self.assertIn("p.battery_pct < 0 || s_chrome_off_face", power)
+        status = body_of(self.src, "static void update_status")
+        self.assertIn("s_dot_shown && !s_chrome_off_face", status)
+
     def test_page_dots_cover_three_tiles(self) -> None:
         self.assertIn("static lv_obj_t *s_dots[3];", self.src)
         self.assertIn("for (int i = 0; i < 3; i++)", self.src)

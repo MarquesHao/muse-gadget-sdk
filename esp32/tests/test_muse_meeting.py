@@ -102,7 +102,8 @@ SETUP = segment(MEETING_C, "static esp_err_t setup(void)", "\n/* setup() to succ
 BEGIN = segment(MEETING_C, "esp_err_t muse_meeting_begin(", "\nbool muse_meeting_write(")
 WRITE = segment(MEETING_C, "bool muse_meeting_write(", "\nesp_err_t muse_meeting_end(")
 END = segment(MEETING_C, "esp_err_t muse_meeting_end(", "\nvoid muse_meeting_console_list(")
-SESSION = segment(VOICE_C, "static void meeting_session(void)", "\nstatic void voice_task(")
+SESSION = segment(VOICE_C, "static esp_err_t meeting_session(void)", "\nstatic void voice_task(")
+START_FAILED = segment(VOICE_C, "static void meeting_start_failed(", "\n/* One 512-byte")
 SALVAGE_ONE = segment(MEETING_C, "static void salvage_one(", "\n/* Caller holds s_lock")
 SALVAGE_ALL = segment(MEETING_C, "static void salvage_orphans(void)",
                       "\n/*\n * Boot-time mount,")
@@ -152,7 +153,7 @@ class WavContractTest(unittest.TestCase):
         self.assertEqual(52 + 4, define_int(MEETING_C, "HDR_OFF_DATA_SIZE"))
 
     def test_block_encoding_seeds_each_block_with_its_first_sample(self):
-        encode = segment(VOICE_C, "static void meet_encode_block(", "\nstatic void meeting_session(")
+        encode = segment(VOICE_C, "static void meet_encode_block(", "\nstatic esp_err_t meeting_session(")
         self.assertIn("out[0] = (uint8_t)(pcm[0] & 0xff)", encode)
         self.assertIn(".pred = pcm[0], .index = 0", encode)
         self.assertIn("MUSE_MEETING_BLOCK_SAMPLES - 1", encode)
@@ -387,17 +388,26 @@ class PowerLossSalvageTest(unittest.TestCase):
 
 
 class SessionPathTest(unittest.TestCase):
-    def test_begin_failure_is_a_plain_storage_caption(self):
-        self.assertIn('muse_state_set_caption("MEETING STORAGE UNAVAILABLE")', SESSION)
-        self.assertIn("s_meet_failed = true", SESSION)
+    def test_begin_failure_returns_the_error_to_the_caller(self):
+        # Menu fix round (2026-11-18): a failed start used to latch
+        # s_meet_failed and put up a plain caption that never expired —
+        # one tap during a memory-tight moment branded storage dead for
+        # the whole visit, and the caption outlived the mode itself.
+        # The session now just reports the error; the caller's policy
+        # (meeting_start_failed) retries transient failures quietly.
+        self.assertIn("esp_err_t berr = muse_meeting_begin(", SESSION)
+        begin_block = SESSION[:SESSION.index("return berr;")]
+        self.assertNotIn("s_meet_failed = true", begin_block)
+        self.assertNotIn("muse_state_set_caption", SESSION[:SESSION.index("muse_state_set_recording(true)")])
         self.assertIn("muse_state_set_mode(MUSE_MODE_IDLE)", SESSION)
 
-    def test_stage_failure_ends_the_file_and_names_memory(self):
+    def test_stage_failure_ends_the_file_and_reports_memory(self):
         alloc = SESSION.index("if (!stage)")
-        block = SESSION[alloc:SESSION.index("return;", alloc)]
+        block = SESSION[alloc:SESSION.index("return ESP_ERR_NO_MEM;", alloc)]
         self.assertIn("muse_meeting_end(0)", block)
-        self.assertIn('muse_state_set_caption("MEETING OUT OF MEMORY")', block)
         self.assertIn("muse_state_set_mode(MUSE_MODE_IDLE)", block)
+        self.assertIn("s_meet_err_oom = true", block)
+        self.assertNotIn("muse_state_set_caption", block)
 
     def test_full_disk_ends_at_the_begin_reported_limit(self):
         self.assertIn("if (++blocks >= max_blocks)", SESSION)
@@ -438,6 +448,55 @@ class SessionPathTest(unittest.TestCase):
         cleared = SESSION.index("muse_state_set_recording(false)")
         ended = SESSION.index("muse_meeting_end(enc_samples)")
         self.assertLess(cleared, ended)
+
+
+class StartFailurePolicyTest(unittest.TestCase):
+    """The caller-side policy for a meeting that won't start (menu fix
+    round, 2026-11-18): transient failures retry quietly, a stuck one
+    reports as an expiring hint, and a mode switch dismisses it."""
+
+    def test_transient_failures_retry_before_any_report(self):
+        self.assertIn("s_meet_tries >= MEET_RETRY_TRIES", START_FAILED)
+        self.assertIn("s_meet_retry_at_us = esp_timer_get_time() + MEET_RETRY_DELAY_US", START_FAILED)
+        task = VOICE_C[VOICE_C.index("static void voice_task("):]
+        self.assertIn("esp_timer_get_time() >= s_meet_retry_at_us", task)
+        self.assertIn("meeting_start_failed(merr)", task)
+
+    def test_a_stuck_failure_reports_as_a_hint_never_a_caption(self):
+        self.assertIn("muse_state_set_hint(msg)", START_FAILED)
+        # Only the stage allocation reports as memory: begin() returns
+        # NO_MEM for a full disk too, and that stays a storage report.
+        self.assertIn('s_meet_err_oom ? "MEETING OUT OF MEMORY"', START_FAILED)
+        self.assertNotIn('muse_state_set_caption("MEETING STORAGE UNAVAILABLE")', VOICE_C)
+        self.assertNotIn('muse_state_set_caption("MEETING OUT OF MEMORY")', VOICE_C)
+
+    def test_no_partition_is_a_hard_failure_that_latches_at_once(self):
+        self.assertIn("err == ESP_ERR_NOT_FOUND", START_FAILED)
+        self.assertIn("s_meet_failed = true", START_FAILED)
+
+    def test_mode_switch_dismisses_the_leftover_hint(self):
+        task = VOICE_C[VOICE_C.index("static void voice_task("):]
+        self.assertIn("gmode != s_last_gmode", task)
+        self.assertIn("muse_state_expire_hint();", task)
+
+    def test_a_session_adopts_the_mode_it_ends_in(self):
+        # A recording stopped BY a mode change posts its SAVED hint after
+        # the switch: the dismissal must not take it for a leftover.
+        self.assertIn("s_last_gmode = muse_settings_gadget_mode();", SESSION)
+
+    def test_a_start_yields_to_a_queued_press(self):
+        # A press queued when a retry comes due is a re-arm request for
+        # the press path, not an instant stop for a fresh session.
+        task = VOICE_C[VOICE_C.index("static void voice_task("):]
+        self.assertIn("xQueuePeek(s_queue, &peek, 0)", task)
+        self.assertIn("&& !press_queued", task)
+
+    def test_a_press_retries_a_latched_failure(self):
+        task = VOICE_C[VOICE_C.index("static void voice_task("):]
+        press = task[task.index("A press outside a running meeting session"):]
+        self.assertIn("s_meet_failed = false", press)
+        self.assertIn('muse_state_set_hint("MEETING - STARTING")', press)
+        self.assertNotIn('muse_state_set_caption("MEETING STORAGE UNAVAILABLE")', press)
 
 
 class InitRetryTest(unittest.TestCase):

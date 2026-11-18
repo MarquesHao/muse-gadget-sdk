@@ -259,6 +259,14 @@ static lv_obj_t *s_state_dot;
 static int s_shown_batt = -2;          /* -2: nothing painted yet */
 static uint32_t s_shown_dot = 0x000000;
 static bool s_dot_shown = true;
+/* Off the face tile (quick settings, settings), the minimal-face
+ * chrome vacates the header band: the battery arc and the status row
+ * used to slice through the settings pages' back capsule and title.
+ * The face tile keeps all of it, exactly as it was. The arc's and the
+ * dot's own updaters consult this flag; the Wi-Fi glyph's HIDDEN flag
+ * is set where the page is computed (update_chrome). */
+static bool s_chrome_off_face;
+static bool s_dot_applied = true;   /* the dot's visibility as last applied */
 /* Minimal-face layout tuning (Hugh's hands-on feedback, 2026-11-16).
  * STATUS_ROW_Y_MINIMAL: the battery arc (424 px across, centred) has
  * its stroke bottoming out at y~27 over the status row's span, and the
@@ -706,8 +714,10 @@ static void quickset_refresh(void)
                 bool selected = i == gm;
                 lv_obj_set_style_bg_opa(seg, selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
                 lv_obj_set_style_shadow_width(seg, selected ? 8 : 0, 0);
+                /* Neutral greys, not the face palette's violet-tinted
+                 * whites: on this page they read as a lavender wash. */
                 lv_obj_set_style_text_color(s_qset_segment_labels[i],
-                                            lv_color_hex(selected ? COLOR_LIT : 0x8e8e93), 0);
+                                            lv_color_hex(selected ? 0xffffff : 0xaeaeb2), 0);
             } else if (s_qset_checks[i]) {
                 lv_label_set_text(s_qset_checks[i], i == gm ? LV_SYMBOL_OK : "");
             }
@@ -1511,20 +1521,28 @@ static void build_quick_tile(lv_obj_t *tile)
     lv_obj_t *col = lv_obj_create(tile);
     lv_obj_remove_style_all(col);
     lv_obj_set_size(col, s_small ? s_w - 16 : 400, LV_SIZE_CONTENT);
-    lv_obj_align(col, LV_ALIGN_TOP_MID, 0, muse_board->minimal_face ? 84 : 48);
+    if (muse_board->minimal_face) {
+        /* Centred on the round screen: the column used to hug the top
+         * and leave the circle's lower half empty. */
+        lv_obj_align(col, LV_ALIGN_CENTER, 0, -10);
+    } else {
+        lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 48);
+    }
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(col, 10, 0);
+    lv_obj_set_style_pad_row(col, 14, 0);
     lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = make_label(col, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), COLOR_LIT);
+    lv_obj_t *title = make_label(col, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), 0xffffff);
     lv_label_set_text(title, ui_lang_zh() ? "快速设置" : "Quick settings");
 
     if (!s_small) {
         lv_obj_t *track = lv_obj_create(col);
         lv_obj_remove_style_all(track);
         lv_obj_set_size(track, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(track, lv_color_hex(0x39393d), 0);
+        /* The page containers' own dark grey: the selected segment's
+         * mid grey has to stand off this, not blend into it. */
+        lv_obj_set_style_bg_color(track, lv_color_hex(0x1c1c1e), 0);
         lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(track, 10, 0);
         lv_obj_set_style_pad_all(track, 2, 0);
@@ -1539,7 +1557,7 @@ static void build_quick_tile(lv_obj_t *tile)
             lv_obj_set_height(seg, 40);
             lv_obj_set_ext_click_area(seg, 3);
             lv_obj_set_style_radius(seg, 8, 0);
-            lv_obj_set_style_bg_color(seg, lv_color_hex(0x636366), 0);
+            lv_obj_set_style_bg_color(seg, lv_color_hex(0x68686b), 0);
             /* A press washes lighter at once, before the selection
              * repaint lands: a segment tap is one-shot (Meeting
              * leaves the tile), so it must feel answered. */
@@ -1548,7 +1566,7 @@ static void build_quick_tile(lv_obj_t *tile)
             lv_obj_set_style_shadow_opa(seg, LV_OPA_30, 0);
             lv_obj_set_style_shadow_ofs_y(seg, 1, 0);
             lv_obj_add_event_cb(seg, on_quickset_mode, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-            lv_obj_t *name = make_label(seg, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_16)), 0x8e8e93);
+            lv_obj_t *name = make_label(seg, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_16)), 0xaeaeb2);
             lv_label_set_text(name, quick_mode_name(i));
             lv_obj_center(name);
             s_qset_segments[i] = seg;
@@ -1585,7 +1603,7 @@ static void build_quick_tile(lv_obj_t *tile)
     lv_obj_set_flex_align(vol_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(vol_row, 14, 0);
     lv_obj_set_style_pad_column(vol_row, 10, 0);
-    lv_obj_t *vol_mid = make_label(vol_row, &lv_font_montserrat_16, COLOR_DIM);
+    lv_obj_t *vol_mid = make_label(vol_row, &lv_font_montserrat_16, 0xaeaeb2);
     lv_label_set_text(vol_mid, LV_SYMBOL_VOLUME_MID);
     s_qset_vol_sl = lv_slider_create(vol_row);
     lv_obj_remove_style_all(s_qset_vol_sl);
@@ -1593,14 +1611,14 @@ static void build_quick_tile(lv_obj_t *tile)
     lv_obj_set_style_bg_color(s_qset_vol_sl, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_qset_vol_sl, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(s_qset_vol_sl, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_qset_vol_sl, lv_color_hex(COLOR_LIT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_qset_vol_sl, lv_color_hex(0xffffff), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(s_qset_vol_sl, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(s_qset_vol_sl, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_qset_vol_sl, lv_color_hex(0xffffff), LV_PART_KNOB);
     lv_obj_set_style_bg_opa(s_qset_vol_sl, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_radius(s_qset_vol_sl, LV_RADIUS_CIRCLE, LV_PART_KNOB);
-    lv_obj_set_style_pad_all(s_qset_vol_sl, 8, LV_PART_KNOB);
-    lv_obj_set_style_shadow_width(s_qset_vol_sl, 8, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_qset_vol_sl, 6, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(s_qset_vol_sl, 6, LV_PART_KNOB);
     lv_obj_set_style_shadow_opa(s_qset_vol_sl, LV_OPA_30, LV_PART_KNOB);
     lv_obj_set_style_shadow_ofs_y(s_qset_vol_sl, 1, LV_PART_KNOB);
     lv_slider_set_range(s_qset_vol_sl, 0, 100);
@@ -1612,13 +1630,16 @@ static void build_quick_tile(lv_obj_t *tile)
     lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_PRESS_LOST, NULL);
-    lv_obj_t *vol_max = make_label(vol_row, &lv_font_montserrat_20, COLOR_DIM);
+    lv_obj_t *vol_max = make_label(vol_row, &lv_font_montserrat_20, 0xaeaeb2);
     lv_label_set_text(vol_max, LV_SYMBOL_VOLUME_MAX);
 
     if (muse_board->minimal_face) {
-        lv_obj_t *keys = make_label(col, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), COLOR_DIM);
-        lv_label_set_text(keys, ui_lang_zh() ? "顶键：按住说话 · 轻点通话"
-                                            : "Top key: hold to talk · tap to call");
+        /* Neutral grey here too (COLOR_DIM is violet-tinted), and a
+         * comma for the separator: the middle dot is in neither the
+         * Latin face nor the CJK subset, so it drew as a tofu box. */
+        lv_obj_t *keys = make_label(col, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), 0xaeaeb2);
+        lv_label_set_text(keys, ui_lang_zh() ? "顶键：按住说话，轻点通话"
+                                            : "Top key: hold to talk, tap to call");
     }
 
     s_qset_shown_mode = s_qset_shown_vol = -1;   /* first refresh paints the current settings */
@@ -2318,6 +2339,17 @@ static void update_chrome(float now)
         /* Three tiles now: quick settings (0), face (1), settings (2). */
         lv_obj_t *active = lv_tileview_get_tile_active(s_tv);
         int page = active == s_settings ? 2 : active == s_face ? 1 : 0;
+        /* Off the face, the header band belongs to the page (see
+         * s_chrome_off_face): the Wi-Fi glyph's flag is set here, the
+         * battery arc and the state dot consult the flag in their own
+         * updaters. */
+        bool off_face = muse_board->minimal_face && page != 1;
+        if (off_face != s_chrome_off_face) {
+            s_chrome_off_face = off_face;
+            if (s_wifi_icon) {
+                lv_obj_set_flag(s_wifi_icon, LV_OBJ_FLAG_HIDDEN, off_face);
+            }
+        }
         bool subpage = page == 2 && muse_settings_ui_in_subpage();
         s_swipe_enabled = page != 2 || !subpage;
         update_tileview_swipe();
@@ -2478,8 +2510,10 @@ static void update_power(float now)
     if (s_batt_arc) {
         /* The arc is the battery readout: length follows the level, green
          * while charging, red when low, near-white otherwise. On USB power
-         * (no battery reading) it hides rather than inventing a level. */
-        if (p.battery_pct < 0) {
+         * (no battery reading) it hides rather than inventing a level; off
+         * the face tile it hides too — there it only crosses the settings
+         * pages' headers (s_chrome_off_face). */
+        if (p.battery_pct < 0 || s_chrome_off_face) {
             if (s_shown_batt != -1) {
                 s_shown_batt = -1;
                 lv_obj_add_flag(s_batt_arc, LV_OBJ_FLAG_HIDDEN);
@@ -2592,7 +2626,11 @@ static void update_status(muse_mode_t mode, float now)
         }
         if (show != s_dot_shown) {
             s_dot_shown = show;
-            lv_obj_set_flag(s_state_dot, LV_OBJ_FLAG_HIDDEN, !show);
+        }
+        bool applied = s_dot_shown && !s_chrome_off_face;
+        if (applied != s_dot_applied) {
+            s_dot_applied = applied;
+            lv_obj_set_flag(s_state_dot, LV_OBJ_FLAG_HIDDEN, !applied);
         }
     }
 

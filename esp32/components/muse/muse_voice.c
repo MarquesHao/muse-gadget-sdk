@@ -1323,6 +1323,44 @@ static void note_toggled(bool on)
  */
 static bool s_meet_armed = true;
 static bool s_meet_failed;
+/* Start-failure policy (meeting_start_failed): how many consecutive
+ * starts have failed this visit, and when the next quiet retry is due. */
+static int s_meet_tries;
+static int64_t s_meet_retry_at_us;
+/* The last start failure was the stage allocation, not begin(): the
+ * two report differently (begin also returns NO_MEM for a full disk,
+ * which is a storage problem, not a memory one). */
+static bool s_meet_err_oom;
+#define MEET_RETRY_TRIES 3
+#define MEET_RETRY_DELAY_US 1500000
+/* The gadget mode the voice loop saw last pass, for the mode-switch
+ * hint dismissal in voice_task. */
+static int s_last_gmode = -1;
+
+/* A meeting start failed. begin()'s own setup already re-arms after a
+ * failure, because the usual cause is a first use that lost the memory
+ * race while the device was busy — transient, and worth retrying
+ * quietly before the user hears about it. Only after MEET_RETRY_TRIES
+ * consecutive failures does the visit latch as failed, and what it
+ * shows is a hint: it expires on its own, and a mode switch dismisses
+ * it (voice_task). A board with no storage partition at all
+ * (ESP_ERR_NOT_FOUND) can never succeed, so it latches at once. */
+static void meeting_start_failed(esp_err_t err)
+{
+    if (err == ESP_ERR_NOT_FOUND) {
+        s_meet_tries = MEET_RETRY_TRIES;
+    } else if (s_meet_tries < MEET_RETRY_TRIES) {
+        s_meet_tries++;
+    }
+    if (s_meet_tries >= MEET_RETRY_TRIES) {
+        s_meet_failed = true;
+        const char *msg = s_meet_err_oom ? "MEETING OUT OF MEMORY"
+                                         : "MEETING STORAGE UNAVAILABLE";
+        muse_state_set_hint(msg);
+    } else {
+        s_meet_retry_at_us = esp_timer_get_time() + MEET_RETRY_DELAY_US;
+    }
+}
 
 /* One 512-byte WAV IMA block from 1017 samples: the first sample travels
  * as the block preamble (predictor, index 0) and the encoder is seeded
@@ -1337,26 +1375,29 @@ static void meet_encode_block(const int16_t *pcm, uint8_t out[MUSE_MEETING_BLOCK
     muse_adpcm_encode_block(&enc, pcm + 1, MUSE_MEETING_BLOCK_SAMPLES - 1, out + 4);
 }
 
-static void meeting_session(void)
+static esp_err_t meeting_session(void)
 {
     char name[20];
     uint32_t max_blocks = 0;
-    if (muse_meeting_begin(name, sizeof(name), &max_blocks) != ESP_OK) {
-        s_meet_failed = true;
+    esp_err_t berr = muse_meeting_begin(name, sizeof(name), &max_blocks);
+    if (berr != ESP_OK) {
+        /* No latch and no caption here: the caller owns the failure
+         * policy (meeting_start_failed) — a transient failure retries
+         * quietly instead of reporting storage dead on a single tap. */
+        s_meet_err_oom = false;
         muse_state_set_mode(MUSE_MODE_IDLE);
-        muse_state_set_caption("MEETING STORAGE UNAVAILABLE");
-        return;
+        return berr;
     }
     int16_t *stage = heap_caps_malloc((MUSE_MEETING_BLOCK_SAMPLES + MUSE_AUDIO_CHUNK) * sizeof(int16_t),
                                       MUSE_BIG_CAPS);
     if (!stage) {
         muse_meeting_end(0);
-        s_meet_failed = true;
         /* Set IDLE explicitly, like the begin() failure above: do not
-         * rely on the caller always entering here already in IDLE. */
+         * rely on the caller always entering here already in IDLE. The
+         * caller reports it under the same retry policy as begin(). */
         muse_state_set_mode(MUSE_MODE_IDLE);
-        muse_state_set_caption("MEETING OUT OF MEMORY");
-        return;
+        s_meet_err_oom = true;
+        return ESP_ERR_NO_MEM;
     }
     muse_state_set_mode(MUSE_MODE_IDLE);
     muse_state_set_recording(true);
@@ -1459,6 +1500,12 @@ static void meeting_session(void)
     ESP_LOGI(TAG, "meeting %s: %s, %" PRIu32 " captured, %" PRIu32 " written in %" PRIu32 " blocks",
              name, full ? "storage full" : error ? "error" : stop_press ? "press stop" : "mode change/shutdown",
              total, enc_samples, blocks);
+    /* The mode may have changed under this session (one of its stop
+     * reasons): adopt it, so the loop's mode-switch dismissal does not
+     * take the result hint posted above for a leftover from the mode
+     * just left — this session posted it after the switch. */
+    s_last_gmode = muse_settings_gadget_mode();
+    return ESP_OK;
 }
 
 static void voice_task(void *arg)
@@ -1533,16 +1580,40 @@ static void voice_task(void *arg)
                 }
                 continue;
             }
+            /* A gadget-mode switch dismisses a hint left over from the
+             * mode just left — the meeting storage error above all, which
+             * used to sit on the face forever. Only hints go: replies and
+             * the save-failed caption are plain captions and stay. */
+            int gmode = muse_settings_gadget_mode();
+            if (s_last_gmode >= 0 && gmode != s_last_gmode) {
+                muse_state_expire_hint();
+            }
+            s_last_gmode = gmode;
             /* Meeting mode records instead of idling (see meeting_session). */
-            if (muse_settings_gadget_mode() == MUSE_GADGET_MODE_MEETING) {
-                if (s_meet_armed && !s_meet_failed && !atomic_load(&s_shutdown)) {
-                    meeting_session();
+            if (gmode == MUSE_GADGET_MODE_MEETING) {
+                /* A press already queued belongs to the press path below
+                 * (it re-arms), not to a session that would read it as
+                 * an instant stop. */
+                muse_input_event_t peek;
+                bool press_queued = xQueuePeek(s_queue, &peek, 0) == pdTRUE
+                                    && peek.type == MUSE_PTT_DOWN;
+                if (s_meet_armed && !s_meet_failed && !atomic_load(&s_shutdown)
+                    && esp_timer_get_time() >= s_meet_retry_at_us && !press_queued) {
+                    esp_err_t merr = meeting_session();
+                    if (merr != ESP_OK) {
+                        meeting_start_failed(merr);
+                    } else {
+                        s_meet_tries = 0;
+                        s_meet_retry_at_us = 0;
+                    }
                     pre_reset();
                     continue;
                 }
             } else {
                 s_meet_armed = true;   /* re-arm for the next visit */
                 s_meet_failed = false;
+                s_meet_tries = 0;
+                s_meet_retry_at_us = 0;
             }
             /* The 20 ms read paces this loop. */
             idle_capture();
@@ -1560,17 +1631,17 @@ static void voice_task(void *arg)
             wake = ev.wake;
             if (muse_settings_gadget_mode() == MUSE_GADGET_MODE_MEETING) {
                 /* A press outside a running meeting session: re-arm (the
-                 * recording starts on the next loop pass), or repeat why
-                 * recording is unavailable. A waking press only wakes. */
+                 * recording starts on the next loop pass), clearing any
+                 * latched start failure so the press retries it. A waking
+                 * press only wakes. */
                 muse_input_clear_call_pending(ev.mark);
                 if (!ev.wake) {
                     muse_state_set_mode(MUSE_MODE_IDLE);
-                    if (s_meet_failed) {
-                        muse_state_set_caption("MEETING STORAGE UNAVAILABLE");
-                    } else {
-                        s_meet_armed = true;
-                        muse_state_set_caption("MEETING - STARTING");
-                    }
+                    s_meet_failed = false;
+                    s_meet_tries = 0;
+                    s_meet_retry_at_us = 0;
+                    s_meet_armed = true;
+                    muse_state_set_hint("MEETING - STARTING");
                 }
                 pre_reset();
                 continue;

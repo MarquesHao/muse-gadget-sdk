@@ -165,6 +165,19 @@ bool muse_state_hint_pending(void)
     return pending;
 }
 
+void muse_state_expire_hint(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    if (s_hint_until_us) {
+        s_hint_until_us = 0;
+        if (s_caption[0]) {
+            s_caption[0] = '\0';
+            s_caption_version++;   /* the UI redraws: the hint is gone */
+        }
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
 bool muse_state_caption(char *out, size_t out_len, uint32_t *version)
 {
     bool changed = false;

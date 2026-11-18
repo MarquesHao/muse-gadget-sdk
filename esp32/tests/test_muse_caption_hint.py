@@ -170,6 +170,20 @@ int main(int argc, char **argv) {
         muse_text_keep_latin();
         muse_state_set_caption("%s", "\u201cXin chào\u201d");
         assert(look() && strcmp(shown, "\"Xin chào\"") == 0);
+    } else if (test == 9) {   /* expire_hint dismisses a hint now, and only a hint */
+        muse_state_set_hint("MEETING STORAGE UNAVAILABLE");
+        assert(look() && strcmp(shown, "MEETING STORAGE UNAVAILABLE") == 0);
+        muse_state_expire_hint();
+        assert(look() && shown[0] == 0);
+        assert(!muse_state_hint_pending());
+        muse_state_expire_hint();   /* nothing pending: no redraw */
+        assert(!look());
+        muse_state_set_caption("MEETING SAVE FAILED");
+        assert(look() && strcmp(shown, "MEETING SAVE FAILED") == 0);
+        muse_state_expire_hint();   /* a plain caption is not a hint: untouched */
+        assert(!look());
+        later(MUSE_HINT_MS * 2);
+        assert(!look());
     } else {
         return 2;
     }
@@ -239,13 +253,18 @@ class CaptionHint(unittest.TestCase):
     def test_accents_and_punctuation_are_preserved(self):
         self.run_case(8)
 
+    def test_expire_hint_dismisses_only_hints(self):
+        self.run_case(9)
+
     def test_only_transient_notices_are_hints(self):
         voice = (MUSE / "muse_voice.c").read_text()
         # Replies, errors from Muse and status stay up: go_idle() keeps a plain caption.
         self.assertNotIn("muse_state_set_hint", function(voice, "go_idle"))
-        # too_short()'s notice, worded for press-toggle notes or for holding.
+        # too_short()'s notice, worded for press-toggle notes or for holding,
+        # and the meeting press path's starting notice (a hint since the
+        # 2026-11-18 fix round: it must not outlive the mode either).
         self.assertEqual(re.findall(r'muse_state_set_hint\("([^"]*)"\)', voice),
-                         ["RECORD A LONGER NOTE", "HOLD LONGER TO TALK"])
+                         ["RECORD A LONGER NOTE", "HOLD LONGER TO TALK", "MEETING - STARTING"])
         self.assertIn("muse_state_set_hint", function(voice, "too_short"))
         self.assertNotIn('go_idle("HOLD LONGER TO TALK")', voice)
         self.assertNotIn('go_idle("RECORD A LONGER NOTE")', voice)

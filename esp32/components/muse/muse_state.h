@@ -70,6 +70,10 @@ bool muse_state_caption(char *out, size_t out_len, uint32_t *version);
 void muse_state_set_hint(const char *text);
 /* Whether the caption is a hint that hasn't expired yet. */
 bool muse_state_hint_pending(void);
+/* Dismiss a pending hint now instead of at its expiry — the context it
+ * belonged to is gone (a gadget-mode switch above all). Plain captions
+ * are not hints and are left exactly as they are. */
+void muse_state_expire_hint(void);
 
 /* How much reply text the screen shows at once, set by the UI: lines of up to
  * `cols` characters. The replies are wrapped and paged to fit. A screen that

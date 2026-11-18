@@ -223,12 +223,16 @@ static const char *hatch_state_display_name(muse_hatch_state_t state)
 #define SOUND_TITLE TR("SOUND", "声音")
 #define SOUND_NAV TR("Sound", "声音")
 #define SOUND_MODE_HINT TR("Mode:", "模式：")
+/* Short enough to read whole above the fold on the round screen: the
+ * old copy ran to four CJK lines and the last one fell off the circle's
+ * bottom chord at rest (Hugh's photo, 2026-11-18). The page still
+ * scrolls for the controls below; the paragraph itself now fits. */
 #define SOUND_MODE_DESC                                                                                                \
-    TR("Voice call: tap the top button to talk live, or hold it to send a voice note. "                                 \
-       "Text replies: hold to talk; replies are shown, not spoken. Meeting: records to the "                           \
-       "device until the top button is pressed again; files stay on the device.",                                      \
-       "语音通话：点顶部键实时通话，或按住发语音条。文字回复：按住说话，回复只显示文字、不出声。"                       \
-       "会议录音：录音存到设备里，再按一次顶部键停止；文件只留在设备上。")
+    TR("Voice call: tap the top key to talk, hold for a voice note. "                                                  \
+       "Text replies: hold to talk; replies show as text only. Meeting: records onto the "                             \
+       "device until the top key is pressed again.",                                                                   \
+       "语音通话：轻点顶部键通话，按住发语音条。文字回复：按住说话，只回文字。"                                         \
+       "会议录音：录进设备，再按顶部键停。")
 #define SOUND_SPEAKER TR("Speaker", "扬声器")
 #define SOUND_VOLUME TR("Volume", "音量")
 #define SOUND_GAIN TR("Mic gain", "麦克风增益")
