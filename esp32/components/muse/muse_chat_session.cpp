@@ -29,7 +29,10 @@
  *   3. Each finished message is shown at reading pace (see start_tts to
  *      speak it with a TTS API of your own; Muse doesn't speak gadget replies).
  * A turn has no explicit end event; like Sidekick, it settles once every
- * message is done and nothing has arrived for a few seconds.
+ * message is done and nothing has arrived for a few seconds. Speech waits
+ * for that settle and then speaks only the turn's last message: a sender
+ * that posts working notes before its answer would otherwise have each
+ * one read aloud. The earlier messages are shown, never spoken.
  *
  * Everything network-side runs on one task. The voice task talks to it through
  * a command queue, a stream buffer of mic audio, an event queue (captions) and
@@ -147,6 +150,7 @@ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP
 #define REPLY_TIMEOUT_US (60 * 1000000LL)  /* chat posted -> first assistant message */
 #define TURN_CAP_US (180 * 1000000LL)
 #define SETTLE_US (3 * 1000000LL)          /* quiet period that ends a turn */
+#define HOLD_CAP_US (60 * 1000000LL)       /* a held reply is spoken anyway after this, settle or not */
 #define BUSY_HOLD_US (20 * 1000000LL)      /* how long a busy agent keeps it open */
 #define TEXT_REPLY_TIMEOUT_US (5 * 60 * 1000000LL)   /* typed turns: agents can work a while */
 #define TEXT_TURN_CAP_US (15 * 60 * 1000000LL)
@@ -230,7 +234,7 @@ static stream_t s_streams[MAX_STREAMS];
 
 enum phase_t : uint8_t { P_IDLE, P_LISTEN, P_WAIT_FINAL, P_WAIT_REPLY };
 
-enum tts_t : uint8_t { TTS_NONE, TTS_QUEUED, TTS_ACTIVE, TTS_FINISHED };
+enum tts_t : uint8_t { TTS_NONE, TTS_HELD, TTS_QUEUED, TTS_ACTIVE, TTS_FINISHED };
 
 struct msg_t {
     char id[80];
@@ -296,6 +300,7 @@ struct turn_t {
     int tts_status;          /* HTTP status of the current fetch, 0 until known */
     bool detached;           /* the reply is slow: a notice is said, the turn ends, the reply starts another */
     bool incoming;           /* plays a reply to a request that outlived its turn */
+    int64_t held_since_us;   /* when the turn's first finished message was held for the settle, 0 while none is */
 };
 
 /*
@@ -1567,9 +1572,71 @@ static void message_done(int i, const char *final_text)
         append_text(m, final_text);
     }
     if (m.len && m.tts == TTS_NONE) {
-        m.tts = TTS_QUEUED;
+        /* A message this turn will speak is held until the reply settles
+         * (release_held): only the turn's last message is ever fetched.
+         * One that will only be shown (speaker off, text mode) is queued
+         * at once, paced by silence as before. */
+        if (muse_settings_speaker_on() && muse_settings_gadget_mode() != MUSE_GADGET_MODE_TEXT) {
+            m.tts = TTS_HELD;
+            if (!s_turn.held_since_us) {
+                s_turn.held_since_us = now_us();
+            }
+        } else {
+            m.tts = TTS_QUEUED;
+        }
     }
     ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)m.len);
+}
+
+/*
+ * Releases a spoken turn's held messages once the reply has settled: the
+ * last one is queued for speech, the rest are done — shown as they arrived,
+ * never spoken. The reply settles as check_turn tests a turn's end, on the
+ * content clock (last_content_us, so status events alone don't restart the
+ * wait): every message done, no new message for SETTLE_US, and an agent
+ * that still says it's working given its BUSY_HOLD_US — a working note
+ * followed a few quiet seconds later by the answer is not spoken first.
+ * HOLD_CAP_US bounds the wait whatever the agent says (its messages keep
+ * coming, say): the latest held message is spoken anyway rather than
+ * never, and a later one is held and released as a wave of its own. A
+ * cancelled turn never reaches this: its state is finished or wiped
+ * before the loop runs again.
+ */
+static void release_held(void)
+{
+    if (s_turn.phase != P_WAIT_REPLY || !s_turn.held_since_us) {
+        return;
+    }
+    int last = -1;
+    for (int i = 0; i < s_turn.nmsgs; i++) {
+        const msg_t &m = s_turn.msgs[i];
+        if (!m.done) {
+            return;   /* still arriving: which message is the last isn't known yet */
+        }
+        if (m.tts == TTS_HELD) {
+            last = i;
+        }
+    }
+    if (last < 0) {
+        s_turn.held_since_us = 0;
+        return;
+    }
+    int64_t t = now_us();
+    bool settled = t - s_turn.last_content_us >= SETTLE_US &&
+                   (s_turn.detached || !s_turn.agent_busy || t - s_turn.last_content_us >= BUSY_HOLD_US);
+    if (!settled && t - s_turn.held_since_us < HOLD_CAP_US) {
+        return;
+    }
+    for (int i = 0; i < last; i++) {
+        msg_t &m = s_turn.msgs[i];
+        if (m.tts == TTS_HELD) {
+            m.tts = TTS_FINISHED;
+            ESP_LOGI(TAG, "message %s: held back; only the turn's last message is spoken", m.id);
+        }
+    }
+    s_turn.msgs[last].tts = TTS_QUEUED;
+    s_turn.held_since_us = 0;
+    ESP_LOGI(TAG, "message %s: the reply has settled; speaking its last message", s_turn.msgs[last].id);
 }
 
 /* A piece of message i's text, shown. */
@@ -2252,7 +2319,8 @@ static void check_turn(void)
     bool text = s_turn.text;
     bool complete = s_turn.nmsgs > 0;
     for (int i = 0; i < s_turn.nmsgs; i++) {
-        if (!s_turn.msgs[i].done || s_turn.msgs[i].tts == TTS_QUEUED || s_turn.msgs[i].tts == TTS_ACTIVE) {
+        if (!s_turn.msgs[i].done || s_turn.msgs[i].tts == TTS_HELD || s_turn.msgs[i].tts == TTS_QUEUED ||
+            s_turn.msgs[i].tts == TTS_ACTIVE) {
             complete = false;
             break;
         }
@@ -2691,6 +2759,7 @@ static void hatch_task(void *arg)
             continue;
         }
         if (s_turn.phase == P_WAIT_REPLY) {
+            release_held();
             start_tts();
             decode();
         }
@@ -2930,7 +2999,9 @@ static int reply_message_at(size_t played)
     int message = -1;
     for (int i = 0; i < s_turn.nmsgs; i++) {
         const msg_t &m = s_turn.msgs[i];
-        if (m.tts >= TTS_ACTIVE && m.len && m.pcm_start <= played) message = i;
+        /* A message held back from speech ends TTS_FINISHED without ever
+         * playing (pcm_end 0): it must not take the cursor from one that did. */
+        if (m.tts >= TTS_ACTIVE && m.len && m.pcm_start <= played && (m.tts == TTS_ACTIVE || m.pcm_end)) message = i;
     }
     return message;
 }

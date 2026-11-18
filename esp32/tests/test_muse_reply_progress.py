@@ -61,6 +61,11 @@ int main() {
  assert(close(muse_turn_progress(95*MIC_RATE,&message),.5f));
  s_turn.msgs[1].tts=TTS_FINISHED; s_turn.msgs[1].pcm_end=100*MIC_RATE;
  assert(muse_turn_progress(100*MIC_RATE,nullptr)==1);
+ /* A message held back from speech ends finished without ever playing
+  * (pcm_end 0): it must not take the cursor from the one that is playing. */
+ s_turn.nmsgs=2; s_turn.msgs[0]={6000,TTS_ACTIVE,0,90*MIC_RATE};
+ s_turn.msgs[1]={40,TTS_FINISHED,0,0};
+ assert(close(muse_turn_progress(45*MIC_RATE,&message),.5f) && message==0);
  /* Caption-only message holds its final page while queued silence drains. */
  s_turn.nmsgs=1; m={1000,TTS_ACTIVE,0,10*MIC_RATE};
  assert(close(muse_turn_progress(5*MIC_RATE,&message),.5f));

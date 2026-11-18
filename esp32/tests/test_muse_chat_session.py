@@ -100,9 +100,12 @@ bool muse_hatch_configured() { return true; }
 static void resampler_init(resampler_t *, int, int) {}
 static void on_dictation_end(bool) {}
 static void log_marks() {}
-/* The cases here are the speaker-off ones: replies are shown, not fetched. */
-bool muse_settings_speaker_on(void) { return false; }
-int muse_settings_gadget_mode(void) { return 0; }
+/* Most cases here are the speaker-off ones: replies are shown, not fetched.
+ * The held-reply cases turn the fake speaker on (one goes to text mode). */
+static bool fake_speaker_on;
+bool muse_settings_speaker_on(void) { return fake_speaker_on; }
+static int fake_gadget_mode;
+int muse_settings_gadget_mode(void) { return fake_gadget_mode; }
 #define MUSE_GADGET_MODE_TEXT 1
 /* start_tts readies the decoder for a fetch the speaker-off cases never make. */
 void mp3dec_init(mp3dec_t *) {}
@@ -115,8 +118,16 @@ void muse_text_to_ascii(char *, size_t) {}
 void muse_text_to_caption(char *, size_t) {}
 #endif
 ''' + kinds + r'''static char chat_body[256];
+static int tts_fetches;
+static char tts_path[288];
 static int64_t open_stream(kind_t kind, const char *verb, const char *path, const char *, const char *,
                            const char *body, bool end_body) {
+    if (kind == K_TTS) {   /* a speech fetch: record which message it asks for */
+        assert(!strcmp(verb, "GET") && end_body);
+        tts_fetches++;
+        strlcpy(tts_path, path, sizeof(tts_path));
+        return 9;
+    }
     assert(kind == K_CHAT && !strcmp(verb, "POST") && !strcmp(path, "/chat/stream") && body && end_body);
     strlcpy(chat_body, body, sizeof(chat_body));
     return 7;
@@ -684,6 +695,122 @@ static void late_rows_by_their_own_order_and_content() {
     assert(s_turn.nmsgs == 3 && !strcmp(s_turn.msgs[0].id, "late") && s_turn.msgs[0].done);
     assert(s_turn.msgs[0].len == 6 && s_turn.msgs[1].done && !strcmp(s_turn.msgs[2].id, "outer"));
 }
+/* Spoken turns (the fake speaker is on): finished messages are held until
+ * the reply settles, and only the last of them is ever fetched. */
+static void held_until_settle_then_only_last() {
+    fake_speaker_on = true;
+    tts_fetches = 0;
+    begin();
+    event("message.assistant", "first", "note", "Working on it");
+    event("message.assistant", "second", "note", "Still working");
+    event("message.assistant", "third", "note", "The answer");
+    assert(s_turn.nmsgs == 3 && s_turn.held_since_us);
+    for (int i = 0; i < 3; i++) assert(s_turn.msgs[i].tts == TTS_HELD);
+    release_held();   /* the last event just arrived: nothing has settled yet */
+    for (int i = 0; i < 3; i++) assert(s_turn.msgs[i].tts == TTS_HELD);
+    clock_us += SETTLE_US + 1;
+    release_held();
+    assert(s_turn.msgs[0].tts == TTS_FINISHED && s_turn.msgs[1].tts == TTS_FINISHED);
+    assert(s_turn.msgs[2].tts == TTS_QUEUED && !s_turn.held_since_us);
+    start_tts();
+    assert(s_turn.msgs[2].tts == TTS_ACTIVE && s_turn.tts_msg == 2);
+    assert(tts_fetches == 1 && strstr(tts_path, "message_id=third"));
+    fake_speaker_on = false;
+}
+static void single_message_held_for_the_settle_only() {
+    fake_speaker_on = true;
+    tts_fetches = 0;
+    begin();
+    event("message.assistant", "only", "note", "The whole answer");
+    assert(s_turn.msgs[0].tts == TTS_HELD);
+    release_held();
+    assert(s_turn.msgs[0].tts == TTS_HELD && !tts_fetches);
+    clock_us += SETTLE_US + 1;
+    release_held();
+    assert(s_turn.msgs[0].tts == TTS_QUEUED);
+    start_tts();
+    assert(s_turn.msgs[0].tts == TTS_ACTIVE && tts_fetches == 1 && strstr(tts_path, "message_id=only"));
+    fake_speaker_on = false;
+}
+static void held_messages_die_with_the_turn() {
+    fake_speaker_on = true;
+    tts_fetches = 0;
+    begin();
+    event("message.assistant", "first", "note", "Working on it");
+    event("message.assistant", "second", "note", "The answer");
+    assert(s_turn.msgs[0].tts == TTS_HELD && s_turn.msgs[1].tts == TTS_HELD);
+    turn_finish();   /* the press that cancels: the session task ends the turn */
+    clock_us += HOLD_CAP_US + 1;
+    release_held();   /* no longer in a reply phase: nothing is released */
+    assert(s_turn.msgs[0].tts == TTS_HELD && s_turn.msgs[1].tts == TTS_HELD && !tts_fetches);
+    begin();   /* a new turn wipes the held messages with the rest of the state */
+    assert(!s_turn.nmsgs && !s_turn.held_since_us);
+    release_held();
+    assert(!tts_fetches);
+    fake_speaker_on = false;
+}
+static void hold_cap_speaks_without_quiet() {
+    fake_speaker_on = true;
+    tts_fetches = 0;
+    begin();
+    status("working");
+    event("message.assistant", "first", "note", "Working on it");
+    /* Muse keeps working and a fresh message lands every 10 s: the content
+     * clock never ages into the settle or the busy hold... */
+    const char *ids[] = {"second", "third", "fourth", "fifth", "sixth"};
+    for (int k = 0; k < 5; k++) {
+        clock_us += 10 * 1000000LL;
+        event("message.assistant", ids[k], "note", "Still working");
+        release_held();
+        assert(s_turn.held_since_us && s_turn.msgs[s_turn.nmsgs - 1].tts == TTS_HELD);
+    }
+    /* ...but at the cap the latest one is spoken anyway. */
+    clock_us += 11 * 1000000LL;
+    release_held();
+    assert(s_turn.nmsgs == 6 && !s_turn.held_since_us);
+    for (int i = 0; i < 5; i++) assert(s_turn.msgs[i].tts == TTS_FINISHED);
+    assert(s_turn.msgs[5].tts == TTS_QUEUED);
+    fake_speaker_on = false;
+}
+static void streaming_and_busy_do_not_release_early() {
+    fake_speaker_on = true;
+    tts_fetches = 0;
+    begin();
+    status("working");
+    event("delta.message_start", "first", "note");
+    event("delta.text_append", "first", "", "Working on it");
+    event("delta.message_done", "first");
+    event("delta.message_start", "second", "note");
+    event("delta.text_append", "second", "", "The answer");
+    assert(s_turn.msgs[0].tts == TTS_HELD && !s_turn.msgs[1].done);
+    clock_us += SETTLE_US + 1;
+    release_held();   /* the second message is still arriving: nothing is released */
+    assert(s_turn.msgs[0].tts == TTS_HELD && s_turn.msgs[1].tts == TTS_NONE);
+    event("delta.message_done", "second");
+    assert(s_turn.msgs[1].tts == TTS_HELD);
+    clock_us += SETTLE_US + 1;
+    release_held();   /* Muse still says it's working: its hold hasn't run out */
+    assert(s_turn.agent_busy);
+    assert(s_turn.msgs[0].tts == TTS_HELD && s_turn.msgs[1].tts == TTS_HELD);
+    status("online");   /* done now: the settle that already passed releases them */
+    release_held();
+    assert(s_turn.msgs[0].tts == TTS_FINISHED && s_turn.msgs[1].tts == TTS_QUEUED);
+    fake_speaker_on = false;
+}
+static void shown_replies_are_never_held() {
+    /* Text mode: no speech to protect, messages queue at once as before. */
+    fake_speaker_on = true;
+    fake_gadget_mode = MUSE_GADGET_MODE_TEXT;
+    begin();
+    event("message.assistant", "reply", "note", "Shown, not spoken");
+    assert(s_turn.msgs[0].tts == TTS_QUEUED && !s_turn.held_since_us);
+    /* Speaker off in call mode: the same, paced by silence. */
+    fake_speaker_on = false;
+    fake_gadget_mode = 0;
+    begin();
+    event("message.assistant", "reply", "note", "Shown, not spoken");
+    assert(s_turn.msgs[0].tts == TTS_QUEUED && !s_turn.held_since_us);
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     switch (atoi(argv[1])) {
@@ -715,6 +842,12 @@ int main(int argc, char **argv) {
     case 28: others_status_and_late_play(); break;
     case 29: chained_and_mid_stream_replies(); break;
     case 30: late_rows_by_their_own_order_and_content(); break;
+    case 31: held_until_settle_then_only_last(); break;
+    case 32: single_message_held_for_the_settle_only(); break;
+    case 33: held_messages_die_with_the_turn(); break;
+    case 34: hold_cap_speaks_without_quiet(); break;
+    case 35: streaming_and_busy_do_not_release_early(); break;
+    case 36: shown_replies_are_never_held(); break;
 #if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
     case 18: typed_turns_replace_the_review(); break;
     case 19: review_keeps_the_whole_reply(); break;
@@ -853,3 +986,21 @@ int main(int argc, char **argv) {
 
     def test_late_turn_takes_chained_rows_and_never_half_a_message(self):
         self.run_case(29)
+
+    def test_spoken_turn_speaks_only_its_last_message_after_the_settle(self):
+        self.run_case(31)
+
+    def test_single_spoken_reply_waits_only_for_the_settle(self):
+        self.run_case(32)
+
+    def test_held_messages_are_never_spoken_after_the_turn_is_cancelled(self):
+        self.run_case(33)
+
+    def test_held_reply_is_spoken_at_the_cap_when_the_content_never_quiets(self):
+        self.run_case(34)
+
+    def test_streaming_message_and_busy_agent_do_not_release_held_ones(self):
+        self.run_case(35)
+
+    def test_shown_replies_in_text_mode_or_speaker_off_are_not_held(self):
+        self.run_case(36)
