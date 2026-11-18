@@ -242,25 +242,38 @@ class QuickSettingsTileTest(unittest.TestCase):
         status = body_of(self.src, "static void update_status")
         self.assertIn("s_dot_shown && !s_chrome_off_face", status)
 
-    def test_chrome_apply_is_the_single_writer_for_all_four(self) -> None:
+    def test_chrome_apply_is_the_single_writer_for_the_three(self) -> None:
         # Style round (2026-11-18): the menufix round's hide never took
         # effect on the real device (Hugh's photos) — its flag was only
         # consulted inside update_status/update_power, which the frame
-        # tick never reaches off the face, and the ring was not in the
-        # set at all. chrome_off_face_apply() now writes all four
-        # HIDDEN flags on the tile transition itself, resets the two
-        # owners' paint caches so they repaint on return, and logs the
-        # transition as on-device evidence.
+        # tick never reaches off the face. chrome_off_face_apply() now
+        # writes the HIDDEN flags on the tile transition itself, resets
+        # the two owners' paint caches so they repaint on return, and
+        # logs the transition as on-device evidence.
+        # Ring round (2026-11-18): the status ring is NOT in the set —
+        # Hugh wants the purple ring on every page. The style round hid
+        # it with the rest; that was one item too many, so the apply
+        # must not touch s_ring at all.
         chrome = body_of(self.src, "static void update_chrome")
         self.assertIn("chrome_off_face_apply(off_face)", chrome)
         self.assertIn('ESP_LOGI(TAG, "chrome: %s (tile %d)"', chrome)
         apply = body_of(self.src, "static void chrome_off_face_apply")
         self.assertIn("lv_obj_set_flag(s_wifi_icon, LV_OBJ_FLAG_HIDDEN, off)", apply)
-        self.assertIn("lv_obj_set_flag(s_ring, LV_OBJ_FLAG_HIDDEN, off)", apply)
         self.assertIn("lv_obj_add_flag(s_batt_arc, LV_OBJ_FLAG_HIDDEN)", apply)
         self.assertIn("s_shown_batt = -1", apply)
         self.assertIn("lv_obj_add_flag(s_state_dot, LV_OBJ_FLAG_HIDDEN)", apply)
         self.assertIn("s_dot_applied = false", apply)
+        self.assertNotIn("s_ring", apply)
+
+    def test_ring_stays_visible_on_every_tile(self) -> None:
+        # The purple status ring is the screen's frame: it must never
+        # be hidden by tile changes. Its only remaining HIDDEN write
+        # anywhere is the rectangle boards' full-reply path, which the
+        # round 1.75C never takes (guarded by !muse_board->round).
+        self.assertEqual(self.src.count("lv_obj_set_flag(s_ring, LV_OBJ_FLAG_HIDDEN"), 1)
+        self.assertIn("if (!muse_board->round && s_ring)", self.src)
+        self.assertNotIn("lv_obj_add_flag(s_ring, LV_OBJ_FLAG_HIDDEN)", self.src)
+        self.assertNotIn("lv_obj_remove_flag(s_ring, LV_OBJ_FLAG_HIDDEN)", self.src)
 
     def test_page_dots_cover_three_tiles(self) -> None:
         self.assertIn("static lv_obj_t *s_dots[3];", self.src)

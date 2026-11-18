@@ -263,17 +263,19 @@ static lv_obj_t *s_state_dot;
 static int s_shown_batt = -2;          /* -2: nothing painted yet */
 static uint32_t s_shown_dot = 0x000000;
 static bool s_dot_shown = true;
-/* Off the face tile (quick settings, settings), the minimal-face
- * chrome vacates the screen: the battery arc, the status ring, the
- * state dot and the Wi-Fi glyph used to slice through the other
- * tiles' pages. The face tile keeps all of it, exactly as it was.
+/* Off the face tile (quick settings, settings), part of the
+ * minimal-face chrome vacates the screen: the battery arc, the state
+ * dot and the Wi-Fi glyph used to slice through the other tiles'
+ * page headers. The face tile keeps all of it, exactly as it was.
+ * The status ring is NOT part of this set: it is the screen's frame,
+ * not header chrome, and stays up on every tile (Hugh, 2026-11-18 —
+ * the style round hid it with the rest, one item too many).
  * chrome_off_face_apply() (called from update_chrome on tile changes)
- * is the single writer of the four HIDDEN flags: the arc's and the
+ * is the single writer of the three HIDDEN flags: the arc's and the
  * dot's own updaters also consult s_chrome_off_face, but they only
  * run on the face — the frame tick holds still off it — so they can
  * never apply an off-face change by themselves (the menufix round's
- * bug: the flag flipped, nothing applied it, and the ring was never
- * in the set at all). */
+ * bug: the flag flipped, nothing applied it). */
 static bool s_chrome_off_face;
 static bool s_dot_applied = true;   /* the dot's visibility as last applied */
 /* Minimal-face layout tuning (Hugh's hands-on feedback, 2026-11-16).
@@ -2655,19 +2657,17 @@ static const char *idle_name(muse_wifi_state_t wifi)
 }
 
 /* Apply s_chrome_off_face to the screen-level chrome (see the flag's
- * comment). The Wi-Fi glyph and the ring have no other writer, so
- * their flags follow `off` directly. The arc and the dot do have
- * owners (update_power / update_status) that repaint them on the
- * face; off the face those owners never run, so the flags are set
- * here and their "what is painted" caches are reset, which makes the
- * owners repaint — and so unhide — on the first face tick back. */
+ * comment). The Wi-Fi glyph has no other writer, so its flag follows
+ * `off` directly. The arc and the dot do have owners (update_power /
+ * update_status) that repaint them on the face; off the face those
+ * owners never run, so the flags are set here and their "what is
+ * painted" caches are reset, which makes the owners repaint — and so
+ * unhide — on the first face tick back. The status ring is not
+ * touched here: it stays visible on every tile. */
 static void chrome_off_face_apply(bool off)
 {
     if (s_wifi_icon) {
         lv_obj_set_flag(s_wifi_icon, LV_OBJ_FLAG_HIDDEN, off);
-    }
-    if (s_ring) {
-        lv_obj_set_flag(s_ring, LV_OBJ_FLAG_HIDDEN, off);
     }
     if (off) {
         if (s_batt_arc) {
