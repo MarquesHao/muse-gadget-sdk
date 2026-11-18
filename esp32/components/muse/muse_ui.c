@@ -126,8 +126,12 @@ static lv_obj_t *s_face;
 static lv_obj_t *s_quick_tile;
 static lv_obj_t *s_qset_checks[MUSE_GADGET_MODE_COUNT], *s_qset_vol_val, *s_qset_vol_sl;
 static lv_obj_t *s_qset_segments[MUSE_GADGET_MODE_COUNT], *s_qset_segment_labels[MUSE_GADGET_MODE_COUNT];
+/* Minimal-face quick tile (2026-11-18 restyle): mode rows instead of
+ * the segmented control, plus a brightness slider next to the volume. */
+static lv_obj_t *s_qset_mode_rows[MUSE_GADGET_MODE_COUNT], *s_qset_mode_checks[MUSE_GADGET_MODE_COUNT];
+static lv_obj_t *s_qset_bri_sl;
 static bool s_qset_syncing;   /* quickset_refresh is setting the slider itself */
-static int s_qset_shown_mode = -1, s_qset_shown_vol = -1;   /* what the tile last painted */
+static int s_qset_shown_mode = -1, s_qset_shown_vol = -1, s_qset_shown_bri = -1;   /* what the tile last painted */
 /* Keep these names in sync with GADGET_MODE_NAMES in muse_settings_ui.c:
  * the quick settings tile and the Sound page each carry a copy, in enum order. */
 /* The screen's language at run time (project V1.1 fix2): Chinese only
@@ -260,11 +264,16 @@ static int s_shown_batt = -2;          /* -2: nothing painted yet */
 static uint32_t s_shown_dot = 0x000000;
 static bool s_dot_shown = true;
 /* Off the face tile (quick settings, settings), the minimal-face
- * chrome vacates the header band: the battery arc and the status row
- * used to slice through the settings pages' back capsule and title.
- * The face tile keeps all of it, exactly as it was. The arc's and the
- * dot's own updaters consult this flag; the Wi-Fi glyph's HIDDEN flag
- * is set where the page is computed (update_chrome). */
+ * chrome vacates the screen: the battery arc, the status ring, the
+ * state dot and the Wi-Fi glyph used to slice through the other
+ * tiles' pages. The face tile keeps all of it, exactly as it was.
+ * chrome_off_face_apply() (called from update_chrome on tile changes)
+ * is the single writer of the four HIDDEN flags: the arc's and the
+ * dot's own updaters also consult s_chrome_off_face, but they only
+ * run on the face — the frame tick holds still off it — so they can
+ * never apply an off-face change by themselves (the menufix round's
+ * bug: the flag flipped, nothing applied it, and the ring was never
+ * in the set at all). */
 static bool s_chrome_off_face;
 static bool s_dot_applied = true;   /* the dot's visibility as last applied */
 /* Minimal-face layout tuning (Hugh's hands-on feedback, 2026-11-16).
@@ -709,6 +718,15 @@ static void quickset_refresh(void)
     if (gm != s_qset_shown_mode) {
         s_qset_shown_mode = gm;
         for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
+            if (s_qset_mode_rows[i]) {
+                /* Minimal-face rows: the selected row lifts a shade and
+                 * grows the iOS-blue check; the rest stay card-dark. */
+                bool selected = i == gm;
+                lv_obj_set_style_bg_color(s_qset_mode_rows[i],
+                                          lv_color_hex(selected ? 0x242426 : 0x1c1c1e), 0);
+                lv_label_set_text(s_qset_mode_checks[i], selected ? LV_SYMBOL_OK : "");
+                continue;
+            }
             lv_obj_t *seg = s_qset_segments[i];
             if (seg) {
                 bool selected = i == gm;
@@ -737,6 +755,17 @@ static void quickset_refresh(void)
                 snprintf(buf, sizeof(buf), "%d", v);
                 lv_label_set_text(s_qset_vol_val, buf);
             }
+        }
+    }
+    /* The brightness slider follows its setting the same way (it can
+     * change on the Screen page). */
+    if (s_qset_bri_sl && !lv_obj_has_state(s_qset_bri_sl, LV_STATE_PRESSED)) {
+        int b = muse_settings_brightness();
+        if (b != s_qset_shown_bri) {
+            s_qset_shown_bri = b;
+            s_qset_syncing = true;
+            lv_slider_set_value(s_qset_bri_sl, b, LV_ANIM_OFF);
+            s_qset_syncing = false;
         }
     }
 }
@@ -773,6 +802,25 @@ static void on_quickset_volume_done(lv_event_t *e)
     int v = lv_slider_get_value(lv_event_get_target(e));
     muse_settings_set_volume(v);
     s_qset_shown_vol = v;
+}
+
+static void on_quickset_bright(lv_event_t *e)
+{
+    if (s_qset_syncing) return;
+    /* Preview while dragging, like the Screen page: the panel follows
+     * the finger without an NVS write per step. */
+    muse_ui_preview_brightness(lv_slider_get_value(lv_event_get_target(e)));
+}
+
+static void on_quickset_bright_done(lv_event_t *e)
+{
+    int v = lv_slider_get_value(lv_event_get_target(e));
+    /* A vertical scroll that started on the slider also ends in a
+     * release; don't walk the save path when nothing changed. */
+    if (v != muse_settings_brightness()) {
+        muse_settings_set_brightness(v);
+    }
+    s_qset_shown_bri = v;
 }
 
 static void on_canvas_clicked(lv_event_t *e)
@@ -1516,8 +1564,275 @@ static void apply_text_size(void)
 #endif
 
 /* Start below the fixed chrome on the minimal-face board. */
+/* --- Minimal-face quick tile pieces (Hugh's approved mock-quick-v6,
+ * 2026-11-18): saturated icon tiles with white pictograms, Apple-shaped
+ * sliders with tick dots. The symbol font has a handset (LV_SYMBOL_CALL)
+ * but no chat bubble, no microphone and no sun, so those three are
+ * drawn from plain objects — filled shapes, not line art, to keep the
+ * "white pictogram on colour" read. */
+
+/* The Apple-shaped slider the quick cards share: dark track, iOS-blue
+ * fill, white knob with a soft shadow, a forgiving touch area. */
+static void style_quick_slider(lv_obj_t *s)
+{
+    lv_obj_remove_style_all(s);
+    lv_obj_set_style_bg_color(s, lv_color_hex(0x3a3a3c), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s, lv_color_hex(0x0a84ff), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s, 6, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(s, 6, LV_PART_KNOB);
+    lv_obj_set_style_shadow_opa(s, LV_OPA_30, LV_PART_KNOB);
+    lv_obj_set_style_shadow_ofs_y(s, 1, LV_PART_KNOB);
+    /* Keep the hit area taller than the thin track. */
+    lv_obj_set_ext_click_area(s, 19);
+}
+
+/* Seven tick dots under a slider track, as on Apple's sliders. */
+static void quick_slider_ticks(lv_obj_t *card, int x, int y, int w)
+{
+    for (int i = 0; i < 7; i++) {
+        lv_obj_t *dot = lv_obj_create(card);
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 3, 3);
+        lv_obj_set_pos(dot, x + i * (w - 3) / 6, y);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0x636366), 0);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+static lv_obj_t *quick_icon_tile(lv_obj_t *parent, uint32_t color)
+{
+    lv_obj_t *t = lv_obj_create(parent);
+    lv_obj_remove_style_all(t);
+    lv_obj_set_size(t, 36, 36);
+    lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(t, lv_color_hex(color), 0);
+    lv_obj_set_style_radius(t, 9, 0);
+    lv_obj_remove_flag(t, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    return t;
+}
+
+/* A speech bubble: a filled rounded rect with a small diamond tail. */
+static void glyph_bubble(lv_obj_t *tile)
+{
+    lv_obj_t *tail = lv_obj_create(tile);
+    lv_obj_remove_style_all(tail);
+    lv_obj_set_size(tail, 8, 8);
+    lv_obj_set_style_bg_opa(tail, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(tail, lv_color_white(), 0);
+    lv_obj_set_style_transform_rotation(tail, 450, 0);   /* 45.0 degrees */
+    lv_obj_align(tail, LV_ALIGN_CENTER, -7, 9);
+    lv_obj_remove_flag(tail, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *b = lv_obj_create(tile);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, 26, 18);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(b, lv_color_white(), 0);
+    lv_obj_set_style_radius(b, 5, 0);
+    lv_obj_align(b, LV_ALIGN_CENTER, 0, -2);
+    lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+}
+
+/* A microphone: a filled capsule in a U cradle on a short stem. */
+static void glyph_mic(lv_obj_t *tile)
+{
+    lv_obj_t *u = lv_arc_create(tile);
+    lv_obj_remove_style_all(u);
+    lv_obj_set_size(u, 22, 22);
+    lv_arc_set_bg_angles(u, 0, 180);   /* the bottom half */
+    lv_arc_set_range(u, 0, 100);
+    lv_arc_set_value(u, 100);
+    lv_obj_remove_style(u, NULL, LV_PART_KNOB);
+    lv_obj_set_style_arc_width(u, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(u, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(u, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(u, lv_color_white(), LV_PART_INDICATOR);
+    lv_obj_align(u, LV_ALIGN_CENTER, 0, -3);
+    lv_obj_remove_flag(u, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *cap = lv_obj_create(tile);
+    lv_obj_remove_style_all(cap);
+    lv_obj_set_size(cap, 10, 17);
+    lv_obj_set_style_bg_opa(cap, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(cap, lv_color_white(), 0);
+    lv_obj_set_style_radius(cap, LV_RADIUS_CIRCLE, 0);
+    lv_obj_align(cap, LV_ALIGN_CENTER, 0, -5);
+    lv_obj_remove_flag(cap, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *neck = lv_obj_create(tile);
+    lv_obj_remove_style_all(neck);
+    lv_obj_set_size(neck, 2, 6);
+    lv_obj_set_style_bg_opa(neck, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(neck, lv_color_white(), 0);
+    lv_obj_align(neck, LV_ALIGN_CENTER, 0, 9);
+    lv_obj_remove_flag(neck, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *stem = lv_obj_create(tile);
+    lv_obj_remove_style_all(stem);
+    lv_obj_set_size(stem, 10, 2);
+    lv_obj_set_style_bg_opa(stem, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(stem, lv_color_white(), 0);
+    lv_obj_align(stem, LV_ALIGN_CENTER, 0, 13);
+    lv_obj_remove_flag(stem, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+}
+
+/* A sun, drawn as a ring with a filled core — the symbol font has no
+ * sun; the two sizes tell the slider's ends apart, and the card's
+ * label ("Brightness") anchors the meaning. */
+static void glyph_sun(lv_obj_t *parent, int cx, int cy, int r)
+{
+    lv_obj_t *ring = lv_obj_create(parent);
+    lv_obj_remove_style_all(ring);
+    lv_obj_set_size(ring, 2 * r, 2 * r);
+    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(ring, 2, 0);
+    lv_obj_set_style_border_color(ring, lv_color_hex(0xaeaeb2), 0);
+    lv_obj_set_pos(ring, cx - r, cy - r);
+    lv_obj_remove_flag(ring, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *core = lv_obj_create(parent);
+    lv_obj_remove_style_all(core);
+    int d = r / 2 < 3 ? 3 : r / 2;
+    lv_obj_set_size(core, d, d);
+    lv_obj_set_style_radius(core, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(core, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(core, lv_color_hex(0xaeaeb2), 0);
+    lv_obj_set_pos(core, cx - d / 2, cy - d / 2);
+    lv_obj_remove_flag(core, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+}
+
+/* One labelled slider card for the minimal-face quick tile: a small
+ * grey label at the top left, the slider under it flanked by a small
+ * and a large glyph, tick dots under the track, and no numeric
+ * readout (Apple's sliders carry none). Returns the slider. */
+static lv_obj_t *quick_slider_card(lv_obj_t *col, const char *label, bool brightness)
+{
+    lv_obj_t *card = lv_obj_create(col);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, lv_pct(100), 84);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x1c1c1e), 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lab = make_label(card, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), 0xaeaeb2);
+    lv_label_set_text(lab, label);
+    lv_obj_set_pos(lab, 18, 10);
+
+    if (brightness) {
+        glyph_sun(card, 30, 56, 6);
+        glyph_sun(card, 370, 56, 9);
+    } else {
+        lv_obj_t *lo = make_label(card, &lv_font_montserrat_16, 0xaeaeb2);
+        lv_label_set_text(lo, LV_SYMBOL_VOLUME_MID);
+        lv_obj_align(lo, LV_ALIGN_TOP_LEFT, 18, 46);
+        lv_obj_t *hi = make_label(card, &lv_font_montserrat_20, 0xaeaeb2);
+        lv_label_set_text(hi, LV_SYMBOL_VOLUME_MAX);
+        lv_obj_align(hi, LV_ALIGN_TOP_RIGHT, -16, 43);
+    }
+
+    lv_obj_t *s = lv_slider_create(card);
+    lv_obj_set_size(s, 288, 8);
+    lv_obj_set_pos(s, 56, 48);
+    style_quick_slider(s);
+    quick_slider_ticks(card, 56, 64, 288);
+    return s;
+}
+
 static void build_quick_tile(lv_obj_t *tile)
 {
+    if (muse_board->minimal_face) {
+        /* Hugh's approved layout (mock-quick-v6, 2026-11-18): the mode
+         * switch as three big tappable rows with coloured icon tiles,
+         * then labelled Apple-style slider cards for volume and
+         * brightness. The column is taller than the circle, so the
+         * tile itself scrolls (build_screen keeps its scroll flag and
+         * pins it to vertical); the key hint rides at the column's
+         * foot, past the brightness card. */
+        lv_obj_t *col = lv_obj_create(tile);
+        lv_obj_remove_style_all(col);
+        lv_obj_set_size(col, 400, LV_SIZE_CONTENT);
+        lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(col, 10, 0);
+        lv_obj_set_style_pad_top(col, 44, 0);
+        lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = make_label(col, ui_font_cjk(muse_lang_montserrat(font_pick(&lv_font_montserrat_20, FONT_COMPACT))), 0xffffff);
+        lv_label_set_text(title, ui_lang_zh() ? "快速设置" : "Quick settings");
+
+        static const uint32_t mode_tile_colors[MUSE_GADGET_MODE_COUNT] = { 0x30d158, 0x0a84ff, 0xff375f };
+        for (int i = 0; i < MUSE_GADGET_MODE_COUNT; i++) {
+            lv_obj_t *row = lv_obj_create(col);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, lv_pct(100), 64);
+            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x1c1c1e), 0);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x2c2c2e), LV_STATE_PRESSED);
+            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_PRESSED);
+            lv_obj_set_style_radius(row, 16, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_hor(row, 16, 0);
+            lv_obj_set_style_pad_column(row, 12, 0);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, on_quickset_mode, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            lv_obj_t *tile_g = quick_icon_tile(row, mode_tile_colors[i]);
+            if (i == 0) {
+                lv_obj_t *g = make_label(tile_g, &lv_font_montserrat_20, 0xffffff);
+                lv_label_set_text(g, LV_SYMBOL_CALL);
+                lv_obj_center(g);
+            } else if (i == 1) {
+                glyph_bubble(tile_g);
+            } else {
+                glyph_mic(tile_g);
+            }
+            lv_obj_t *name = make_label(row, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_16)), 0xffffff);
+            lv_label_set_text(name, quick_mode_name(i));
+            lv_obj_t *fill = lv_obj_create(row);
+            lv_obj_remove_style_all(fill);
+            lv_obj_set_flex_grow(fill, 1);
+            lv_obj_set_height(fill, 1);
+            lv_obj_remove_flag(fill, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_t *check = make_label(row, &lv_font_montserrat_20, 0x0a84ff);
+            lv_label_set_text(check, "");
+            s_qset_mode_rows[i] = row;
+            s_qset_mode_checks[i] = check;
+        }
+
+        s_qset_vol_sl = quick_slider_card(col, ui_lang_zh() ? "音量" : "Volume", false);
+        lv_slider_set_range(s_qset_vol_sl, 0, 100);
+        lv_slider_set_value(s_qset_vol_sl, muse_settings_volume(), LV_ANIM_OFF);
+        lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_RELEASED, NULL);
+        lv_obj_add_event_cb(s_qset_vol_sl, on_quickset_volume_done, LV_EVENT_PRESS_LOST, NULL);
+
+        s_qset_bri_sl = quick_slider_card(col, ui_lang_zh() ? "亮度" : "Brightness", true);
+        lv_slider_set_range(s_qset_bri_sl, 10, 100);
+        lv_slider_set_value(s_qset_bri_sl, muse_settings_brightness(), LV_ANIM_OFF);
+        lv_obj_add_event_cb(s_qset_bri_sl, on_quickset_bright, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(s_qset_bri_sl, on_quickset_bright_done, LV_EVENT_RELEASED, NULL);
+        lv_obj_add_event_cb(s_qset_bri_sl, on_quickset_bright_done, LV_EVENT_PRESS_LOST, NULL);
+
+        lv_obj_t *keys = make_label(col, ui_font_cjk(muse_lang_montserrat(&lv_font_montserrat_14)), 0xaeaeb2);
+        lv_label_set_text(keys, ui_lang_zh() ? "顶键：按住说话，轻点通话"
+                                            : "Top key: hold to talk, tap to call");
+        lv_obj_t *spacer = lv_obj_create(col);
+        lv_obj_remove_style_all(spacer);
+        lv_obj_set_size(spacer, 1, 64);
+        lv_obj_remove_flag(spacer, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+        s_qset_shown_mode = s_qset_shown_vol = s_qset_shown_bri = -1;   /* first refresh paints the current settings */
+        quickset_refresh();
+        return;
+    }
+
     lv_obj_t *col = lv_obj_create(tile);
     lv_obj_remove_style_all(col);
     lv_obj_set_size(col, s_small ? s_w - 16 : 400, LV_SIZE_CONTENT);
@@ -1668,12 +1983,18 @@ static void build_screen(void)
         lv_obj_set_scrollbar_mode(s_quick_tile, LV_SCROLLBAR_MODE_OFF);
         lv_obj_set_style_bg_color(s_quick_tile, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_quick_tile, LV_OPA_COVER, 0);
-        if (!s_small) {
+        if (!s_small && !muse_board->minimal_face) {
             /* The tile's content always fits a full-size screen, so like
              * the minimal face tile below it must not hand a vertical
              * drag a scroll range to settle displaced in; small screens
              * keep the scroll for their taller stack. */
             lv_obj_remove_flag(s_quick_tile, LV_OBJ_FLAG_SCROLLABLE);
+        }
+        if (muse_board->minimal_face) {
+            /* The restyled quick tile is taller than the circle: it
+             * scrolls, but only vertically, so a sideways drag still
+             * belongs to the tileview. */
+            lv_obj_set_scroll_dir(s_quick_tile, LV_DIR_VER);
         }
         s_face = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
         /* It never scrolls, but LVGL would size its scrollbars from all its
@@ -2327,6 +2648,33 @@ static const char *idle_name(muse_wifi_state_t wifi)
     }
 }
 
+/* Apply s_chrome_off_face to the screen-level chrome (see the flag's
+ * comment). The Wi-Fi glyph and the ring have no other writer, so
+ * their flags follow `off` directly. The arc and the dot do have
+ * owners (update_power / update_status) that repaint them on the
+ * face; off the face those owners never run, so the flags are set
+ * here and their "what is painted" caches are reset, which makes the
+ * owners repaint — and so unhide — on the first face tick back. */
+static void chrome_off_face_apply(bool off)
+{
+    if (s_wifi_icon) {
+        lv_obj_set_flag(s_wifi_icon, LV_OBJ_FLAG_HIDDEN, off);
+    }
+    if (s_ring) {
+        lv_obj_set_flag(s_ring, LV_OBJ_FLAG_HIDDEN, off);
+    }
+    if (off) {
+        if (s_batt_arc) {
+            lv_obj_add_flag(s_batt_arc, LV_OBJ_FLAG_HIDDEN);
+            s_shown_batt = -1;   /* update_power: -1 means "arc hidden" */
+        }
+        if (s_state_dot) {
+            lv_obj_add_flag(s_state_dot, LV_OBJ_FLAG_HIDDEN);
+            s_dot_applied = false;
+        }
+    }
+}
+
 static void update_chrome(float now)
 {
     if (now < s_next_settings_tick) {
@@ -2339,16 +2687,13 @@ static void update_chrome(float now)
         /* Three tiles now: quick settings (0), face (1), settings (2). */
         lv_obj_t *active = lv_tileview_get_tile_active(s_tv);
         int page = active == s_settings ? 2 : active == s_face ? 1 : 0;
-        /* Off the face, the header band belongs to the page (see
-         * s_chrome_off_face): the Wi-Fi glyph's flag is set here, the
-         * battery arc and the state dot consult the flag in their own
-         * updaters. */
+        /* Off the face, the screen belongs to the page: the chrome
+         * vacates (see s_chrome_off_face / chrome_off_face_apply). */
         bool off_face = muse_board->minimal_face && page != 1;
         if (off_face != s_chrome_off_face) {
             s_chrome_off_face = off_face;
-            if (s_wifi_icon) {
-                lv_obj_set_flag(s_wifi_icon, LV_OBJ_FLAG_HIDDEN, off_face);
-            }
+            chrome_off_face_apply(off_face);
+            ESP_LOGI(TAG, "chrome: %s (tile %d)", off_face ? "hidden off-face" : "shown on face", page);
         }
         bool subpage = page == 2 && muse_settings_ui_in_subpage();
         s_swipe_enabled = page != 2 || !subpage;

@@ -134,6 +134,41 @@ class QuickSettingsTileTest(unittest.TestCase):
         refresh = body_of(self.src, "static void quickset_refresh")
         self.assertIn("selected ? 0xffffff : 0xaeaeb2", refresh)
 
+    def test_mode_rows_carry_icon_tiles_and_blue_check(self) -> None:
+        # Style round (2026-11-18, Hugh's approved mock-quick-v6): on
+        # the minimal-face board the segmented control is gone; the
+        # three modes are big rows with a saturated icon tile and a
+        # white pictogram each, the selected row a shade lighter with
+        # an iOS-blue check.
+        build = body_of(self.src, "static void build_quick_tile")
+        self.assertIn("quick_icon_tile(row, mode_tile_colors[i])", build)
+        self.assertIn("0x30d158, 0x0a84ff, 0xff375f", build)
+        self.assertIn("LV_SYMBOL_CALL", build)        # the font has a handset
+        self.assertIn("glyph_bubble(tile_g)", build)  # drawn: no bubble glyph
+        self.assertIn("glyph_mic(tile_g)", build)     # drawn: no mic glyph
+        self.assertIn("lv_obj_set_size(row, lv_pct(100), 64)", build)
+        refresh = body_of(self.src, "static void quickset_refresh")
+        self.assertIn("selected ? 0x242426 : 0x1c1c1e", refresh)
+        self.assertIn("s_qset_mode_checks[i]", refresh)
+
+    def test_slider_cards_are_apple_shaped_with_ticks(self) -> None:
+        # Style round: volume and brightness live in labelled cards;
+        # the sliders are Apple's shape (blue fill, tick dots, white
+        # knob), with no numeric readout on this tile.
+        build = body_of(self.src, "static void build_quick_tile")
+        self.assertIn('quick_slider_card(col, ui_lang_zh() ? "音量" : "Volume", false)', build)
+        self.assertIn('quick_slider_card(col, ui_lang_zh() ? "亮度" : "Brightness", true)', build)
+        style = body_of(self.src, "static void style_quick_slider")
+        self.assertIn("0x3a3a3c), LV_PART_MAIN", style)
+        self.assertIn("0x0a84ff), LV_PART_INDICATOR", style)
+        ticks = body_of(self.src, "static void quick_slider_ticks")
+        self.assertIn("for (int i = 0; i < 7; i++)", ticks)
+        self.assertIn("0x636366", ticks)
+        bright = body_of(self.src, "static void on_quickset_bright")
+        self.assertIn("muse_ui_preview_brightness", bright)
+        done = body_of(self.src, "static void on_quickset_bright_done")
+        self.assertIn("muse_settings_set_brightness(v)", done)
+
     def test_quick_tile_hint_has_no_tofu_separator(self) -> None:
         # The middle dot is in neither the Latin face nor the CJK subset
         # font, so it drew as a tofu box between the hint's two halves.
@@ -142,10 +177,21 @@ class QuickSettingsTileTest(unittest.TestCase):
         self.assertNotIn("·", build)
 
     def test_quick_tile_column_centred_on_minimal_face(self) -> None:
-        # The column used to hug the top of the circle and leave its
-        # lower half empty (Hugh's photo, 2026-11-18).
+        # Superseded by the style round's scrolling column (next test);
+        # the centred column remains the non-minimal fallthrough.
         build = body_of(self.src, "static void build_quick_tile")
         self.assertIn("lv_obj_align(col, LV_ALIGN_CENTER, 0, -10)", build)
+
+    def test_quick_tile_scrolls_vertically_on_minimal_face(self) -> None:
+        # Style round (2026-11-18): the restyled column (title, three
+        # mode rows, two slider cards, key hint) is taller than the
+        # circle, so the tile scrolls — vertically only, so sideways
+        # drags still belong to the tileview.
+        build = body_of(self.src, "static void build_quick_tile")
+        self.assertIn("lv_obj_set_style_pad_top(col, 44, 0)", build)
+        screen = body_of(self.src, "static void build_screen")
+        self.assertIn("lv_obj_set_scroll_dir(s_quick_tile, LV_DIR_VER)", screen)
+        self.assertIn("!s_small && !muse_board->minimal_face", screen)
 
     def test_chrome_vacates_the_header_off_the_face(self) -> None:
         # The battery arc and the status row are screen-level chrome: off
@@ -159,6 +205,26 @@ class QuickSettingsTileTest(unittest.TestCase):
         self.assertIn("p.battery_pct < 0 || s_chrome_off_face", power)
         status = body_of(self.src, "static void update_status")
         self.assertIn("s_dot_shown && !s_chrome_off_face", status)
+
+    def test_chrome_apply_is_the_single_writer_for_all_four(self) -> None:
+        # Style round (2026-11-18): the menufix round's hide never took
+        # effect on the real device (Hugh's photos) — its flag was only
+        # consulted inside update_status/update_power, which the frame
+        # tick never reaches off the face, and the ring was not in the
+        # set at all. chrome_off_face_apply() now writes all four
+        # HIDDEN flags on the tile transition itself, resets the two
+        # owners' paint caches so they repaint on return, and logs the
+        # transition as on-device evidence.
+        chrome = body_of(self.src, "static void update_chrome")
+        self.assertIn("chrome_off_face_apply(off_face)", chrome)
+        self.assertIn('ESP_LOGI(TAG, "chrome: %s (tile %d)"', chrome)
+        apply = body_of(self.src, "static void chrome_off_face_apply")
+        self.assertIn("lv_obj_set_flag(s_wifi_icon, LV_OBJ_FLAG_HIDDEN, off)", apply)
+        self.assertIn("lv_obj_set_flag(s_ring, LV_OBJ_FLAG_HIDDEN, off)", apply)
+        self.assertIn("lv_obj_add_flag(s_batt_arc, LV_OBJ_FLAG_HIDDEN)", apply)
+        self.assertIn("s_shown_batt = -1", apply)
+        self.assertIn("lv_obj_add_flag(s_state_dot, LV_OBJ_FLAG_HIDDEN)", apply)
+        self.assertIn("s_dot_applied = false", apply)
 
     def test_page_dots_cover_three_tiles(self) -> None:
         self.assertIn("static lv_obj_t *s_dots[3];", self.src)

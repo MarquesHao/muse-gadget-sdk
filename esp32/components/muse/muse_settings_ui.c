@@ -510,7 +510,11 @@ static lv_obj_t *page(lv_obj_t *tile, const char *title, bool back, lv_obj_t **l
         lv_obj_align(t, LV_ALIGN_TOP_RIGHT, -4, 12);
     }
 
-    if (back) {
+    /* The minimal-face board has no back button at all (Hugh, 2026-11-18):
+     * its top-left corner belongs to the face chrome's arc, and the
+     * swipe-right gesture every page already catches (catch_swipes) is
+     * the way back. Other boards keep the button. */
+    if (back && !muse_board->minimal_face) {
         lv_obj_t *b = back_button(p);
         if (compact) {
             lv_obj_set_size(b, 44, 44);
@@ -798,15 +802,17 @@ static lv_obj_t *button(lv_obj_t *list, const char *text, uint32_t color, lv_eve
     return b;
 }
 
-/* The iOS slider: a thin track, the set part filled light, and a
- * white knob with a soft shadow. The knob is mostly pad, so it rides
- * proud of the thin track the way Apple's does. */
+/* The Apple slider (restyled 2026-11-18 to match the quick tile and
+ * Hugh's macOS reference): a thin track, the set part filled iOS blue,
+ * tick dots under the track (added by slider()), and a white knob with
+ * a soft shadow. The knob is mostly pad, so it rides proud of the thin
+ * track the way Apple's does. */
 static void style_slider_ios(lv_obj_t *s)
 {
     lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_SLIDER_TRACK), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_TEXT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_IOS_BLUE), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s, lv_color_white(), LV_PART_KNOB);
@@ -852,11 +858,30 @@ static lv_obj_t *slider(lv_obj_t *list, const char *text, int lo, int hi, int va
 
     lv_obj_t *s = lv_slider_create(c);
     lv_obj_set_width(s, lv_pct(94));
-    lv_obj_set_height(s, wide_layout() ? 8 : 6);
+    lv_obj_set_height(s, s_tiny ? 6 : 8);
     lv_obj_align(s, LV_ALIGN_TOP_MID, 0, wide_layout() ? 50 : s_tiny ? 30 : 40);
     lv_slider_set_range(s, lo, hi);
     lv_slider_set_value(s, value, LV_ANIM_OFF);
     style_slider_ios(s);
+    /* Tick dots under the track, as on Apple's sliders: seven of them
+     * spanning the slider's width, hung off the slider itself so every
+     * layout variant lands them in the same place. */
+    lv_obj_t *ticks = lv_obj_create(c);
+    lv_obj_remove_style_all(ticks);
+    lv_obj_set_size(ticks, lv_pct(94), 3);
+    lv_obj_align_to(ticks, s, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
+    lv_obj_set_flex_flow(ticks, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ticks, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(ticks, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    for (int i = 0; i < 7; i++) {
+        lv_obj_t *dot = lv_obj_create(ticks);
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 3, 3);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0x636366), 0);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    }
     /* The track is thinner than the old bar; widen the forgiving area
      * so the touch target keeps its old height. */
     lv_obj_set_ext_click_area(s, wide_layout() ? 20 : 19);
@@ -1097,7 +1122,9 @@ static void build_text_page(lv_obj_t *tile)
     lv_obj_remove_flag(s_text, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_text, LV_OBJ_FLAG_HIDDEN);
     catch_swipes(s_text);
-    lv_obj_t *back = back_button(s_text);
+    /* No back button on the minimal-face board (see page()): the
+     * swipe-right gesture caught above is the way out there too. */
+    lv_obj_t *back = muse_board->minimal_face ? NULL : back_button(s_text);
 
     /* Between the back arrow and its mirror image. */
     s_text_title = label(s_text, &lv_font_montserrat_20, COLOR_ACCENT, "");
@@ -1135,8 +1162,10 @@ static void build_text_page(lv_obj_t *tile)
     }
     lv_obj_align(s_text_ta, LV_ALIGN_TOP_MID, 0, text_field_y());
     if (text_compact()) {
-        lv_obj_set_size(back, 48, TEXT_COMPACT_FIELD_H);
-        lv_obj_align(back, LV_ALIGN_TOP_LEFT, 4, 0);
+        if (back) {
+            lv_obj_set_size(back, 48, TEXT_COMPACT_FIELD_H);
+            lv_obj_align(back, LV_ALIGN_TOP_LEFT, 4, 0);
+        }
         single_line(s_text_title, muse_board->width - 120);   /* a long SSID mustn't wrap onto the field */
         lv_obj_align(s_text_title, LV_ALIGN_TOP_MID, 0, 10);
     }
@@ -1161,18 +1190,26 @@ static void build_text_page(lv_obj_t *tile)
         lv_obj_align(s_text_title, LV_ALIGN_TOP_MID, 0, 8);
         lv_obj_set_width(s_text_ta, muse_board->width - 60);
         lv_obj_align(s_text_ta, LV_ALIGN_TOP_RIGHT, -4, 36);
-        lv_obj_set_size(back, 48, h);
-        lv_obj_align(back, LV_ALIGN_TOP_LEFT, 4, 36);
+        if (back) {
+            lv_obj_set_size(back, 48, h);
+            lv_obj_align(back, LV_ALIGN_TOP_LEFT, 4, 36);
+        }
         top = 92;
     } else {
         lv_obj_align(s_text_title, LV_ALIGN_TOP_MID, 0, text_y(16) + text_top_extra);
         lv_obj_set_width(s_text_title, text_px(180));
         lv_obj_set_width(s_text_ta, text_px(224));
         lv_obj_align(s_text_ta, LV_ALIGN_TOP_MID, 0, text_y(44) + text_top_extra);
-        lv_obj_set_size(back, text_px(48), h);
-        lv_obj_align(back, LV_ALIGN_TOP_MID, -text_px(140), text_y(44) + text_top_extra);
+        if (back) {
+            lv_obj_set_size(back, text_px(48), h);
+            lv_obj_align(back, LV_ALIGN_TOP_MID, -text_px(140), text_y(44) + text_top_extra);
+        }
     }
     s_text_kp = muse_keypad_create(s_text, s_text_ta, muse_board->round);
+    /* The keypad stops gestures bubbling to the page, so on the board
+     * without a back button a right swipe starting on the keys would
+     * go nowhere: catch it on the keypad itself too. */
+    catch_swipes(s_text_kp);
     lv_obj_set_size(s_text_kp, muse_board->width, muse_board->height - top);
     lv_obj_align(s_text_kp, LV_ALIGN_TOP_MID, 0, top);
     if (muse_board->round) {
@@ -1321,7 +1358,7 @@ static void tick_saved_list(const muse_wifi_status_t *w)
             text = "Tap to forget";
             color = COLOR_DANGER;
         } else if (w->state == MUSE_WIFI_CONNECTED && !strcmp(w->ssid, s_saved[i].ssid)) {
-            text = "Connected";
+            text = TR("Connected", "已连接");
             color = COLOR_OK;
         } else if (s_saved[i].hidden) {
             text = "Hidden";
@@ -1390,7 +1427,7 @@ static void build_wifi_page(lv_obj_t *tile)
     s_wifi_sw = switch_row(sw_group, "Wi-Fi", muse_settings_wifi_on(), on_wifi_sw);
     s_wifi_status = note(list, "");
 
-    s_wifi_saved_hdr = section(list, "Saved networks");
+    s_wifi_saved_hdr = section(list, TR("Saved networks", "已保存的网络"));
     lv_obj_add_flag(s_wifi_saved_hdr, LV_OBJ_FLAG_HIDDEN);
     s_wifi_saved = group(list);
     lv_obj_add_flag(s_wifi_saved, LV_OBJ_FLAG_HIDDEN);

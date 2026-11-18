@@ -128,6 +128,17 @@ class ControlStyleTest(unittest.TestCase):
         # A lone slider carries its own group surface.
         self.assertIn("lv_obj_set_style_clip_corner(c, true, 0)", slider)
 
+    def test_slider_fill_is_apple_blue_with_tick_dots(self) -> None:
+        # Style round (2026-11-18): the settings sliders take the same
+        # Apple shape as the quick tile's — iOS-blue fill and seven
+        # tick dots under the track. The numeric readout stays.
+        body = body_of(self.src, "static void style_slider_ios(")
+        self.assertIn("COLOR_IOS_BLUE), LV_PART_INDICATOR", body)
+        slider = body_of(self.src, "static lv_obj_t *slider(")
+        self.assertIn("LV_ALIGN_OUT_BOTTOM_MID", slider)
+        self.assertIn("for (int i = 0; i < 7; i++)", slider)
+        self.assertIn("0x636366", slider)
+
 
 class PageLayoutTest(unittest.TestCase):
     @classmethod
@@ -148,6 +159,26 @@ class PageLayoutTest(unittest.TestCase):
         body = body_of(self.src, "static lv_obj_t *back_button(")
         self.assertIn("LV_RADIUS_CIRCLE, 0)", body)
         self.assertIn("0x2c2c2e", body)
+
+    def test_no_back_button_on_minimal_face_swipe_right_goes_back(self) -> None:
+        # Style round (2026-11-18, Hugh): the minimal-face board drops
+        # the back button entirely — the top-left corner is the face
+        # chrome's arc — and relies on the swipe-right gesture every
+        # page already catches. No hint element is added.
+        page = body_of(self.src, "static lv_obj_t *page(")
+        self.assertIn("back && !muse_board->minimal_face", page)
+        text_page = body_of(self.src, "static void build_text_page(")
+        self.assertIn("muse_board->minimal_face ? NULL : back_button(s_text)", text_page)
+        gesture = body_of(self.src, "static void on_gesture(")
+        self.assertIn("LV_DIR_RIGHT", gesture)
+        self.assertIn("go_back();", gesture)
+        show = body_of(self.src, "static void show(")
+        self.assertIn("muse_ui_set_swipe_enabled(p == s_home)", show)
+
+    def test_wifi_saved_strings_are_translated(self) -> None:
+        # Style round: the Wi-Fi page's last two English holdouts.
+        self.assertIn('TR("Saved networks", "已保存的网络")', self.src)
+        self.assertIn('TR("Connected", "已连接")', self.src)
 
     def test_titles_are_plain_not_accent(self) -> None:
         body = body_of(self.src, "static lv_obj_t *page(")
