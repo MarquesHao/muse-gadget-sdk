@@ -277,13 +277,25 @@ static lv_obj_t *s_boot_hint;
 static int s_boot_hint_stage;
 static float s_boot_hint_until;
 static lv_obj_t *s_caption_lbl;
-static lv_obj_t *s_dialog;   /* minimal face only: the game-style box the caption sits in */
-static lv_obj_t *s_dialog_text;   /* clips both labels clear of the frame */
+static lv_obj_t *s_dialog;   /* minimal face only: the bottom band the caption rides in */
+static lv_obj_t *s_dialog_text;   /* clips both labels to the band's text area */
 static uint32_t s_dialog_since;  /* tick when the current text first appeared */
 
-#define DIALOG_W 208
-#define DIALOG_TOP 329
-#define DIALOG_INSET 12
+/* The band's geometry (466x466 round panel, centre 233, ring inner
+ * edge 223, effective text radius 217 — see fits_across): 392 wide
+ * with its top corners inside the glass, running off the bottom
+ * edge so the panel's own edge crops it into an arc. Rows here are
+ * panel rows: the frame image rides FR_FACE_DY (20) lower than its
+ * source pixels, so the speaking mouths' lowest animated pixel —
+ * source 302, measured by diffing the shipped talk frames against
+ * each other — renders at 322. The band's top edge sits there, and
+ * the text starts 10 px below it, at DIALOG_TOP + DIALOG_TEXT_DY =
+ * 332: as high as it can go while 288 px of text — 18 columns —
+ * still fits the ring at the second line's bottom row (395). */
+#define DIALOG_W 392
+#define DIALOG_TOP 322
+#define DIALOG_INSET 52          /* text width = DIALOG_W - 2 * DIALOG_INSET = 288 */
+#define DIALOG_TEXT_DY 10        /* the text viewport's drop below the band's top */
 #define DIALOG_HOLD_MS 2000
 #define DIALOG_STEP_MS 100       /* one pixel per step, ten pixels per second */
 
@@ -1285,7 +1297,7 @@ static void build_answer(lv_obj_t *face, int ring_in)
             a->cols = a->w / box_cw;
             a->lines = 2;
             a->h = 2 * box_pitch - CAPTION_LINE_SPACE;
-            a->top = DIALOG_TOP + DIALOG_INSET - s_h / 2;
+            a->top = DIALOG_TOP + DIALOG_TEXT_DY - s_h / 2;
         }
     }
     ESP_LOGI(TAG, "reply pages: %d x %d heard, %d x %d read", s_answers[ANSWER_HEARD].cols,
@@ -1881,31 +1893,29 @@ static void build_screen(void)
         return;
     }
     if (muse_board->minimal_face) {
-        /* Fit two 33-pixel CJK lines without scrolling normal pages.
-         * The outline touches the mouth endpoint at y=325; include its
-         * four pixels when finding the bottom chord inside the ring. */
+        /* The bottom band (Hugh, 2026-11-17: the framed in-circle box
+         * looked like a plaque stuck on the figure): no border, no
+         * outline, just the translucent fill, wide across the bottom
+         * and running off the screen's bottom edge, where the round
+         * panel crops it into an arc. The text viewport inside it is
+         * exactly one two-line page tall, so a normal page never
+         * scrolls. */
         s_dialog = lv_obj_create(face);
         lv_obj_remove_style_all(s_dialog);
-        int bottom = reply_bottom(DIALOG_W + 8, ring_in) + s_h / 2 - 4;
-        lv_obj_set_size(s_dialog, DIALOG_W, bottom - DIALOG_TOP);
+        lv_obj_set_size(s_dialog, DIALOG_W, s_h - DIALOG_TOP);
         lv_obj_align(s_dialog, LV_ALIGN_TOP_MID, 0, DIALOG_TOP);
         lv_obj_set_style_bg_color(s_dialog, lv_color_hex(0x0d0d17), 0);
         lv_obj_set_style_bg_opa(s_dialog, LV_OPA_80, 0);
-        lv_obj_set_style_border_color(s_dialog, lv_color_hex(0xe8e4ff), 0);
-        lv_obj_set_style_border_width(s_dialog, 2, 0);
-        lv_obj_set_style_outline_color(s_dialog, lv_color_hex(0xe8e4ff), 0);
-        lv_obj_set_style_outline_width(s_dialog, 1, 0);
-        lv_obj_set_style_outline_pad(s_dialog, 3, 0);
-        lv_obj_set_style_outline_opa(s_dialog, LV_OPA_50, 0);
-        lv_obj_set_style_radius(s_dialog, 10, 0);
+        lv_obj_set_style_radius(s_dialog, 12, 0);
         lv_obj_remove_flag(s_dialog, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(s_dialog, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(s_dialog, LV_OBJ_FLAG_HIDDEN);
         s_dialog_text = lv_obj_create(s_dialog);
         lv_obj_remove_style_all(s_dialog_text);
         lv_obj_set_size(s_dialog_text, DIALOG_W - 2 * DIALOG_INSET,
-                        bottom - DIALOG_TOP - 2 * DIALOG_INSET);
-        lv_obj_align(s_dialog_text, LV_ALIGN_TOP_MID, 0, DIALOG_INSET - 2);   /* parent border is two pixels */
+                        2 * (lv_font_get_line_height(caption_font()) + CAPTION_LINE_SPACE)
+                            - CAPTION_LINE_SPACE);
+        lv_obj_align(s_dialog_text, LV_ALIGN_TOP_MID, 0, DIALOG_TEXT_DY);
         lv_obj_remove_flag(s_dialog_text, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(s_dialog_text, LV_OBJ_FLAG_CLICKABLE);
     }
@@ -2677,8 +2687,8 @@ static void update_status(muse_mode_t mode, float now)
             lv_obj_add_flag(answer >= 0 ? s_caption_lbl : s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
         }
         if (s_dialog) {
-            /* The game dialog box lives and dies with the text it
-             * frames: the caption while listening, the reply body
+            /* The dialog band lives and dies with the text it
+             * carries: the caption while listening, the reply body
              * while an answer layout is up (on this board the layouts
              * are the box's own page — see build_answer). Visible
              * while the showing label has text, gone with it. */

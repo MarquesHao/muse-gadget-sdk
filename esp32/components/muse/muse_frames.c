@@ -53,7 +53,9 @@
  * scratch and this task's stack are in PSRAM, and storage is only
  * mounted seconds after boot — after the voice session's first VM
  * lookup has had its pick of internal RAM. The mount then stays, like
- * it does after any meeting use.
+ * it does after any meeting use. The buffers themselves are reserved
+ * earlier, in muse_frames_attach() before that lookup: only the
+ * mount waits, not the PSRAM.
  *
  * The fallback face, for the seconds before the mount and for any
  * failure after it, is the embedded boot still (muse_boot_still.h)
@@ -595,7 +597,7 @@ static void breath_stop_locked(void);            /* defined with the breath */
 #define FR_PRES_TOP 52            /* first direct row: below the status row */
 #define FR_PRES_X0 16             /* side columns stay LVGL's: the ring's */
 #define FR_PRES_X1 (FR_W - 16)    /* edge pixels live in them */
-#define FR_PRES_DIALOG_TOP 342    /* dialog up: rows from here stay LVGL's */
+#define FR_PRES_DIALOG_TOP 322    /* dialog up: rows from here stay LVGL's (the band's top: DIALOG_TOP in muse_ui.c) */
 
 typedef struct {
     const uint16_t *base;   /* the rect's first source pixel */
@@ -1264,6 +1266,24 @@ static int mouth_for_level(float level)
     return 0;
 }
 
+/* Reserve whatever of the player's PSRAM the caller doesn't
+ * already hold: the two frame buffers and the file scratch. Called
+ * once from muse_frames_attach() — in the UI's context, before the
+ * voice session makes its first allocations — and again by the
+ * player after the mount, for anything the reservation missed. */
+static void frames_buffers_reserve(void)
+{
+    if (!s_buf[0]) {
+        s_buf[0] = heap_caps_aligned_alloc(32, FR_BYTES, MUSE_BIG_CAPS);
+    }
+    if (!s_buf[1]) {
+        s_buf[1] = heap_caps_aligned_alloc(32, FR_BYTES, MUSE_BIG_CAPS);
+    }
+    if (!s_file) {
+        s_file = heap_caps_malloc(FR_FILE_MAX, MUSE_BIG_CAPS);
+    }
+}
+
 /* ---- the player task ---- */
 
 static void player_task(void *arg)
@@ -1309,12 +1329,45 @@ static void player_task(void *arg)
         }
     }
     if (mounted) {
-        s_buf[0] = heap_caps_aligned_alloc(32, FR_BYTES, MUSE_BIG_CAPS);
-        s_buf[1] = heap_caps_aligned_alloc(32, FR_BYTES, MUSE_BIG_CAPS);
-        s_file = heap_caps_malloc(FR_FILE_MAX, MUSE_BIG_CAPS);
-        if (!s_buf[0] || !s_buf[1] || !s_file) {
-            ESP_LOGE(TAG, "frame buffers unavailable: no library face this boot");
-            mounted = false;
+        /* The buffers are normally already reserved (attach, before
+         * the voice session's first allocations). Anything missing
+         * gets spaced retries rather than none: the squeeze that can
+         * starve this allocation in the boot window — a talk press
+         * landing while the session comes up — is transient, and its
+         * allocations are released again within seconds, so a retry
+         * a few seconds later is a different question. The waits are
+         * sliced and the hold gate comes first, like the mount loop
+         * above: a hold request landing mid-retry is acknowledged
+         * within a slice, not after the whole spacing — the chat
+         * session's hold caller only waits two seconds. */
+        int alloc_tries = 0;
+        while (!(s_buf[0] && s_buf[1] && s_file) && mounted) {
+            if (s_hold_req) {
+                /* Asked to be quiet before the library is up: there
+                 * is nothing to release yet — just don't allocate
+                 * until the requester is done. */
+                s_hold_ack = true;
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+            if (alloc_tries >= 6) {
+                ESP_LOGE(TAG, "frame buffers unavailable: no library face this boot");
+                mounted = false;
+                break;
+            }
+            if (alloc_tries) {
+                ESP_LOGW(TAG, "frame buffers: retry %d (free psram %u, largest %u)", alloc_tries,
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+                for (int waited = 0; waited < 3000 && !s_hold_req; waited += 50) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+                if (s_hold_req) {
+                    continue;
+                }
+            }
+            alloc_tries++;
+            frames_buffers_reserve();
         }
     }
     if (!mounted) {
@@ -1728,6 +1781,20 @@ void muse_frames_attach(lv_obj_t *face)
             heap_caps_free(s_still);
             s_still = NULL;
         }
+    }
+
+    /* Reserve the player's frame buffers and file scratch now, in
+     * the UI's context, alongside the still: left until after the
+     * mount (seconds into boot), the allocation raced a talk press
+     * landing in the boot window — the press's own session and note
+     * allocations took the PSRAM first — and the whole boot was
+     * left with only the still face. PSRAM only: the mount's
+     * deferral is about internal RAM, and that discipline is
+     * unchanged. Anything that still fails here is retried by the
+     * player after the mount. */
+    frames_buffers_reserve();
+    if (!s_buf[0] || !s_buf[1] || !s_file) {
+        ESP_LOGW(TAG, "frame buffer reservation incomplete: the player will retry");
     }
 
     /* PSRAM stack: this task reads the storage partition but never

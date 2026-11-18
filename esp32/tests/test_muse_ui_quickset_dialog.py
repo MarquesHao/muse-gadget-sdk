@@ -160,45 +160,57 @@ class CaptionDialogTest(unittest.TestCase):
             self.src)
         self.assertNotIn("answer >= 0 || !shown[0]", self.src)
 
-    def test_frame_fits_every_occupied_row(self) -> None:
+    def test_band_corners_inside_glass_and_bottom_off_screen(self) -> None:
         constants = dict(re.findall(r"#define (DIALOG_\w+) (\d+)", self.src))
         width, top = int(constants["DIALOG_W"]), int(constants["DIALOG_TOP"])
-        radius = 466 // 2 - 10 - 6
-        bottom = int(math.sqrt(radius ** 2 - (width + 8) ** 2 / 4)) + 233 - 4
-        self.assertEqual((width, top, bottom), (208, 329, 417))
+        self.assertEqual((width, top), (392, 322))
         build = body_of(self.src, "static void build_screen")
-        self.assertIn("reply_bottom(DIALOG_W + 8, ring_in) + s_h / 2 - 4", build)
-        refs = [(350, 403), (400, 343), (430, 278), (458, 121)]
-        for y in range(top - 4, bottom + 5):
-            chord = 2 * math.sqrt(233 ** 2 - (y - 233) ** 2)
-            # Extend the first reference conservatively to the upper rows.
-            reference = refs[0][1]
-            for (y0, w0), (y1, w1) in zip(refs, refs[1:]):
-                if y0 <= y <= y1:
-                    reference = w0 + (w1 - w0) * (y - y0) / (y1 - y0)
-            self.assertLess(width + 8, min(chord, reference))
-            self.assertLessEqual((width + 8) ** 2 / 4 + (y - 233) ** 2,
-                                 radius ** 2)
+        # The band runs off the bottom edge — its height is the rest
+        # of the screen — so the round panel's own edge crops it
+        # into an arc instead of a frame doing it.
+        self.assertIn("lv_obj_set_size(s_dialog, DIALOG_W, s_h - DIALOG_TOP)", build)
+        # The top corners (the radius pulls them further in still)
+        # sit inside the glass, so the band's top edge reads as one
+        # clean line across the face.
+        self.assertLessEqual((width / 2) ** 2 + (top - 233) ** 2, 233 ** 2)
+        # No frame any more: neither a border nor an outline.
+        self.assertNotIn("lv_obj_set_style_border_width(s_dialog", self.src)
+        self.assertNotIn("lv_obj_set_style_border_color(s_dialog", self.src)
+        self.assertNotIn("lv_obj_set_style_outline_width(s_dialog", self.src)
+        self.assertNotIn("lv_obj_set_style_outline_color(s_dialog", self.src)
 
     def test_two_line_cjk_page_fits_without_scrolling(self) -> None:
         constants = dict(re.findall(r"#define (DIALOG_\w+) (\d+)", self.src))
-        width, top, inset = (int(constants[name]) for name in
-                             ("DIALOG_W", "DIALOG_TOP", "DIALOG_INSET"))
-        radius = 217
-        bottom = math.isqrt(radius ** 2 - (width + 8) ** 2 // 4) + 233 - 4
-        viewport_height = bottom - top - 2 * inset
-        self.assertEqual((width - 2 * inset, viewport_height), (184, 64))
+        width, top, inset, dy = (int(constants[name]) for name in
+                                 ("DIALOG_W", "DIALOG_TOP", "DIALOG_INSET",
+                                  "DIALOG_TEXT_DY"))
+        self.assertEqual((width - 2 * inset, dy), (288, 10))
         cjk_pitch = 31 + 2
         page_height = 2 * cjk_pitch - 2
+        # The viewport is exactly one page tall: the build sizes it
+        # from the caption font's own metrics (64 px at the CJK
+        # font's 31 px line height), so a normal page never scrolls.
+        build = body_of(self.src, "static void build_screen")
+        self.assertIn("2 * (lv_font_get_line_height(caption_font()) + CAPTION_LINE_SPACE)",
+                      build)
+        viewport_height = page_height
         self.assertGreaterEqual(viewport_height, page_height)
         self.assertEqual(max(0, page_height - viewport_height), 0)
-        # The outline touches the approximate mouth endpoint, without intrusion.
-        self.assertEqual(top - 4, 325)
-        # A wider centred box would lose the height needed for two CJK lines.
-        wider_bottom = math.isqrt(radius ** 2 - (width + 2 + 8) ** 2 // 4) + 233 - 4
-        self.assertLess(wider_bottom - top - 2 * inset, page_height)
-        build = body_of(self.src, "static void build_screen")
-        self.assertIn("bottom - DIALOG_TOP - 2 * DIALOG_INSET", build)
+        # Every occupied text row fits the effective ring (223 - 6)
+        # at the full text width; the binding row is the second
+        # line's bottom one.
+        text_top = top + dy
+        radius = 217
+        for y in range(text_top, text_top + page_height):
+            self.assertLessEqual((width - 2 * inset) ** 2 / 4 + (y - 233) ** 2,
+                                 radius ** 2)
+        # The text starts clear of the speaking mouths' lowest
+        # animated pixel in panel rows: the talk frames differ only
+        # within source y 219..302 (diffed against each other), and
+        # the image rides FR_FACE_DY = 20 lower on the panel, so the
+        # mouth's rendered bottom is 322 — where the band's top edge
+        # sits. The text keeps a further 10 px clear of it.
+        self.assertGreaterEqual(text_top - (302 + 20), 10)
         tick = body_of(self.src, "static void update_status")
         self.assertIn("if (overflow < 0) overflow = 0;", tick)
 
@@ -238,9 +250,10 @@ class ReplyInDialogTest(unittest.TestCase):
 
     def test_box_page_rides_where_the_caption_rides(self) -> None:
         build = body_of(self.src, "static void build_answer")
-        # Both layouts share the caption viewport's twelve-pixel inset,
-        # measured from the centre for the answer-layout contract.
-        self.assertIn("a->top = DIALOG_TOP + DIALOG_INSET - s_h / 2;", build)
+        # Both layouts share the caption viewport's drop below the
+        # band's top, measured from the centre for the answer-layout
+        # contract.
+        self.assertIn("a->top = DIALOG_TOP + DIALOG_TEXT_DY - s_h / 2;", build)
 
     def test_pager_still_follows_the_layout(self) -> None:
         # No second page size anywhere: the UI tick keeps sizing the
