@@ -847,14 +847,13 @@ static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compac
     return s_small ? compact : full;
 }
 
-/* Keep this NOTO-first selection in sync with SETTINGS_CJK_FONT in
- * muse_settings_ui.c: the two files each pick the CJK font this way. */
-#if CONFIG_MUSE_CJK_FONT_NOTO
+/* Keep this selection in sync with SETTINGS_CJK_FONT in
+ * muse_settings_ui.c: the two files each pick the CJK font this way.
+ * Noto Sans SC is the only bundled CJK font (the Unifont bitmap font
+ * was removed with the other unused upstream assets). */
+#if CONFIG_MUSE_CJK_FONT
 LV_FONT_DECLARE(muse_font_cjk_noto_16)
 #define CJK_FONT muse_font_cjk_noto_16
-#elif CONFIG_MUSE_CJK_FONT
-LV_FONT_DECLARE(muse_font_cjk_16)
-#define CJK_FONT muse_font_cjk_16
 #endif
 #if CONFIG_MUSE_LATIN_FONT
 LV_FONT_DECLARE(muse_font_latin_16)

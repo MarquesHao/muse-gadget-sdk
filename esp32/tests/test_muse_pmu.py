@@ -100,7 +100,7 @@ class PowerKeyTalkBoardsInit(unittest.TestCase):
         return source[start:end]
 
     def test_pwr_talk_boards_turn_key_shutdown_on(self):
-        for name in ("board_m5stack_cores3.c", "board_waveshare_s3_216.c"):
+        for name in ("board_waveshare_s3_216.c",):
             init = self.init_of(name)
             self.assertIn("muse_pmu_set_key_shutdown(true)", init, name)
             self.assertLess(init.index("muse_pmu_init("), init.index("muse_pmu_set_key_shutdown(true)"), name)
@@ -111,10 +111,11 @@ class PowerKeyTalkBoardsInit(unittest.TestCase):
         self.assertNotIn("#endif", init[init.rindex("#if !CONFIG_MUSE_BOARD_WAVESHARE_S3_175", 0, call):call])
 
     def test_other_axp2101_boards_leave_it(self):
-        pwr_talk = {"board_m5stack_cores3.c", "board_waveshare_s3_175c.c", "board_waveshare_s3_216.c"}
+        pwr_talk = {"board_waveshare_s3_175c.c", "board_waveshare_s3_216.c"}
         others = [path.name for path in sorted((MUSE / "boards").glob("board_*.c"))
                   if "muse_pmu_init(" in path.read_text() and path.name not in pwr_talk]
-        self.assertIn("board_waveshare_c6_18.c", others)   # the glob found the AXP2101 boards
+        # Both surviving AXP2101 boards talk on PWR, so this list is empty
+        # today; the loop still guards any board that adopts the PMU later.
         for name in others:
             self.assertNotIn("muse_pmu_set_key_shutdown", (MUSE / "boards" / name).read_text(), name)
 
@@ -223,45 +224,6 @@ int main(void) {
     for (int i = 0; i < 4; i++) ev |= poll_buttons();
     assert(ev == MUSE_BTN_AUX_RELEASE);
     assert(calls == 0);
-    return 0;
-}
-''')
-
-    def test_m5stack_cores3_pwr(self):
-        source = self.board("board_m5stack_cores3.c")
-        (poll,) = functions(source, "poll_buttons")
-        self.build_and_run("cores3", defines(source, r"PMU_KEY_EVERY") + r'''
-static bool s_pmu = true;
-''' + poll + r'''
-/* The PMU is read every PMU_KEY_EVERY polls. */
-static unsigned poll_pmu(unsigned key) {
-    s_pmu_key = key;
-    unsigned ev = 0;
-    for (int i = 0; i < PMU_KEY_EVERY; i++) ev |= poll_buttons();
-    assert(s_pmu_key == 0);
-    return ev;
-}
-int main(void) {
-    assert(poll_pmu(MUSE_PMU_KEY_PRESS) == MUSE_BTN_TALK_PRESS);
-    assert(calls == 1 && !shutdown_on);
-    for (int i = 0; i < 750; i++) assert(poll_pmu(0) == 0);   /* held 15 s */
-    assert(calls == 1);
-    assert(poll_pmu(MUSE_PMU_KEY_RELEASE | MUSE_PMU_KEY_LONG) == MUSE_BTN_TALK_RELEASE);
-    assert(calls == 2 && shutdown_on);
-    /* A tap inside one read: press then release, so still released. */
-    assert(poll_pmu(MUSE_PMU_KEY_PRESS | MUSE_PMU_KEY_RELEASE | MUSE_PMU_KEY_CLICK) ==
-           (MUSE_BTN_TALK_PRESS | MUSE_BTN_TALK_RELEASE));
-    assert(calls == 2 && shutdown_on);
-    /* Held, then release and a new press inside one read: still held. */
-    poll_pmu(MUSE_PMU_KEY_PRESS);
-    assert(calls == 3 && !shutdown_on);
-    poll_pmu(MUSE_PMU_KEY_RELEASE | MUSE_PMU_KEY_PRESS);
-    assert(calls == 3 && !shutdown_on);
-    poll_pmu(MUSE_PMU_KEY_RELEASE);
-    assert(calls == 4 && shutdown_on);
-    /* The PMU not answering doesn't stop the talk. */
-    set_err = ESP_FAIL;
-    assert(poll_pmu(MUSE_PMU_KEY_PRESS) == MUSE_BTN_TALK_PRESS && calls == 5);
     return 0;
 }
 ''')

@@ -18,7 +18,6 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_gadget.csv"
 # (Muse's replies) render instead of boxes, and the gadget-mode names
 # plus the Sound page's main rows are shown in Chinese in this build.
 CONFIG_MUSE_CJK_FONT=y
-CONFIG_MUSE_CJK_FONT_NOTO=y
 # Run-time Chinese/English switch (V1.1 fix2): Chinese translations for the
 # state names, captions and settings pages, picked by the Language setting
 # (default Chinese in this build).

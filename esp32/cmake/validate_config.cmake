@@ -39,9 +39,7 @@ endif()
 
 # Old generated profiles retain 64 KiB TCP buffers and can exhaust the DMA heap
 # during tunnel bursts even when sdkconfig.defaults has been updated.
-# TCP limits: the no-PSRAM Cardputer and AI Passport have no tunnel and use
-# four-MSS windows.
-# The C5 may use up to 96 KiB (sdkconfig.defaults.esp32c5), and only with the
+# TCP limits: the C5 may use up to 96 KiB (sdkconfig.defaults.esp32c5), and only with the
 # setup that was measured: PSRAM with lwIP and Wi-Fi buffers preferring it, a
 # receive path that takes a whole window (at least 64 dynamic RX buffers and a
 # 64-entry TCP receive mailbox up to 64 KiB; past that, window scaling, PSRAM
@@ -66,12 +64,9 @@ if((NOT CONFIG_LWIP_TCP_SND_BUF_DEFAULT EQUAL 16384 OR
           CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM GREATER_EQUAL 96 AND
           CONFIG_LWIP_TCP_RECVMBOX_SIZE GREATER_EQUAL 96 AND
           CONFIG_LWIP_TCP_SND_BUF_DEFAULT LESS_EQUAL 98304 AND
-          CONFIG_LWIP_TCP_WND_DEFAULT LESS_EQUAL 98304))) AND
-   NOT ((CONFIG_MUSE_BOARD_M5STACK_CARDPUTER_ADV OR CONFIG_MUSE_BOARD_AI_PASSPORT) AND NOT CONFIG_SPIRAM AND
-        NOT CONFIG_HOMEHUB_TUNNEL AND CONFIG_LWIP_TCP_SND_BUF_DEFAULT EQUAL 5760 AND
-        CONFIG_LWIP_TCP_WND_DEFAULT EQUAL 5760))
+          CONFIG_LWIP_TCP_WND_DEFAULT LESS_EQUAL 98304))))
     message(FATAL_ERROR
-        "ESP32 Device SDK requires TCP send buffer and receive window 16384 (up to 65535 on the C5 with PSRAM, CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP, 64+ dynamic RX buffers, a 64+ entry TCP receive mailbox and 1-12 out-of-order segments, or up to 98304 as in sdkconfig.defaults.esp32c5, adding window scaling, PSRAM required at boot, 96+ dynamic RX buffers and a 96+ entry mailbox; 5760 on the no-tunnel Cardputer ADV and AI Passport) for DMA headroom. ${GADGET_CONFIG_REGEN_HINT}")
+        "ESP32 Device SDK requires TCP send buffer and receive window 16384 (up to 65535 on the C5 with PSRAM, CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP, 64+ dynamic RX buffers, a 64+ entry TCP receive mailbox and 1-12 out-of-order segments, or up to 98304 as in sdkconfig.defaults.esp32c5, adding window scaling, PSRAM required at boot, 96+ dynamic RX buffers and a 96+ entry mailbox) for DMA headroom. ${GADGET_CONFIG_REGEN_HINT}")
 endif()
 
 # With BLE kept up after setup, the gadget keeps advertising a connectable

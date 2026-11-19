@@ -142,14 +142,13 @@ static lv_obj_t *s_ble_sw, *s_ble_status;
 static lv_obj_t *s_notes_sw;
 #endif
 static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val;
-/* Keep this NOTO-first selection in sync with CJK_FONT in muse_ui.c:
- * the two files each pick the CJK font this way. */
-#if CONFIG_MUSE_CJK_FONT_NOTO
+/* Keep this selection in sync with CJK_FONT in muse_ui.c:
+ * the two files each pick the CJK font this way. Noto Sans SC is the
+ * only bundled CJK font (the Unifont bitmap font was removed with
+ * the other unused upstream assets). */
+#if CONFIG_MUSE_CJK_FONT
 LV_FONT_DECLARE(muse_font_cjk_noto_16)
 #define SETTINGS_CJK_FONT muse_font_cjk_noto_16
-#elif CONFIG_MUSE_CJK_FONT
-LV_FONT_DECLARE(muse_font_cjk_16)
-#define SETTINGS_CJK_FONT muse_font_cjk_16
 #endif
 /* The screen's language (project V1.1 fix2): these pages are written in
  * English and translated where they are built — a page is built when

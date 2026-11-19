@@ -857,6 +857,34 @@ static void set_face(const char *name)
 }
 
 /*
+ * Bench: switches the gadget mode ("mode=meeting") exactly as the quick
+ * settings mode rows do — the same persisted setter, so the voice loop
+ * picks the change up on its next pass: entering meeting starts a
+ * recording on its own, leaving it stops and saves the recording. This
+ * is a test channel for driving the meeting flow without fingers; it
+ * adds no behaviour of its own.
+ */
+static void set_gadget_mode(const char *name)
+{
+    static const char *const names[MUSE_GADGET_MODE_COUNT] = {
+        [MUSE_GADGET_MODE_CALL] = "call",
+        [MUSE_GADGET_MODE_TEXT] = "text",
+        [MUSE_GADGET_MODE_MEETING] = "meeting",
+    };
+    muse_state_poke();
+    for (int m = 0; m < MUSE_GADGET_MODE_COUNT; m++) {
+        if (!strcmp(name, names[m])) {
+            muse_settings_set_gadget_mode(m);
+            printf("@mode %s\n", names[muse_settings_gadget_mode()]);
+            fflush(stdout);
+            return;
+        }
+    }
+    printf("@mode.error unknown mode \"%s\": call text meeting\n", name);
+    fflush(stdout);
+}
+
+/*
  * Console-only commands; false for setup commands. Their buffers are taken
  * per command: without PSRAM, static ones would hold internal RAM for good.
  */
@@ -906,6 +934,10 @@ static bool console_command(char *line, bool whole)
             printf("@meet.error no such recording\n");
             fflush(stdout);
         }
+        return true;
+    }
+    if (!strncmp(line, "mode=", 5)) {
+        set_gadget_mode(line + 5);
         return true;
     }
     if (!strcmp(line, "status")) {
@@ -999,7 +1031,8 @@ static bool console_command(char *line, bool whole)
  * the device's state, "power" the battery meter (muse_battery.h) and
  * "power.reset" starts it over, "nap" sleeps and leaves Wi-Fi at once (as
  * two minutes asleep on battery would; 'w' rejoins), "face=" shows a face
- * (see set_face), and "chat=" sends a typed message to Hatch (see chat_line
+ * (see set_face), "mode=" switches the gadget mode (see set_gadget_mode),
+ * and "chat=" sends a typed message to Hatch (see chat_line
  * and tools/muse/chat.py).
  */
 static void serial_task(void *arg)

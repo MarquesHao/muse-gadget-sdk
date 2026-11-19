@@ -84,21 +84,7 @@ set(GADGET_REQUIRES
     esp_driver_pcnt
 )
 
-# E-paper has its own status screen in place of led_status.c, with
-# a per-panel driver behind epd_panel.h.
-if(CONFIG_HOMEHUB_LED_BACKEND_RETERMINAL_UC8179)
-    list(APPEND GADGET_SRCS "epaper_status.c" "epd_uc8179.c" "reterminal_battery.c")
-elseif(CONFIG_HOMEHUB_LED_BACKEND_RETERMINAL_SPECTRA6)
-    list(APPEND GADGET_SRCS "epaper_status.c" "epd_spectra6.c" "reterminal_battery.c")
-elseif(CONFIG_HOMEHUB_LED_BACKEND_STICKY_SSD1677)
-    list(APPEND GADGET_SRCS "epaper_status.c" "epd_ssd1677.c")
-elseif(CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_SSD1681)
-    list(APPEND GADGET_SRCS "epaper_status.c" "epd_ssd1681.c")
-elseif(CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_EPD154G)
-    list(APPEND GADGET_SRCS "epaper_status.c" "epd_154g.c")
-else()
-    list(APPEND GADGET_SRCS "led_status.c")
-endif()
+list(APPEND GADGET_SRCS "led_status.c")
 
 if(CONFIG_MUSE_ENABLED)
     list(APPEND GADGET_SRCS "muse_glue.c")
@@ -120,16 +106,6 @@ endif()
 
 if(CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_S3_ST7796)
     list(APPEND GADGET_REQUIRES esp_lcd_st7796)
-endif()
-
-if(CONFIG_HOMEHUB_SENSECAP_SENSORS)
-    list(APPEND GADGET_SRCS "sensecap_sensors.c")
-endif()
-if(CONFIG_HOMEHUB_RETERMINAL_SHT4X)
-    list(APPEND GADGET_SRCS "reterminal_sht4x.c")
-endif()
-if(CONFIG_HOMEHUB_WAVESHARE_154G_SHTC3)
-    list(APPEND GADGET_SRCS "waveshare_154g_shtc3.c")
 endif()
 
 if(CONFIG_HOMEHUB_VOICE)

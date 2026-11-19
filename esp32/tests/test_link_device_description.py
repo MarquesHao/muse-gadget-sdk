@@ -193,14 +193,8 @@ int main(void) {{
         # SSID is 32 quotation marks, each escaped to two bytes: an SSID with a
         # control character (six bytes each) isn't sent.
         profiles = {
-            "e-paper status screen": ["CONFIG_HOMEHUB_DISPLAY_COMMANDS", "CONFIG_HOMEHUB_RETERMINAL_SHT4X"],
-            "SenseCAP Indicator": ["CONFIG_HOMEHUB_DISPLAY_COMMANDS", "CONFIG_HOMEHUB_SENSECAP_SENSORS"],
-            "four-colour e-paper": ["CONFIG_HOMEHUB_DISPLAY_COMMANDS", "CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_EPD154G",
-                                    "CONFIG_HOMEHUB_WAVESHARE_154G_SHTC3", "CONFIG_HOMEHUB_VOICE"],
             "full UI": ["CONFIG_HOMEHUB_LED_BACKEND_MUSE", "CONFIG_HOMEHUB_DISPLAY_COMMANDS",
                         "CONFIG_MUSE_WATCHER_CAMERA"],
-            "full UI, P4 camera": ["CONFIG_HOMEHUB_LED_BACKEND_MUSE", "CONFIG_HOMEHUB_DISPLAY_COMMANDS",
-                                   "CONFIG_MUSE_P4_CSI_CAMERA"],
             "voice": ["CONFIG_HOMEHUB_VOICE"],
         }
         model_id, model_name = "z" * 64, "~" * 128
@@ -351,13 +345,9 @@ int main(void) {
                     self.assertNotIn("Hatch", text)
 
     def test_boards_get_a_guide_that_fits_their_hardware(self) -> None:
-        # The XVF3800 has no status light, and the LCD-7 no microphone, so their
-        # guides must not promise one.
+        # The surviving full-UI overlay names the Muse guide; the deleted
+        # boards' guide mappings went with their overlays.
         guides = overlay_values("MUSE_DEVICE_GUIDE")
-        self.assertEqual(guides["sdkconfig.seeed-respeaker-xvf3800"], "devices/guides/voice.md")
-        voice = " ".join((ROOT / "devices/guides/voice.md").read_text().split())
-        self.assertIn("Seeed reSpeaker XVF3800 running", voice)
-        self.assertIn("The reSpeaker XVF3800 shows no state", voice)
         self.assertNotIn("sdkconfig.muse-waveshare-s3-lcd7", guides)
         self.assertEqual(guides["sdkconfig.muse"], "devices/guides/muse.md")
         muse = " ".join((ROOT / "devices/guides/muse.md").read_text().split())

@@ -355,14 +355,8 @@ class LinkOledStatusTest(unittest.TestCase):
         self.assertLess(task.index("oled_show_state(state);"), task.index("switch (state)"))
 
     def test_board_wiring(self) -> None:
-        overlay = (ROOT / "devices" / "sdkconfig.c3-oled-042").read_text()
-        for setting in ('CONFIG_IDF_TARGET="esp32c3"',
-                        "CONFIG_HOMEHUB_LED_BACKEND_C3_SSD1306=y",
-                        "CONFIG_HOMEHUB_BUTTON_GPIO=9",
-                        "CONFIG_SPIRAM=n",
-                        "CONFIG_HOMEHUB_TUNNEL=n",
-                        'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c3_oled_042.csv"'):
-            self.assertIn(setting, overlay)
+        # The board's overlay and its CI job went with the other unused
+        # upstream boards; the SSD1306 backend and the helper case remain.
         # The agent's name needs GET /identity, which only runs when this is on.
         kconfig = (ROOT / "main" / "Kconfig.projbuild").read_text()
         name = kconfig[kconfig.index("config HOMEHUB_SHOW_AGENT_NAME"):]
@@ -370,8 +364,6 @@ class LinkOledStatusTest(unittest.TestCase):
                       name[:name.index("help")])
         helper = (ROOT / "tools" / "board.sh").read_text()
         self.assertRegex(helper, r"\n  c3-oled-042\)\n    TARGET=esp32c3\n")
-        workflow = (ROOT.parent / ".github" / "workflows" / "esp32.yml").read_text()
-        self.assertIn('overlays: ";devices/sdkconfig.c3-oled-042"', workflow)
 
     def test_helper_parses(self) -> None:
         helper = ROOT / "tools" / "board.sh"

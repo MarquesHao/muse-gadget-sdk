@@ -103,12 +103,11 @@ class StopWatchPTT(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_toggle_notes_are_not_offered_where_the_gesture_cannot_work(self):
-        # The Watcher's short wheel click sleeps, and the FreeInk UI has no
-        # navigation guard for a toggled note.
+        # The Watcher's short wheel click sleeps, so a toggled note's
+        # gesture cannot work there.
         kconfig = (ROOT / "components" / "muse" / "Kconfig").read_text()
         block = kconfig.split("config MUSE_VOICE_NOTE_TOGGLE", 1)[1].split("\n\n", 1)[0]
         self.assertIn("!MUSE_BOARD_SENSECAP_WATCHER", block)
-        self.assertIn("!MUSE_UI_FREEINK", block)
     def test_reply_ring_advances_without_rewinding_across_messages(self):
         for board, realtime in ((1, 1), (0, 1), (3, 0)):
             with self.subTest(board=board, realtime=realtime):
@@ -302,37 +301,6 @@ class StopWatchPTT(unittest.TestCase):
         self.run_case('voice', 21)
         self.run_case('voice', 20, board=0)
         self.run_case('voice', 20, realtime=0)
-
-
-class StopWatchControlMapping(unittest.TestCase):
-    """The production StopWatch board's control blocks, preprocessed with live
-    calls off (public mapping) and on (yellow talks, blue mutes/hangs up)."""
-
-    def mapping(self, realtime):
-        board = (MUSE / 'boards/board_m5stack_stopwatch.c').read_text()
-        blocks = re.findall(r'^#if !CONFIG_MUSE_REALTIME_VOICE\n.*?^#endif\n', board, re.M | re.S)
-        self.assertEqual(len(blocks), 2)   # the GPIOs, and the labels and icon positions
-        source = ('#define GPIO_NUM_1 1\n#define GPIO_NUM_2 2\n#define LV_ALIGN_CENTER 9\n'
-                  f'#define CONFIG_MUSE_REALTIME_VOICE {realtime}\n' + blocks[0] +
-                  'int talk_gpio = TALK_GPIO, speaker_gpio = SPEAKER_GPIO;\n'
-                  'struct { const char *talk_button, *speaker_button; struct { int a, x, y; } talk_hint, speaker_hint; } b = {\n'
-                  + blocks[1] + '};\n')
-        result = subprocess.run([*shlex.split(os.environ.get('CC', 'cc')), '-E', '-P', '-x', 'c', '-'],
-                                input=source, capture_output=True, text=True, check=True)
-        out = result.stdout
-        talk_gpio, speaker_gpio = map(int, re.search(r'int talk_gpio = (\d+), speaker_gpio = (\d+)', out).groups())
-        talk = re.search(r'\.talk_button = "([^"]+)"', out).group(1)
-        speaker = re.search(r'\.speaker_button = "([^"]+)"', out).group(1)
-        talk_x = int(re.search(r'\.talk_hint = \{ 9, (-?\d+), -110 \}', out).group(1))
-        speaker_x = int(re.search(r'\.speaker_hint = \{ 9, (-?\d+), -110 \}', out).group(1))
-        return talk_gpio, speaker_gpio, talk, speaker, talk_x, speaker_x
-
-    def test_public_mapping_unchanged_without_calls(self):
-        # GPIO1 is blue (top-right), GPIO2 yellow (top-left).
-        self.assertEqual(self.mapping(0), (1, 2, 'top-right', 'top-left', 144, -144))
-
-    def test_calls_put_talk_on_yellow_and_speaker_on_blue(self):
-        self.assertEqual(self.mapping(1), (2, 1, 'top-left', 'top-right', -144, 144))
 
 
 if __name__ == '__main__':

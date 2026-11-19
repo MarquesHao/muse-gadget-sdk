@@ -265,22 +265,6 @@ class CaptionWrapTest(unittest.TestCase):
         self.assertEqual(self.shown(letters), plain)
         self.assertEqual(self.shown(unicodedata.normalize("NFD", letters)), plain)
 
-    def test_the_latin_font_keeps_accented_letters(self) -> None:
-        def latin(text: str) -> str:
-            proc = subprocess.run(
-                [str(self.binary), "latin"], input=text.encode(), capture_output=True, check=True
-            )
-            return proc.stdout.decode()
-
-        self.assertEqual(latin("\u201cThời tiết\u201d \u2014 Hà Nội đẹp"), '1:"Thời tiết" -- Hà Nội đẹp')
-        self.assertEqual(latin("plain \u2026"), "0:plain ...")
-        # Every letter a caption keeps, and the plain caption doesn't, is in the font.
-        every = "".join(map(chr, range(0xC0, 0x1EFA)))
-        kept = {ord(c) for c in latin(every)} - {ord(c) for c in self.shown(every)}
-        font = (ROOT / "components" / "muse" / "fonts" / "muse_font_latin_16.c").read_text(encoding="utf-8")
-        has = {int(cp, 16) for cp in re.findall(r"/\* U\+([0-9A-F]+) ", font)}
-        self.assertLessEqual(set(range(0x1EA0, 0x1EFA)) | {0x1A0, 0x1A1, 0x1AF, 0x1B0, 0x110, 0x111}, kept)
-        self.assertEqual(sorted(kept - has), [])
 
 
 if __name__ == "__main__":

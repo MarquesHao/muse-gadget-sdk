@@ -160,7 +160,7 @@ class LinkNoiseTunnelTest(unittest.TestCase):
         cache.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=cache) as tmpdir:
             script = Path(tmpdir) / "guard.cmake"
-            base = dict(snd=16384, wnd=16384, cardputer=False, tunnel=True, psram=True,
+            base = dict(snd=16384, wnd=16384, tunnel=True, psram=True,
                         c5=False, lwip_psram=False, dyn_rx=32, ooseq=4, mbox=64,
                         scale=False, ignore_notfound=True)
             c5 = dict(base, snd=65535, wnd=65535, c5=True, lwip_psram=True, dyn_rx=64, ooseq=12)
@@ -170,9 +170,6 @@ class LinkNoiseTunnelTest(unittest.TestCase):
                 (base, True),
                 (dict(base, snd=65535), False),
                 (dict(base, wnd=65535), False),
-                (dict(base, snd=5760, wnd=5760, cardputer=True, tunnel=False, psram=False), True),
-                (dict(base, snd=5760, wnd=5760, cardputer=True, psram=False), False),
-                (dict(base, snd=5760, wnd=5760, cardputer=True, tunnel=False), False),
                 (dict(base, snd=5760, wnd=5760, tunnel=False, psram=False), False),
                 # Other boards get no larger windows, PSRAM or not.
                 (dict(base, snd=32768, wnd=32768, lwip_psram=True), False),
@@ -207,7 +204,6 @@ class LinkNoiseTunnelTest(unittest.TestCase):
                     script.write_text(
                         f"set(CONFIG_LWIP_TCP_SND_BUF_DEFAULT {cfg['snd']})\n"
                         f"set(CONFIG_LWIP_TCP_WND_DEFAULT {cfg['wnd']})\n"
-                        f"set(CONFIG_MUSE_BOARD_M5STACK_CARDPUTER_ADV {on(cfg['cardputer'])})\n"
                         f"set(CONFIG_HOMEHUB_TUNNEL {on(cfg['tunnel'])})\n"
                         f"set(CONFIG_SPIRAM {on(cfg['psram'])})\n"
                         f"set(CONFIG_IDF_TARGET_ESP32C5 {on(cfg['c5'])})\n"
