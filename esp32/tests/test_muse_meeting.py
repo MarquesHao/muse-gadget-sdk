@@ -174,6 +174,22 @@ class SpaceGateTest(unittest.TestCase):
         self.assertIn("return ESP_ERR_NO_MEM", BEGIN)
         self.assertEqual(define_int(MEETING_C, "MEET_RESERVE_BYTES"), 256 * 1024)
 
+    def test_begin_reads_free_space_from_the_fat_driver(self):
+        # POSIX statvfs() is an ENOSYS stub in ESP-IDF (esp_libc
+        # syscalls.c, "TODO IDF-9879"): a begin() that asks it for the
+        # free space fails on every call, so no recording could ever
+        # start — which is exactly what it did until 2026-11-20, hidden
+        # behind the writer-task allocation failure. The check must go
+        # through the FAT driver's own esp_vfs_fat_info(), and the
+        # query must run on the writer task (MSG_SPACE): f_getfree()
+        # can flush a dirty FAT window — a flash write — and flash
+        # writes must not run on the voice task's PSRAM stack.
+        self.assertIn("esp_vfs_fat_info(MEET_BASE", WRITER)
+        self.assertNotIn("esp_vfs_fat_info", BEGIN)
+        self.assertIn("MSG_SPACE", BEGIN)
+        self.assertNotIn("statvfs(MEET_BASE", BEGIN)
+        self.assertNotIn("struct statvfs", BEGIN)
+
     def test_max_blocks_spends_everything_above_the_reserve(self):
         self.assertIn("*max_blocks = (uint32_t)((free_bytes - MEET_RESERVE_BYTES)"
                       " / MUSE_MEETING_BLOCK_BYTES)", BEGIN)
@@ -529,8 +545,36 @@ class InitRetryTest(unittest.TestCase):
     def test_writer_task_keeps_its_internal_stack(self):
         # V1.1 lesson: the writer stack stays in internal RAM (safe
         # under flash writes); retry support must not move it to PSRAM.
-        self.assertIn('xTaskCreate(writer_task, "muse_meet_wr", 4096', SETUP)
+        # Since the 2026-11-20 fix the stack is static (.bss) instead of
+        # a dynamic xTaskCreate allocation: a runtime 4 KB heap block is
+        # exactly what the settled heap cannot provide (the largest free
+        # block sits below 4 KB once the VM session is up and frames are
+        # playing, so setup failed ESP_ERR_NO_MEM on every attempt),
+        # while a link-time array is internal and contiguous by
+        # construction. The creation mechanism changed; the internal-
+        # stack contract this test exists for did not.
+        self.assertIn('xTaskCreateStatic(writer_task, "muse_meet_wr"', SETUP)
+        self.assertNotIn("xTaskCreate(writer_task", SETUP)
         self.assertNotIn("xTaskCreateWithCaps", SETUP)
+        decl = re.search(r"static StackType_t s_writer_stack\[", MEETING_C)
+        self.assertIsNotNone(decl)
+        # The array must stay plain .bss: no attribute on its line or
+        # the line before it may park it in PSRAM (EXT_RAM_BSS_ATTR)
+        # or any other section.
+        line_start = MEETING_C.rindex("\n", 0, decl.start()) + 1
+        prev_start = MEETING_C.rindex("\n", 0, line_start - 1) + 1 if line_start >= 2 else 0
+        self.assertNotIn("ATTR", MEETING_C[prev_start:MEETING_C.index("\n", decl.start())])
+        # A floor, not the exact size: the size is set from the measured
+        # high-water mark (see the next test) and may be re-tuned.
+        self.assertGreaterEqual(define_int(MEETING_C, "MEET_WRITER_STACK_BYTES"), 2048)
+
+    def test_writer_logs_its_stack_high_water_mark(self):
+        # The static stack size is justified by measurement, so the
+        # measurement must keep happening: the writer reports its stack
+        # high-water mark (converted from words to bytes) when a
+        # recording ends.
+        self.assertIn("uxTaskGetStackHighWaterMark(NULL)", WRITER)
+        self.assertIn("sizeof(StackType_t)", WRITER)
 
 
 class ConsoleGuardTest(unittest.TestCase):

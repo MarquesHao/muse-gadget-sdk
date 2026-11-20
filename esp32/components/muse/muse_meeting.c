@@ -21,7 +21,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "esp_heap_caps.h"
@@ -45,6 +44,15 @@ static const char *TAG = "muse_meeting";
 #define MEET_RESERVE_BYTES (256 * 1024)
 #define MEET_MIN_FREE_BLOCKS 944   /* refuse to start with under ~1 minute of space */
 #define MEET_NVS_NS "muse_meet"
+/* Writer task stack size. The stack itself is static (s_writer_stack
+ * below); the size comes from the writer's measured stack high-water
+ * mark, logged after every recording: four hardware recordings at
+ * 4096 B (three 65 s, one 300 s, 2026-11-20) never used more than
+ * 2036 B, so 3072 B keeps 1036 B of headroom — half the worst
+ * observed use again — and hands the other kilobyte back to the
+ * scarcest resource on this board. If the logged mark ever climbs
+ * past ~2500 B used, raise this again. */
+#define MEET_WRITER_STACK_BYTES 3072
 
 /*
  * WAV header for IMA-ADPCM (format tag 0x11), one channel at 16 kHz,
@@ -73,7 +81,7 @@ typedef struct {
     uint8_t b[MUSE_MEETING_BLOCK_BYTES];
 } meet_blk_t;
 
-enum { MSG_BEGIN, MSG_DATA, MSG_END };
+enum { MSG_BEGIN, MSG_DATA, MSG_END, MSG_SPACE };
 typedef struct {
     int kind;
     meet_blk_t *blk;        /* MSG_DATA: ownership passes to the writer */
@@ -91,6 +99,7 @@ static atomic_int s_init_state;    /* 0 new/retryable, 1 initializing, 2 done (s
 static atomic_int s_lock_state;    /* same protocol, for s_lock alone */
 static esp_err_t s_init_err = ESP_OK;
 static volatile esp_err_t s_op_err = ESP_OK;
+static volatile uint64_t s_free_bytes;   /* MSG_SPACE result: writer fills, begin() reads after s_done */
 static FILE *s_fp;                 /* writer task only */
 static uint32_t s_data_bytes;      /* writer task only */
 static char s_fp_path[32];         /* writer task only */
@@ -198,6 +207,15 @@ static void writer_task(void *arg)
                 }
             }
             xQueueSend(s_freeq, &m.blk, 0);
+        } else if (m.kind == MSG_SPACE) {
+            /* Free-space query for begin(), run here on purpose:
+             * f_getfree() can flush a dirty FAT window — a flash
+             * write — and flash writes belong on this task (internal
+             * stack), never on the voice task's PSRAM stack. */
+            uint64_t total = 0, freeb = 0;
+            s_op_err = esp_vfs_fat_info(MEET_BASE, &total, &freeb);
+            s_free_bytes = freeb;
+            xSemaphoreGive(s_done);
         } else {   /* MSG_END */
             if (s_fp) {
                 bool empty = m.total_samples == 0 && s_data_bytes == 0;
@@ -221,6 +239,15 @@ static void writer_task(void *arg)
                     remove(s_fp_path);   /* a zero-length meeting leaves no file */
                 }
             }
+            /* One line per recording: the writer stack's high-water
+             * mark is what MEET_WRITER_STACK_BYTES is sized from, so
+             * if a future change starts eating the stack, the
+             * shrinking margin shows here while there is still
+             * headroom. (The mark is the lifetime minimum of unused
+             * stack, in words; the log prints bytes.) */
+            ESP_LOGI(TAG, "writer stack high-water: %" PRIu32 " of %d B never used",
+                     (uint32_t)uxTaskGetStackHighWaterMark(NULL) * (uint32_t)sizeof(StackType_t),
+                     MEET_WRITER_STACK_BYTES);
             xSemaphoreGive(s_done);
         }
     }
@@ -255,6 +282,15 @@ static esp_err_t lock_init_once(void)
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
+
+/* The writer task's TCB and stack are static (plain .bss = internal
+ * DRAM, contiguous by construction). See the creation site in setup()
+ * for the full reasoning: a runtime heap block of this size is exactly
+ * what the settled heap cannot provide. Plain statics (no section
+ * attribute) also keep the stack out of PSRAM, which the flash writes
+ * the writer performs would not survive. */
+static StaticTask_t s_writer_tcb;
+static StackType_t s_writer_stack[MEET_WRITER_STACK_BYTES / sizeof(StackType_t)];
 
 /* Undo a partial setup() so a later retry starts from nothing. Only
  * setup() calls this, before s_setup is set, so no other task can be
@@ -296,8 +332,25 @@ static esp_err_t setup(void)
         meet_blk_t *blk = &pool[i];
         xQueueSend(s_freeq, &blk, 0);
     }
-    /* Plain xTaskCreate: an internal-RAM stack, safe under flash writes. */
-    if (xTaskCreate(writer_task, "muse_meet_wr", 4096, NULL, 5, NULL) != pdPASS) {
+    /* Static creation (s_writer_stack, plain .bss): creating the
+     * writer asks the heap for no stack block at all, so first use
+     * succeeds in the settled state too. The dynamic version's 4 KB
+     * stack was the one allocation meeting setup could not satisfy
+     * once the VM session was up and the frame player was running:
+     * the largest free internal block sits below 4 KB there, so
+     * creation returned pdFAIL on every attempt (13/13 measured on
+     * hardware, 2026-11-19; setup() reports it as ESP_ERR_NO_MEM) and
+     * meeting mode could never start recording. The stack stays
+     * internal DRAM, as it must: the writer is the task that writes
+     * flash (FAT + wear levelling), and a PSRAM stack does not
+     * survive the cache-off windows those writes cause. The price is
+     * .bss holding stack + TCB for the whole boot — but once a
+     * setup() has succeeded it is never repeated, and the writer
+     * then lives until reboot, so a heap stack was never actually
+     * transient either. */
+    if (xTaskCreateStatic(writer_task, "muse_meet_wr",
+                          MEET_WRITER_STACK_BYTES / sizeof(StackType_t),
+                          NULL, 5, s_writer_stack, &s_writer_tcb) == NULL) {
         setup_undo(pool);
         return ESP_ERR_NO_MEM;
     }
@@ -618,11 +671,29 @@ esp_err_t muse_meeting_begin(char *name_out, size_t name_cap, uint32_t *max_bloc
     if (idx < 0) {
         return ESP_ERR_NO_MEM;
     }
-    struct statvfs sv;
-    if (statvfs(MEET_BASE, &sv) != 0) {
-        return ESP_FAIL;
+    /* Free space comes from the FAT driver's own API, not POSIX
+     * statvfs(): in ESP-IDF that function is an ENOSYS stub (esp_libc
+     * syscalls.c, "TODO IDF-9879"), so it failed on every call and no
+     * recording could ever start. The writer-task allocation failure
+     * masked this until 2026-11-20 — setup() always failed first, so
+     * begin() never got far enough to reach the check.
+     * The query itself runs on the writer (MSG_SPACE): f_getfree()
+     * can flush a dirty FAT window, which is a flash write, and flash
+     * writes must not run on this task's PSRAM stack. A timed-out
+     * query leaves a late s_done token and a stale result behind;
+     * both are harmless — the drain before each send clears the
+     * token, and every query overwrites the result before it is read. */
+    while (xSemaphoreTake(s_done, 0) == pdTRUE) {
     }
-    uint64_t free_bytes = (uint64_t)sv.f_bfree * sv.f_frsize;
+    meet_msg_t q = { .kind = MSG_SPACE };
+    xQueueSend(s_wq, &q, portMAX_DELAY);
+    if (xSemaphoreTake(s_done, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_op_err != ESP_OK) {
+        return s_op_err;
+    }
+    uint64_t free_bytes = s_free_bytes;
     if (free_bytes < MEET_RESERVE_BYTES + MEET_MIN_FREE_BLOCKS * MUSE_MEETING_BLOCK_BYTES) {
         return ESP_ERR_NO_MEM;   /* under a minute left: call it full */
     }
